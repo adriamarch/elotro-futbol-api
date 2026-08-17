@@ -1,0 +1,176 @@
+// Configuración de sincronización por tabla.
+//
+// "order": orden seguro de migración/sincronización respetando FKs
+//   (ver FASE4.md sección 5). Coincide con la propuesta del documento;
+//   se ha revisado contra worker/schema.sql y no hace falta cambiarlo:
+//   users no depende de nadie; articles depende de users+results
+//   (resultado_id) por eso se hace después de results, etc.
+//
+// "changeStrategy":
+//   - "immutable"   -> solo se INSERTa una vez, nunca se modifica tras
+//                       crearse (article_slug_redirects, match_events,
+//                       activity_log, nivel_historial, custom_clubs).
+//                       created_at basta para saber qué es nuevo.
+//   - "updated_at"  -> tiene updated_at que SÍ se toca en cada cambio.
+//                       Filtrar por "updated_at > cursor" detecta altas Y
+//                       modificaciones con una sola columna.
+//
+// Todas las tablas con "updated_at" ya sea nativo (articles, alineaciones,
+// club_info, settings) o añadido en esta fase mediante trigger
+// (worker/migracion_fase4_sync_tracking.sql: users, results, sessions,
+// edit_requests, comments, club_info_solicitudes) usan changeStrategy
+// "updated_at". Las que son de solo-inserción usan "immutable" con
+// created_at como cursor -no necesitan trigger ni columna nueva-.
+//
+// "deleteDetection": si D1 permite borrar filas de esta tabla, hay que
+// comparar el conjunto de IDs D1 vs PostgreSQL en cada pasada para poder
+// aplicar el DELETE también en PostgreSQL (D1 no tiene una tabla de
+// tombstones genérica). Se activa para las tablas donde el Worker
+// principal ejecuta DELETE (revisado en worker/src/index.js).
+
+export const TABLES = [
+  {
+    name: "users",
+    pk: ["id"],
+    order: 1,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true, // el panel de Usuarios permite eliminar usuarios
+    syncMode: "authoritative", // D1 debe dejar PostgreSQL exactamente igual
+  },
+  {
+    name: "settings",
+    pk: ["key"],
+    order: 2,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true, // D1 es la autoridad; eliminar sobrantes en PG
+    syncMode: "authoritative",
+  },
+  {
+    name: "results",
+    pk: ["id"],
+    order: 3,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true,
+    syncMode: "authoritative", // D1 es la autoridad; evita depender de updated_at en D1 remoto
+  },
+  {
+    name: "articles",
+    pk: ["id"],
+    order: 4,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true,
+  },
+  {
+    name: "media",
+    pk: ["id"],
+    order: 5,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true, // se puede borrar media desde el panel
+  },
+  {
+    name: "custom_clubs",
+    pk: ["id"],
+    order: 6,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: false,
+  },
+  {
+    name: "article_slug_redirects",
+    pk: ["slug_antiguo"],
+    order: 7,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: false, // en cascada al borrar el articulo (FK ON DELETE CASCADE)
+    cascadeDeleteFrom: "articles",
+  },
+  {
+    name: "match_events",
+    pk: ["id"],
+    order: 8,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true, // se pueden borrar/corregir eventos desde Minuto a Minuto
+  },
+  {
+    name: "alineaciones",
+    pk: ["id"],
+    order: 9,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true,
+  },
+  {
+    name: "comments",
+    pk: ["id"],
+    order: 10,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true,
+    syncMode: "authoritative", // D1 es la autoridad; evita depender de updated_at en D1 remoto
+  },
+  {
+    name: "club_info",
+    pk: ["club"],
+    order: 11,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: false,
+  },
+  {
+    name: "club_info_solicitudes",
+    pk: ["id"],
+    order: 12,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true,
+    syncMode: "authoritative", // D1 es la autoridad; tabla pequeña
+  },
+  {
+    name: "edit_requests",
+    pk: ["id"],
+    order: 13,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true,
+    syncMode: "authoritative", // D1 es la autoridad; tabla pequeña
+  },
+  {
+    name: "activity_log",
+    pk: ["id"],
+    order: 14,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: false, // registro de auditoría, no se borra
+  },
+  {
+    name: "nivel_historial",
+    pk: ["id"],
+    order: 15,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: false,
+  },
+  {
+    name: "sessions",
+    pk: ["id"],
+    order: 16,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true, // sesiones antiguas se podrían limpiar en el futuro
+    syncMode: "authoritative", // D1 es la autoridad también para sesiones
+  },
+];
+
+export function getTable(name) {
+  const t = TABLES.find((t) => t.name === name);
+  if (!t) throw new Error(`Tabla no reconocida en config de sync: ${name}`);
+  return t;
+}
+
+export const TABLES_IN_ORDER = [...TABLES].sort((a, b) => a.order - b.order);

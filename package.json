@@ -1,0 +1,26 @@
+{
+  "name": "elotrofutbol-api-secondary",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server-railway.js",
+    "test": "node --test test/*.test.mjs",
+    "test:railway": "node scripts/validate-railway.mjs",
+    "db:sync-sequences": "node scripts/sync-identity-sequences.mjs",
+    "db:migrate": "node scripts/migrate.mjs",
+    "sync:initial": "node sync/initial-migration.mjs",
+    "sync:incremental": "node sync/incremental.mjs",
+    "sync:compare": "node sync/comparator.mjs",
+    "sync:scheduler": "node sync/scheduler.mjs",
+    "test:sync": "node --test sync/test/*.test.mjs",
+    "sync:unlock": "node sync/unlock.mjs"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.17",
+    "hono": "^4.13.2",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.123.0"
+  }
+}

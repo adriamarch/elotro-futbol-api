@@ -48,8 +48,23 @@ export function debeEncolarse(method, path) {
 // No lanza si falla el encolado (ver comentario en la llamada): perder el
 // registro de la cola es peor que no bloquear la respuesta al usuario, así
 // que el error se loguea y ya, no se propaga hacia el llamador.
-export async function encolarEscritura({ method, path, queryString, body, authorizationHeader, userId, originalStatus }) {
-  const writeId = crypto.randomUUID();
+//
+// writeId ahora se recibe ya generado por quien llama (server-railway.js),
+// en vez de generarse aquí: así puede pasarse ANTES a handler.fetch como
+// cabecera X-Write-Id (ver server-railway.js), de forma que la fila que
+// Postgres crea y la fila que D1 creará al reproducir esta escritura
+// compartan el mismo origin_write_id desde el primer momento. Si por lo
+// que sea no llega un writeId ya generado (llamadas antiguas o de test),
+// se genera aquí como red de seguridad -- pero entonces la fila de
+// Postgres ya se creó sin ese id en su columna origin_write_id, así que la
+// deduplicación en sync/incremental.mjs no podría reconciliarla (mismo
+// comportamiento que antes de este cambio: se marca aquí para que quede
+// claro en los logs, no falla en silencio).
+export async function encolarEscritura({ writeId: writeIdEntrante, method, path, queryString, body, authorizationHeader, userId, originalStatus }) {
+  const writeId = writeIdEntrante || crypto.randomUUID();
+  if (!writeIdEntrante) {
+    console.warn(`[pending-writes] encolando ${method} ${path} sin writeId pre-generado: la fila creada en Postgres (si la hay) no llevará origin_write_id y no podrá reconciliarse automáticamente al llegar de vuelta desde D1.`);
+  }
   try {
     await pool.query(
       `INSERT INTO pending_writes

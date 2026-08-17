@@ -1400,6 +1400,17 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
+    // Presente solo cuando server-railway.js ya decidió que esta escritura
+    // se va a encolar en pending_writes para reproducirse luego contra D1
+    // (ver server-railway.js: candidataAEncolar). Se guarda en la propia
+    // fila creada aquí (origin_write_id, si la petición es un INSERT de
+    // artículo/resultado) para que, cuando D1 reproduzca esta misma
+    // escritura más tarde con el mismo X-Write-Id (ver drainPendingWrites
+    // en worker/src/index.js), sync/incremental.mjs pueda reconciliar
+    // ambas filas como una sola en vez de duplicar. Ver
+    // worker/migracion_origin_write_id.sql para el porqué completo.
+    const origenWriteId = request.headers.get("X-Write-Id") || null;
+
     if (method === "OPTIONS") return cors(new Response(null, { status: 204 }));
 
     try {
@@ -2548,8 +2559,8 @@ export default {
 
         await env.DB.prepare(
           `INSERT INTO articles (slug, titulo, subtitulo, contenido, tipo, categoria, club, imagen_url, imagenes, resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado, estado_borrador, programado_para, slug_congelado, fecha_publicacion, updated_at,
-            titulo_eu, subtitulo_eu, contenido_eu, titulo_ca, subtitulo_ca, contenido_ca, titulo_gl, subtitulo_gl, contenido_gl, titulo_en, subtitulo_en, contenido_en)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            titulo_eu, subtitulo_eu, contenido_eu, titulo_ca, subtitulo_ca, contenido_ca, titulo_gl, subtitulo_gl, contenido_gl, titulo_en, subtitulo_en, contenido_en, origin_write_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           slug, body.titulo, body.subtitulo || null, body.contenido,
           body.tipo || "noticia", body.categoria || "hypermotion", body.club || null,
@@ -2560,7 +2571,8 @@ export default {
           traducciones.titulo_eu, traducciones.subtitulo_eu, traducciones.contenido_eu,
           traducciones.titulo_ca, traducciones.subtitulo_ca, traducciones.contenido_ca,
           traducciones.titulo_gl, traducciones.subtitulo_gl, traducciones.contenido_gl,
-          traducciones.titulo_en, traducciones.subtitulo_en, traducciones.contenido_en
+          traducciones.titulo_en, traducciones.subtitulo_en, traducciones.contenido_en,
+          origenWriteId
         ).run();
 
         const publicado = body.publicado !== false;
@@ -3530,14 +3542,14 @@ export default {
         }
         const flashscoreUrl = flashscoreUrlValido(body.competicion, body.estado, body.flashscore_url);
         const insertResult = await env.DB.prepare(
-          `INSERT INTO results (competicion, grupo, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido, estado, ubicacion, flashscore_url, escudo_local_url, escudo_visitante_url, autor_id, autor_nombre)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO results (competicion, grupo, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido, estado, ubicacion, flashscore_url, escudo_local_url, escudo_visitante_url, autor_id, autor_nombre, origin_write_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           body.competicion, body.grupo || null, body.jornada, body.equipo_local, body.equipo_visitante,
           body.goles_local ?? null, body.goles_visitante ?? null, body.fecha_partido || null, body.estado || "programado",
           body.ubicacion || null, flashscoreUrl,
           body.escudo_local_url || null, body.escudo_visitante_url || null,
-          payload.uid, payload.nombre
+          payload.uid, payload.nombre, origenWriteId
         ).run();
         const nuevoId = insertResult.meta.last_row_id;
         // Si se crea directamente en estado "en_juego" a mano, se arranca

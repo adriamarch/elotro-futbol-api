@@ -13,6 +13,7 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import crypto from "node:crypto";
 import handler from "./index.js";
 import { createD1CompatDb, checkPostgres, checkSyncFreshness } from "./postgres-db.js";
 import { debeEncolarse, encolarEscritura, contarPendientes } from "./pending-writes.js";
@@ -130,7 +131,25 @@ app.all("*", async (c) => {
     }
   }
 
-  const response = await handler.fetch(c.req.raw, env, ctx);
+  // writeId se genera AQUÍ, antes de que Postgres atienda la petición, y no
+  // dentro de encolarEscritura() como antes -- así puede pasarse también al
+  // handler como cabecera X-Write-Id para que, si la petición crea una fila
+  // nueva (POST /api/articles o /api/results), esa fila nazca ya con
+  // origin_write_id = writeId en Postgres. Cuando esta misma escritura se
+  // reproduzca luego contra D1 (ver drainPendingWrites en
+  // worker/src/index.js, que reenvía el mismo write_id de la cola), D1
+  // creará su fila con el MISMO origin_write_id, lo que permite a
+  // sync/incremental.mjs reconciliar ambas filas como una sola en vez de
+  // duplicar (ver worker/migracion_origin_write_id.sql para el porqué
+  // completo). Sin esto, el id que ligaba ambos lados solo vivía en la
+  // cola (pending_writes.write_id) y nunca llegaba a las tablas de negocio.
+  const writeId = candidataAEncolar ? crypto.randomUUID() : null;
+  const requestConWriteId = writeId
+    ? new Request(c.req.raw, { headers: new Headers(c.req.raw.headers) })
+    : c.req.raw;
+  if (writeId) requestConWriteId.headers.set("X-Write-Id", writeId);
+
+  const response = await handler.fetch(requestConWriteId, env, ctx);
 
   if (candidataAEncolar && response.status < 500) {
     // Solo se encola si Postgres/Railway la atendió con éxito (< 500): si
@@ -156,6 +175,7 @@ app.all("*", async (c) => {
     }
     ctx.waitUntil(
       encolarEscritura({
+        writeId,
         method,
         path,
         queryString: new URL(c.req.url).search,

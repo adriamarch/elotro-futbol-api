@@ -44,6 +44,7 @@ import {
   eliminarFila,
   obtenerIdsPostgres,
   reconciliarTablaAutoritativa,
+  reconciliarFilasPorOriginWriteId,
 } from "./pg-writer.mjs";
 import { conReintentos } from "./retry.mjs";
 import {
@@ -134,6 +135,29 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
     }
 
     try {
+      // Antes de la reconciliación autoritativa normal (por PK), se resuelven
+      // los casos de failover: filas de D1 que traen origin_write_id y cuyo
+      // PK no coincide con el que tenía la fila equivalente creada en
+      // PostgreSQL durante el failover (ver reconciliarFilasPorOriginWriteId
+      // para el porqué completo). Sin este paso, reconciliarTablaAutoritativa
+      // insertaría la fila de D1 como ADICIONAL (PK distinto) y dejaría la
+      // fila de Postgres huérfana -pero como esta tabla es autoritativa, ni
+      // siquiera se borraría sola en la siguiente pasada, porque su PK
+      // seguiría sin existir en D1 solo si nadie la reconcilia antes-.
+      const reconciliacionWriteId = await conReintentos(
+        () => reconciliarFilasPorOriginWriteId(client, name, filasD1, pk),
+        {
+          onRetry: ({ intento, error }) =>
+            console.warn(`[${name}] reintento reconciliación por origin_write_id (${intento}): ${error.message}`),
+        }
+      );
+      if (reconciliacionWriteId.huerfanasEliminadas > 0) {
+        console.log(`[${name}] reconciliadas ${reconciliacionWriteId.huerfanasEliminadas} fila(s) huérfana(s) de failover por origin_write_id.`);
+      }
+      if (reconciliacionWriteId.conflictos.length > 0) {
+        detalle.errors.push(`${reconciliacionWriteId.conflictos.length} conflicto(s) de origin_write_id sin resolver, ver sync_write_id_conflicts.`);
+      }
+
       const resultado = await conReintentos(
         () => reconciliarTablaAutoritativa(client, name, filasD1, columnasUtilizables, pk),
         {
@@ -189,6 +213,22 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
   for (let i = 0; i < filas.length; i += TAMANO_LOTE) {
     const lote = filas.slice(i, i + TAMANO_LOTE);
     try {
+      // Igual que en la rama autoritativa: resuelve primero cualquier fila
+      // huérfana de un failover antes del upsert normal por PK, para que
+      // una fila reproducida desde D1 sustituya a su equivalente huérfana
+      // de PostgreSQL en vez de duplicarse (ver
+      // reconciliarFilasPorOriginWriteId en sync/pg-writer.mjs).
+      const reconciliacionWriteId = await conReintentos(
+        () => reconciliarFilasPorOriginWriteId(client, name, lote, pk),
+        { onRetry: ({ intento, error }) => console.warn(`[${name}] reintento reconciliación por origin_write_id, lote ${i + 1}-${i + lote.length} (${intento}): ${error.message}`) }
+      );
+      if (reconciliacionWriteId.huerfanasEliminadas > 0) {
+        console.log(`[${name}] reconciliadas ${reconciliacionWriteId.huerfanasEliminadas} fila(s) huérfana(s) de failover por origin_write_id (lote ${i + 1}-${i + lote.length}).`);
+      }
+      if (reconciliacionWriteId.conflictos.length > 0) {
+        detalle.errors.push(`${reconciliacionWriteId.conflictos.length} conflicto(s) de origin_write_id sin resolver en lote ${i + 1}-${i + lote.length}, ver sync_write_id_conflicts.`);
+      }
+
       const resultado = await conReintentos(
         () => upsertFilasLote(client, name, lote, columnasUtilizables, pk),
         { onRetry: ({ intento, error }) => console.warn(`[${name}] reintento lote ${i + 1}-${i + lote.length} (${intento}): ${error.message}`) }

@@ -165,6 +165,99 @@ export async function obtenerIdsPostgres(client, table, primaryKeys) {
 export { escaparIdentificador };
 
 /**
+ * Reconciliación de filas creadas durante un failover (ver
+ * worker/migracion_origin_write_id.sql y
+ * worker-secondary/db/migrations/003_pending_writes.sql para el contexto
+ * completo).
+ *
+ * Cuando D1 reproduce una escritura pendiente que era un INSERT, crea una
+ * fila con SU PROPIO id (normalmente distinto del que le había asignado
+ * PostgreSQL en el momento del failover), pero con el MISMO
+ * origin_write_id en ambas filas. Sin este paso, la sincronización normal
+ * (upsertFila/upsertFilasLote por PK) trataría esa fila de D1 como una fila
+ * nueva más -PK distinto, ON CONFLICT no dispara- y la insertaría como
+ * ADICIONAL, dejando la fila original de PostgreSQL (con el id antiguo)
+ * huérfana y duplicada.
+ *
+ * Este paso se ejecuta ANTES del upsert normal de cada lote: para cada fila
+ * de D1 que trae origin_write_id, si existe en PostgreSQL una fila con ese
+ * mismo origin_write_id pero un PK distinto, se borra esa fila huérfana.
+ * El upsert que sigue a continuación entonces sí inserta limpiamente la
+ * fila con el PK definitivo de D1 -- el resultado neto es UNA sola fila,
+ * nunca dos.
+ *
+ * No se hace un UPDATE in-place de la fila huérfana (cambiarle el PK) para
+ * no complicar las referencias que otras tablas pudieran tener hacia su id
+ * antiguo dentro de la propia ventana del failover (por ejemplo, un
+ * resultado_id de un artículo creado justo después, también durante el
+ * mismo failover, apuntando al id antiguo de PostgreSQL): se borra y se
+ * deja que el upsert normal cree la fila limpia con el id ya definitivo, y
+ * cualquier referencia rota resultante queda registrada en
+ * sync_write_id_conflicts para revisión manual, en vez de intentar
+ * repararla en silencio.
+ */
+export async function reconciliarFilasPorOriginWriteId(client, table, filas, primaryKeys) {
+  if (!filas.length) return { huerfanasEliminadas: 0, conflictos: [] };
+
+  const filasConWriteId = filas.filter((row) => row.origin_write_id);
+  if (!filasConWriteId.length) return { huerfanasEliminadas: 0, conflictos: [] };
+
+  let huerfanasEliminadas = 0;
+  const conflictos = [];
+  const pkList = primaryKeys.map(escaparIdentificador).join(", ");
+
+  for (const rowD1 of filasConWriteId) {
+    const pkD1 = primaryKeys.map((c) => rowD1[c]);
+    const huerfana = await client.query(
+      `SELECT ${pkList} FROM ${escaparIdentificador(table)} WHERE origin_write_id = $1;`,
+      [rowD1.origin_write_id]
+    );
+    if (huerfana.rowCount === 0) continue; // no hubo failover para esta fila, o ya se reconcilió antes
+
+    for (const filaHuerfana of huerfana.rows) {
+      const pkHuerfana = primaryKeys.map((c) => filaHuerfana[c]);
+      const mismoRegistro = pkHuerfana.every((v, i) => String(v) === String(pkD1[i]));
+      if (mismoRegistro) continue; // ya reconciliada en una pasada anterior
+
+      const condiciones = primaryKeys.map((c, i) => `${escaparIdentificador(c)} = $${i + 1}`).join(" AND ");
+      try {
+        await client.query(`DELETE FROM ${escaparIdentificador(table)} WHERE ${condiciones};`, pkHuerfana);
+        huerfanasEliminadas++;
+        console.warn(
+          `[reconciliacion-write-id] ${table}: fila huérfana ${JSON.stringify(pkHuerfana)} ` +
+          `(origin_write_id=${rowD1.origin_write_id}) eliminada; sustituida por la fila definitiva ` +
+          `de D1 ${JSON.stringify(pkD1)}.`
+        );
+      } catch (error) {
+        // No se aborta el lote por un conflicto de borrado (p.ej. una FK de
+        // otra tabla apuntando todavía a esta fila huérfana): se registra
+        // para revisión manual y se continúa -- perder la fila entera de la
+        // sincronización sería peor que dejar temporalmente el duplicado.
+        conflictos.push({ table, pkHuerfana, pkD1, origin_write_id: rowD1.origin_write_id, error: error.message });
+        console.error(
+          `[reconciliacion-write-id] no se pudo eliminar la fila huérfana ${JSON.stringify(pkHuerfana)} ` +
+          `de ${table} (origin_write_id=${rowD1.origin_write_id}): ${error.message}`
+        );
+        try {
+          await client.query(
+            `INSERT INTO sync_write_id_conflicts (table_name, origin_write_id, pk_huerfana, pk_d1, error_message)
+             VALUES ($1, $2, $3, $4, $5);`,
+            [table, rowD1.origin_write_id, JSON.stringify(pkHuerfana), JSON.stringify(pkD1), error.message]
+          );
+        } catch (logError) {
+          // Si ni siquiera se puede dejar constancia del conflicto (p.ej.
+          // esta misma migración 004 no se ha aplicado todavía), no se
+          // pierde silenciosamente: queda al menos en el log de arriba.
+          console.error(`[reconciliacion-write-id] no se pudo registrar el conflicto en sync_write_id_conflicts: ${logError.message}`);
+        }
+      }
+    }
+  }
+
+  return { huerfanasEliminadas, conflictos };
+}
+
+/**
  * Reconciliación autoritativa D1 -> PostgreSQL.
  *
  * Se usa en tablas pequeñas/sensibles donde PostgreSQL debe quedar como una

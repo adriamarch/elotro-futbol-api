@@ -25,6 +25,17 @@
 -- queda en status='failed' con el motivo, visible para revisión manual --
 -- nunca se fuerza ni se descarta en silencio.
 --
+-- ACTUALIZACIÓN: el segundo límite que sigue documentado más abajo (IDs
+-- duplicados en altas) quedó resuelto en la práctica -aunque no probado
+-- contra infraestructura real, ver la nota al final de esta sección- por
+-- worker/migracion_origin_write_id.sql +
+-- worker-secondary/db/migrations/004_origin_write_id.sql +
+-- sync/pg-writer.mjs (reconciliarFilasPorOriginWriteId), enganchado en
+-- sync/incremental.mjs. Se deja aquí el razonamiento original íntegro
+-- porque sigue siendo la explicación correcta del PROBLEMA; lo que cambió
+-- es que ahora existe un mecanismo que lo resuelve automáticamente en la
+-- sincronización, en vez de requerir revisión manual en todos los casos.
+--
 -- SEGUNDO LÍMITE IMPORTANTE -- IDs duplicados en altas (INSERT): cuando la
 -- escritura pendiente es un INSERT (crear un artículo/resultado/etc.
 -- nuevo), D1 le asigna su PROPIO id autoincremental al reproducirla, que
@@ -39,6 +50,34 @@
 -- sentado que "ya se sincronizó sola" solo porque status='applied'. Las
 -- ediciones (UPDATE) y borrados (DELETE) sobre un registro que YA existía
 -- antes del failover no tienen este problema, porque su id no cambia.
+--
+-- CÓMO FUNCIONA LA RESOLUCIÓN (ver migracion_origin_write_id.sql para el
+-- detalle completo): el mismo write_id que identifica esta fila en la cola
+-- ahora viaja también como cabecera X-Write-Id hasta la fila de negocio
+-- misma (columna origin_write_id en articles/results, en D1 Y en
+-- PostgreSQL). Cuando D1 reproduce el INSERT, su fila nueva lleva ese
+-- mismo origin_write_id. En la siguiente sincronización D1 -> PostgreSQL,
+-- antes del upsert normal por PK, se busca en PostgreSQL una fila con ese
+-- mismo origin_write_id: si existe con un PK distinto (la huérfana del
+-- failover), se elimina, y el upsert que sigue inserta limpiamente la fila
+-- con el id definitivo de D1 -- resultado neto: una sola fila, no dos.
+--
+-- Si el borrado de la huérfana fallara (por ejemplo, otra fila creada
+-- también durante el mismo failover que la referencia por FK), el
+-- conflicto se registra en sync_write_id_conflicts para revisión manual en
+-- vez de forzarlo o descartarlo en silencio -- el caso "revisar a mano"
+-- sigue existiendo, pero ahora es la EXCEPCIÓN (un conflicto de FK
+-- concreto) y no la REGLA (cualquier alta durante cualquier failover).
+--
+-- NOTA DE VALIDACIÓN: igual que el resto de esta fase, este mecanismo
+-- tiene tests unitarios que sí se ejecutan (ver
+-- worker-secondary/sync/test/write-id-reconciliation.test.mjs) cubriendo
+-- la lógica de reconciliarFilasPorOriginWriteId contra un client de
+-- PostgreSQL simulado, pero NO se ha podido probar de extremo a extremo
+-- contra D1/PostgreSQL reales dentro de un failover real (misma
+-- limitación de infraestructura que el resto del documento). No se declara
+-- "validado en producción" -- solo "implementado y probado a nivel de
+-- unidad", siguiendo el mismo criterio que el resto de esta fase.
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS pending_writes (

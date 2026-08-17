@@ -115,6 +115,14 @@ export async function drenarEscriturasPendientes() {
 }
 
 async function llamarWorker(rows) {
+  // write_id viaja también aquí (además de como identificador de la fila
+  // de la cola) para que el Worker lo inyecte como cabecera X-Write-Id al
+  // reproducir la escritura contra D1 -- ver drainPendingWrites en
+  // worker/src/index.js. Es el mismo UUID que, si esta escritura creó una
+  // fila en Postgres durante el failover, ya quedó guardado en su columna
+  // origin_write_id (ver server-railway.js); al llegar aquí con el mismo
+  // id, D1 crea su fila con origin_write_id igual, permitiendo reconciliar
+  // ambas como una sola en la siguiente sincronización en vez de duplicar.
   const body = JSON.stringify({
     writes: rows.map((r) => ({
       write_id: r.write_id,

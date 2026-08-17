@@ -35,6 +35,11 @@ const RUTAS_EXCLUIDAS = new Set([
   "/api/login",
   "/api/forgot-password",
   "/api/forgot-password/confirmar",
+  // Dispara internamente publicarArticulosProgramados/etc. (ver
+  // ejecutarCronRespaldo en index.js), que ya hacen sus propias
+  // escrituras SQL. No tiene body de negocio reproducible: encolarlo
+  // solo generaría entradas basura en pending_writes.
+  "/api/internal/cron-respaldo",
 ]);
 
 export function debeEncolarse(method, path) {

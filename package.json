@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/server-railway.js",
+    "cron:respaldo": "node scripts/cron-respaldo.mjs",
     "test": "node --test test/*.test.mjs",
     "test:railway": "node scripts/validate-railway.mjs",
     "db:sync-sequences": "node scripts/sync-identity-sequences.mjs",

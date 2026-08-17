@@ -1417,6 +1417,99 @@ async function publicarArticulosProgramados(env) {
   }
 }
 
+/*
+ * ================================================================
+ * CRON DE RESPALDO — implementación
+ * ================================================================
+ *
+ * Llamado por /api/internal/cron-respaldo (ver arriba). Un cron
+ * externo en Railway lo invoca cada minuto; aquí se decide si de
+ * verdad hace falta actuar.
+ */
+
+// URL pública del Worker principal para comprobar si sigue vivo antes de
+// actuar. Se puede sobrescribir con la variable de entorno PRIMARY_HEALTH_URL
+// (por ejemplo, si el subdominio workers.dev cambiara), pero por defecto
+// usa el mismo dominio que ya conoce el frontend (ver public/js/config.js).
+const PRIMARY_HEALTH_URL_POR_DEFECTO = "https://elotrofutbol-api.adriamarch2010.workers.dev/api/health";
+
+// Si el primario no contesta en este tiempo, se considera caído. Corto a
+// propósito: este endpoint lo llama un cron cada minuto, así que no puede
+// quedarse colgado esperando -- mejor asumir que está caído y, en el peor
+// caso, no hacer nada este minuto concreto (se reintenta en el siguiente).
+const TIMEOUT_COMPROBACION_PRIMARIA_MS = 8000;
+
+async function primariaEstaViva(env) {
+  const url = env.PRIMARY_HEALTH_URL || PRIMARY_HEALTH_URL_POR_DEFECTO;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_COMPROBACION_PRIMARIA_MS);
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    // Un 503 de /api/health significa "Worker vivo pero D1 degradado": en
+    // ese caso SÍ debe actuar el respaldo, porque el cron del primario usa
+    // ese mismo D1 y probablemente esté fallando igual. Solo se considera
+    // "viva" si responde 2xx con database: true.
+    if (!res.ok) return false;
+    const data = await res.json().catch(() => null);
+    return !!(data && data.database === true);
+  } catch {
+    // Error de red, timeout, DNS... el primario no es alcanzable.
+    return false;
+  }
+}
+
+async function ejecutarCronRespaldo(request, env, ctx) {
+  const secretoEsperado = env.INTERNAL_CRON_SECRET;
+  if (!secretoEsperado) {
+    // Igual que drainPendingWrites en el primario: fallo cerrado si no
+    // hay secreto configurado, para que este endpoint nunca quede
+    // accesible sin protección por un descuido de configuración.
+    return json({ error: "Endpoint interno no configurado" }, 503);
+  }
+  const secretoRecibido = request.headers.get("X-Internal-Cron-Secret");
+  if (!secretoRecibido || secretoRecibido !== secretoEsperado) {
+    return json({ error: "No autorizado" }, 401);
+  }
+
+  const primariaViva = await primariaEstaViva(env);
+  if (primariaViva) {
+    // El primario sigue sirviendo tráfico con D1 sano: su propio cron
+    // trigger ya se encarga de estas tareas. Actuar aquí también
+    // publicaría cada noticia programada dos veces (una desde cada
+    // backend). No se hace nada, y se informa en la respuesta para que
+    // el log del cron externo en Railway quede claro.
+    return json({ ok: true, actuado: false, motivo: "primaria_viva" });
+  }
+
+  console.warn("[cron-respaldo] Primaria no responde: ejecutando tareas programadas contra Postgres.");
+
+  const resultados = {};
+  try {
+    await publicarArticulosProgramados(env);
+    resultados.articulos = "ok";
+  } catch (error) {
+    console.error("[cron-respaldo] Error publicando artículos programados:", error);
+    resultados.articulos = `error: ${error.message}`;
+  }
+  try {
+    await iniciarPartidosProgramadosCuyaHoraHaLlegado(env);
+    resultados.partidos = "ok";
+  } catch (error) {
+    console.error("[cron-respaldo] Error iniciando partidos programados:", error);
+    resultados.partidos = `error: ${error.message}`;
+  }
+  try {
+    await revisarPartidosDesatendidos(env, ctx);
+    resultados.avisos = "ok";
+  } catch (error) {
+    console.error("[cron-respaldo] Error revisando partidos desatendidos:", error);
+    resultados.avisos = `error: ${error.message}`;
+  }
+
+  return json({ ok: true, actuado: true, motivo: "primaria_caida", resultados });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -1435,6 +1528,38 @@ export default {
     const origenWriteId = request.headers.get("X-Write-Id") || null;
 
     if (method === "OPTIONS") return cors(new Response(null, { status: 204 }));
+
+    /*
+     * ============================================================
+     * CRON DE RESPALDO (tareas programadas cuando el primario cae)
+     * ============================================================
+     *
+     * El Worker principal de Cloudflare tiene un cron trigger
+     * (worker/wrangler.toml, "* * * * *") que cada minuto publica
+     * noticias programadas, arranca partidos programados y avisa de
+     * partidos desatendidos (ver publicarArticulosProgramados,
+     * iniciarPartidosProgramadosCuyaHoraHaLlegado y
+     * revisarPartidosDesatendidos, todas abajo). Ese cron SOLO existe
+     * en el Worker principal -- deliberadamente desactivado aquí en
+     * el wrangler.toml heredado de este directorio, para no disparar
+     * la misma tarea dos veces si ambos backends estuvieran vivos a
+     * la vez.
+     *
+     * Si el Worker principal deja de responder por completo (no solo
+     * D1, sino el propio dominio inalcanzable), su cron deja de
+     * ejecutarse y nada lo sustituye: las noticias programadas no se
+     * publican solas, los partidos programados no arrancan. Este
+     * endpoint es el respaldo para ese caso: un cron EXTERNO
+     * configurado en Railway (ver README de este directorio) lo llama
+     * cada minuto, protegido por un secreto compartido
+     * (INTERNAL_CRON_SECRET). Antes de ejecutar nada, comprueba que el
+     * primario de verdad no responde -- si respondiera, no hace nada,
+     * precisamente para no duplicar publicaciones.
+     * ============================================================
+     */
+    if (path === "/api/internal/cron-respaldo" && method === "POST") {
+      return await ejecutarCronRespaldo(request, env, ctx);
+    }
 
     // ---------- SITEMAP DE NOTICIAS ----------
     // GET /sitemap-noticias.xml — mismo endpoint que worker/src/index.js

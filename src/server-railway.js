@@ -36,6 +36,14 @@ const env = {
   CLOUDINARY_API_KEY: process.env.CLOUDINARY_API_KEY,
   CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET,
   CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME,
+  // Protege POST /api/internal/cron-respaldo (ver src/index.js): debe
+  // coincidir con el valor puesto en el cron externo de Railway que
+  // llama a este endpoint (cabecera X-Internal-Cron-Secret).
+  INTERNAL_CRON_SECRET: process.env.INTERNAL_CRON_SECRET,
+  // Opcional: sobrescribe la URL de /api/health del primario que usa
+  // ese mismo endpoint para decidir si debe actuar. Si no se define, usa
+  // el dominio workers.dev por defecto (ver src/index.js).
+  PRIMARY_HEALTH_URL: process.env.PRIMARY_HEALTH_URL,
 };
 
 // Fallo rápido y con mensaje claro si falta JWT_SECRET: sin validar esto

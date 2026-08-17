@@ -1428,10 +1428,11 @@ async function publicarArticulosProgramados(env) {
  */
 
 // URL pública del Worker principal para comprobar si sigue vivo antes de
-// actuar. Se puede sobrescribir con la variable de entorno PRIMARY_HEALTH_URL
-// (por ejemplo, si el subdominio workers.dev cambiara), pero por defecto
-// usa el mismo dominio que ya conoce el frontend (ver public/js/config.js).
-const PRIMARY_HEALTH_URL_POR_DEFECTO = "https://elotrofutbol-api.adriamarch2010.workers.dev/api/health";
+// actuar. Se puede sobrescribir con la variable de entorno PRIMARY_HEALTH_URL,
+// pero por defecto usa el mismo dominio propio que ya usa el frontend (ver
+// public/js/config.js) en vez del workers.dev subdomain de la cuenta, que
+// se ha demostrado inestable (se desactivaba solo).
+const PRIMARY_HEALTH_URL_POR_DEFECTO = "https://api.elotrofutbol.media/api/health";
 
 // Si el primario no contesta en este tiempo, se considera caído. Corto a
 // propósito: este endpoint lo llama un cron cada minuto, así que no puede

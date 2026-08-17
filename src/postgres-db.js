@@ -9,6 +9,17 @@ const pool = new Pool({
   ssl: process.env.PGSSL === "disable" ? false : undefined,
 });
 
+console.log("[postgres] DATABASE_URL configurada:", Boolean(process.env.DATABASE_URL));
+
+try {
+  const u = new URL(process.env.DATABASE_URL);
+  console.log("[postgres] host:", u.hostname);
+  console.log("[postgres] port:", u.port || "5432");
+  console.log("[postgres] database:", u.pathname);
+} catch (error) {
+  console.error("[postgres] DATABASE_URL inválida:", error.message);
+}
+
 const TABLES_WITH_ID = new Set([
   "users","articles","results","match_events","media","custom_clubs",
   "edit_requests","comments","club_info_solicitudes","activity_log",

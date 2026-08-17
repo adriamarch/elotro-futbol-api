@@ -15,6 +15,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import handler from "./index.js";
 import { createD1CompatDb, checkPostgres, checkSyncFreshness } from "./postgres-db.js";
+import { debeEncolarse, encolarEscritura, contarPendientes } from "./pending-writes.js";
 
 const app = new Hono();
 app.use(
@@ -101,8 +102,72 @@ app.get("/api/health", async (c) => {
 
 app.all("*", async (c) => {
   if (c.req.path === "/api/health") return c.notFound();
+  if (c.req.path === "/api/internal/pending-writes-count") {
+    // Solo diagnóstico (panel/monitorización), sin datos sensibles del
+    // contenido de las escrituras -- por eso no pasa por requireAuth de
+    // index.js. No se expone el contenido de la cola aquí, solo conteos.
+    const counts = await contarPendientes();
+    return c.json(counts);
+  }
+
+  const method = c.req.method;
+  const path = c.req.path;
+  const esFailoverReal = c.req.header("X-Failover-Origin") === "worker-primary";
+
   const ctx = { waitUntil(promise) { Promise.resolve(promise).catch((error) => console.error("[waitUntil]", error)); } };
-  return handler.fetch(c.req.raw, env, ctx);
+
+  // Si esta escritura puede necesitar encolarse, hace falta leer el body
+  // ANTES de pasarlo a handler.fetch (que también lo consume) -- de ahí el
+  // clone(). Para el resto de peticiones (GET, o failover no confirmado)
+  // no merece la pena el coste de leer y clonar el body sin necesidad.
+  const candidataAEncolar = esFailoverReal && debeEncolarse(method, path);
+  let bodyTexto = null;
+  if (candidataAEncolar) {
+    try {
+      bodyTexto = await c.req.raw.clone().text();
+    } catch (error) {
+      console.error("[pending-writes] no se pudo leer el body para encolar:", error.message);
+    }
+  }
+
+  const response = await handler.fetch(c.req.raw, env, ctx);
+
+  if (candidataAEncolar && response.status < 500) {
+    // Solo se encola si Postgres/Railway la atendió con éxito (< 500): si
+    // Railway también la rechazó (validación, permisos, etc.), no hay nada
+    // que reproducir -- el usuario ya vio el error y no hizo falta cambiar
+    // nada. Encolarla igualmente duplicaría trabajo sin sentido cuando D1
+    // vuelva, y generaría fallos previsibles en la cola por el mismo
+    // motivo que ya falló aquí.
+    let userId = null;
+    try {
+      const auth = c.req.header("Authorization") || "";
+      const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+      if (token) {
+        const payloadB64 = token.split(".")[1];
+        if (payloadB64) {
+          const payload = JSON.parse(Buffer.from(payloadB64.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
+          userId = payload.uid ?? null;
+        }
+      }
+    } catch {
+      // Decodificación best-effort solo para metadata de auditoría; un
+      // JWT raro no debe impedir encolar la escritura.
+    }
+    ctx.waitUntil(
+      encolarEscritura({
+        method,
+        path,
+        queryString: new URL(c.req.url).search,
+        body: bodyTexto,
+        authorizationHeader: c.req.header("Authorization") || null,
+        userId,
+        originalStatus: response.status,
+      })
+    );
+  }
+
+  return response;
 });
 
 const port = Number(process.env.PORT) || 8080;

@@ -1,28 +1,22 @@
+#!/usr/bin/env node
 import pg from "pg";
-
-const client = new pg.Client({
+const { Client } = pg;
+if (!process.env.DATABASE_URL) throw new Error("Falta DATABASE_URL en las variables de entorno.");
+const client = new Client({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: process.env.PGSSL === "disable" ? false : { rejectUnauthorized: false },
 });
-
+await client.connect();
 try {
-  await client.connect();
-
-  const result = await client.query(`
+  const r = await client.query(`
     UPDATE sync_state
-    SET
-      status = 'abandoned',
-      finished_at = CURRENT_TIMESTAMP
+    SET status = 'abandoned', finished_at = CURRENT_TIMESTAMP,
+        detail = COALESCE(detail, '{}'::jsonb) || jsonb_build_object('reason', 'manual_unlock')
     WHERE status = 'running'
-    RETURNING run_id, started_at
+    RETURNING run_id, started_at;
   `);
-
-  if (result.rows.length) {
-    console.log("DESBLOQUEADO:");
-    console.table(result.rows);
-  } else {
-    console.log("NO HABIA BLOQUEO");
-  }
+  if (!r.rowCount) console.log("No había ninguna sincronización bloqueada.");
+  else console.log(`Desbloqueadas ${r.rowCount} sincronización(es): ${r.rows.map(x => x.run_id).join(", ")}`);
 } finally {
   await client.end();
 }

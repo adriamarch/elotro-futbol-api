@@ -24,6 +24,7 @@
 
 import { pathToFileURL } from "node:url";
 import { ejecutarSincronizacionIncremental } from "./incremental.mjs";
+import { drenarEscriturasPendientes } from "./drain.mjs";
 
 const INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS || 60_000);
 
@@ -40,6 +41,20 @@ async function bucle() {
       console.error("Error en pasada de sincronización:", error.message);
       // No relanzamos: el scheduler debe seguir vivo para el próximo
       // intento aunque una pasada falle por completo.
+    }
+    try {
+      // Se ejecuta DESPUÉS del sync D1 -> Postgres de arriba, en la misma
+      // pasada: primero se trae lo nuevo de D1, luego se intenta subir lo
+      // que quedó pendiente de la secundaria. Este orden importa: si se
+      // drenara ANTES del sync, una escritura que originalmente vino de
+      // Postgres podría "chocar" en la reconciliación autoritativa de esa
+      // misma pasada contra una versión más vieja de D1 leída unos
+      // segundos antes. Drenando después, la fila recién aplicada en D1
+      // se recoge recién en la SIGUIENTE pasada, cuando ya es indistingible
+      // de cualquier otro cambio hecho directamente en D1. Ver sync/drain.mjs.
+      await drenarEscriturasPendientes();
+    } catch (error) {
+      console.error("Error drenando escrituras pendientes:", error.message);
     }
     await new Promise((resolve) => setTimeout(resolve, INTERVAL_MS));
   }

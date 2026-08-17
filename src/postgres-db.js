@@ -29,10 +29,23 @@ class PreparedStatement {
   constructor(db, sql) { this.db = db; this.sql = sql; this.params = []; }
   bind(...params) { this.params = params; return this; }
   async first() {
-    const q = bindable(this.sql, this.params);
+  const q = bindable(this.sql, this.params);
+  try {
     const r = await this.db.query(q.sql, q.params);
     return r.rows[0] ?? null;
+  } catch (error) {
+    console.error("[postgres:first]", {
+      originalSql: this.sql,
+      translatedSql: q.sql,
+      params: q.params,
+      message: error?.message,
+      code: error?.code,
+      detail: error?.detail,
+      hint: error?.hint,
+    });
+    throw error;
   }
+}
   async all() {
     const q = bindable(this.sql, this.params);
     const r = await this.db.query(q.sql, q.params);

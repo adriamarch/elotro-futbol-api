@@ -18,6 +18,16 @@ export function translateSql(sql, params = []) {
   // Se traduce ANTES de convertir "?" en "$n" para no interferir con esa
   // conversión (que ya cuenta cuántos "?" hay en la cadena).
   out = out.replace(/\bIS\s+\?/gi, "IS NOT DISTINCT FROM ?");
+  // "<columna> COLLATE NOCASE" (típicamente en ORDER BY, para que la a-z
+  // ignore mayúsculas/minúsculas) es una collation de SQLite que no existe
+  // en PostgreSQL de serie -- "collation \"nocase\" for encoding \"UTF8\"
+  // does not exist". El equivalente sin depender de tener esa collation
+  // instalada en el servidor de Postgres es envolver la columna en
+  // LOWER(...): mismo efecto práctico (orden alfabético insensible a
+  // mayúsculas), sin requerir configuración adicional en la base de datos.
+  // Se captura la palabra/columna inmediatamente anterior a "COLLATE
+  // NOCASE" (nombres de columna válidos: letras, dígitos, guión bajo).
+  out = out.replace(/(\w+)\s+COLLATE\s+NOCASE/gi, "LOWER($1)");
   out = out.replace(/\?(\d+)/g, (_, index) => { n = Math.max(n, Number(index)); return `$${index}`; });
   out = out.replace(/\?/g, () => `$${++n}`);
   return { sql: out, params };

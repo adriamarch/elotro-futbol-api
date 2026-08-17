@@ -459,14 +459,6 @@ function b64urlDecode(str) {
   return atob(str);
 }
 async function signHS256(data, secret) {
-  if (!secret) {
-    // Sin esta comprobación, un JWT_SECRET vacío/undefined revienta más
-    // abajo en crypto.subtle.importKey con "Zero-length key is not
-    // supported" -- un mensaje que no menciona la causa real (falta
-    // configurar la variable de entorno) y que aparece igual de críptico
-    // tanto al firmar un login nuevo como al verificar un token existente.
-    throw new Error("JWT_SECRET no está configurado (variable de entorno vacía o ausente)");
-  }
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
@@ -506,38 +498,15 @@ async function requireAuth(request, env, url) {
   // el JWT todavía no haya caducado. Los JWT antiguos (emitidos antes de
   // este cambio) no llevan "sid"; se siguen aceptando hasta que caduquen
   // por sí solos, para no desconectar a todo el mundo de golpe.
-  //
-  // IMPORTANTE (secundaria/Railway): esta base de datos es una RÉPLICA de
-  // D1, que recibe las sesiones nuevas con el retraso propio del
-  // sincronizador (por defecto hasta 60s, ver sync/scheduler.mjs). Si se
-  // exige aquí "la fila existe y no está revocada" igual que en la
-  // primaria, cualquier login o petición que llegue a la secundaria antes
-  // de que su sesión se haya sincronizado se rechaza como si el usuario no
-  // estuviera autenticado — en la práctica, esto tumbaba TODO el panel de
-  // administración durante un failover (todas las rutas protegidas usan
-  // requireAuth), mientras que las rutas públicas sin auth (como
-  // /api/results) seguían funcionando con normalidad, dando la falsa
-  // impresión de que "solo resultados funciona en la secundaria".
-  //
-  // La distinción correcta es entre "la fila NO existe todavía" (aún no
-  // sincronizada: el JWT ya demuestra que hubo un login válido, así que se
-  // deja pasar) y "la fila SÍ existe pero está revocada" (alguien cerró
-  // esa sesión explícitamente: eso sí debe bloquear, y ya habrá llegado a
-  // la secundaria en cuanto se sincronice el cierre de sesión).
   if (payload.sid) {
     const sesion = await env.DB.prepare(
-      "SELECT id, revoked_at FROM sessions WHERE id = ? AND user_id = ?"
+      "SELECT id FROM sessions WHERE id = ? AND user_id = ? AND revoked_at IS NULL"
     ).bind(payload.sid, payload.uid).first();
-    if (sesion && sesion.revoked_at) return null;
-    if (sesion) {
-      // No bloqueamos la respuesta por esto: es solo para que la lista de
-      // "Mis sesiones" muestre cuándo se ha usado cada una por última vez.
-      env.DB.prepare("UPDATE sessions SET last_seen_at = datetime('now') WHERE id = ?")
-        .bind(payload.sid).run().catch(() => {});
-    }
-    // Si sesion es null (aún no sincronizada), se deja pasar: el JWT
-    // firmado con JWT_SECRET ya es prueba suficiente de que el login fue
-    // legítimo en su momento.
+    if (!sesion) return null;
+    // No bloqueamos la respuesta por esto: es solo para que la lista de
+    // "Mis sesiones" muestre cuándo se ha usado cada una por última vez.
+    env.DB.prepare("UPDATE sessions SET last_seen_at = datetime('now') WHERE id = ?")
+      .bind(payload.sid).run().catch(() => {});
   }
   return payload;
 }

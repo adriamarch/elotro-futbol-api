@@ -36,6 +36,27 @@ const env = {
   CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME,
 };
 
+// Fallo rápido y con mensaje claro si falta JWT_SECRET: sin validar esto
+// aquí, el servicio arranca sin problema (Node no se queja de una env var
+// vacía), pero la primera vez que alguien inicia sesión, el código de
+// firma de JWT (signHS256, vía crypto.subtle.importKey con una clave de
+// longitud 0) revienta con "DOMException: Zero-length key is not
+// supported" -- un error sin relación aparente con "falta una variable de
+// entorno", que además solo aparece en el peor momento posible: cuando la
+// primaria ya ha caído y el panel entero depende de que el login funcione
+// en la secundaria. Mejor no arrancar en absoluto que arrancar roto.
+if (!process.env.JWT_SECRET) {
+  console.error(
+    "[worker-secondary] FALTA la variable de entorno JWT_SECRET. " +
+    "Debe tener EXACTAMENTE el mismo valor que el JWT_SECRET configurado " +
+    "en el Worker primario de Cloudflare (wrangler secret put JWT_SECRET), " +
+    "si no, los tokens emitidos por una API no se podrán validar en la " +
+    "otra. Configúrala en las variables de entorno del servicio de " +
+    "Railway y vuelve a desplegar."
+  );
+  process.exit(1);
+}
+
 app.get("/api/health", async (c) => {
   try {
     const database = await checkPostgres();

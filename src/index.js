@@ -534,10 +534,56 @@ async function requireAuth(request, env, url) {
       // "Mis sesiones" muestre cuándo se ha usado cada una por última vez.
       env.DB.prepare("UPDATE sessions SET last_seen_at = datetime('now') WHERE id = ?")
         .bind(payload.sid).run().catch(() => {});
+    } else {
+      // FIX SEGURIDAD (2026-08): "sesion === null" es ambiguo. Puede
+      // significar de verdad "aún no sincronizada" (retraso normal del
+      // sincronizador, hasta ~60s) o puede significar "el sincronizador
+      // está caído/no desplegado y esta fila JAMÁS va a llegar" -- por
+      // ejemplo, si alguien revocó esta sesión hace horas y el proceso
+      // sync/scheduler.mjs lleva parado desde entonces. Sin distinguir
+      // ambos casos, un JWT robado o de una sesión cerrada explícitamente
+      // se aceptaría en la secundaria de forma indefinida, precisamente
+      // en el escenario donde más importa (failover con la primaria caída).
+      //
+      // Se comprueba la frescura real del sincronizador consultando
+      // sync_cursor para la tabla "sessions" (actualizado por
+      // sync/incremental.mjs en cada pasada que toca esa tabla). Si el
+      // cursor está más desactualizado que UMBRAL_SYNC_STALE_MS, se
+      // considera que el sincronizador no está operativo y se falla
+      // cerrado (se rechaza el token) en vez de fiarse ciegamente del JWT.
+      //
+      // Margen elegido: 5 minutos. El intervalo normal del scheduler es de
+      // 60s (SYNC_INTERVAL_MS), así que 5 minutos da margen de sobra para
+      // picos de carga o un reintento puntual sin generar falsos rechazos,
+      // pero sigue detectando un sincronizador realmente caído mucho antes
+      // de que se convierta en un problema de horas o días.
+      const UMBRAL_SYNC_STALE_MS = 5 * 60 * 1000;
+      let sincronizadorSano = false;
+      try {
+        const cursorSessions = await env.DB.prepare(
+          "SELECT last_synced_at FROM sync_cursor WHERE table_name = ?"
+        ).bind("sessions").first();
+        if (cursorSessions && cursorSessions.last_synced_at) {
+          const antiguedadMs = Date.now() - new Date(cursorSessions.last_synced_at).getTime();
+          sincronizadorSano = antiguedadMs <= UMBRAL_SYNC_STALE_MS;
+        }
+        // Si no hay fila de cursor todavía (p. ej. justo tras el
+        // despliegue inicial, antes de la primera pasada), no se puede
+        // afirmar que el sincronizador esté sano: se trata igual que
+        // "caído" y se falla cerrado, por prudencia.
+      } catch (error) {
+        // Si ni siquiera se puede leer sync_cursor (tabla no migrada,
+        // Postgres con problemas, etc.), tampoco hay forma de confiar en
+        // que la sincronización esté funcionando: se falla cerrado.
+        console.error("[requireAuth] no se pudo comprobar sync_cursor de sessions:", error.message);
+        sincronizadorSano = false;
+      }
+      if (!sincronizadorSano) return null;
+      // El sincronizador está operativo y al día: se asume que esta fila
+      // en concreto todavía no ha llegado por el retraso normal de una
+      // pasada (segundos), no porque esté todo caído. El JWT firmado con
+      // JWT_SECRET es prueba suficiente de que el login fue legítimo.
     }
-    // Si sesion es null (aún no sincronizada), se deja pasar: el JWT
-    // firmado con JWT_SECRET ya es prueba suficiente de que el login fue
-    // legítimo en su momento.
   }
   return payload;
 }

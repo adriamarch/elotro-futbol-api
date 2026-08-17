@@ -107,4 +107,37 @@ export async function checkPostgres() {
   return { ok: r.rows[0]?.ok === 1, responseTime: Date.now() - started };
 }
 
+// Mismo umbral que UMBRAL_SYNC_STALE_MS en requireAuth (index.js): si el
+// cursor de sincronización de "sessions" lleva más de esto sin avanzar, el
+// sincronizador (sync/scheduler.mjs, proceso Node aparte) se considera
+// caído/no desplegado, no solo "con retraso normal".
+const UMBRAL_SYNC_STALE_MS = 5 * 60 * 1000;
+
+export async function checkSyncFreshness() {
+  try {
+    const r = await pool.query(
+      "SELECT last_synced_at FROM sync_cursor WHERE table_name = $1",
+      ["sessions"]
+    );
+    const lastSyncedAt = r.rows[0]?.last_synced_at ?? null;
+    if (!lastSyncedAt) {
+      // Sin fila de cursor todavía: no hay forma de confirmar que el
+      // sincronizador haya corrido nunca. Se reporta como "stale" para que
+      // salte en monitorización, igual que hace requireAuth (falla cerrado
+      // en este mismo caso).
+      return { stale: true, lastSyncedAt: null, staleForMs: null, reason: "sin_cursor_todavia" };
+    }
+    const staleForMs = Date.now() - new Date(lastSyncedAt).getTime();
+    return {
+      stale: staleForMs > UMBRAL_SYNC_STALE_MS,
+      lastSyncedAt,
+      staleForMs,
+      reason: staleForMs > UMBRAL_SYNC_STALE_MS ? "sincronizador_caido_o_lento" : null,
+    };
+  } catch (error) {
+    console.error("[postgres] no se pudo comprobar sync_cursor:", error.message);
+    return { stale: true, lastSyncedAt: null, staleForMs: null, reason: `error: ${error.message}` };
+  }
+}
+
 export async function closePostgres() { await pool.end(); }

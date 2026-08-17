@@ -14,7 +14,7 @@ import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import handler from "./index.js";
-import { createD1CompatDb, checkPostgres } from "./postgres-db.js";
+import { createD1CompatDb, checkPostgres, checkSyncFreshness } from "./postgres-db.js";
 
 const app = new Hono();
 app.use(
@@ -60,7 +60,39 @@ if (!process.env.JWT_SECRET) {
 app.get("/api/health", async (c) => {
   try {
     const database = await checkPostgres();
-    return c.json({ status: database.ok ? "ok" : "degraded", database: database.ok, storage: null, responseTime: database.responseTime, api: "secondary" }, database.ok ? 200 : 503);
+    // Estado del sincronizador D1 -> PostgreSQL (proceso Node aparte,
+    // sync/scheduler.mjs). requireAuth confía en que este proceso esté
+    // sano para poder aceptar sesiones aún no replicadas sin arriesgarse a
+    // aceptar sesiones revocadas que nunca lleguen a sincronizarse (ver
+    // comentario junto a UMBRAL_SYNC_STALE_MS en index.js). Se expone aquí
+    // para poder monitorizarlo y alertar si se cae, en vez de descubrirlo
+    // solo cuando falla un intento de revocar una sesión.
+    const sync = await checkSyncFreshness();
+    // Nota deliberada: el estado HTTP (200/503) de este healthcheck sigue
+    // dependiendo solo de "database" (Postgres), no del sincronizador. Un
+    // sincronizador caído es un problema real (ver requireAuth), pero vive
+    // en OTRO proceso/servicio (sync/scheduler.mjs) -- reiniciar este
+    // contenedor de server-railway.js no lo arregla. Si este endpoint
+    // devolviera 503 por eso, un healthcheck de plataforma (Railway) podría
+    // reiniciar el proceso equivocado en bucle sin resolver nada. Por eso
+    // "sync" se expone siempre en el body, para monitorización activa
+    // (alertas externas), sin acoplarlo al código HTTP de liveness.
+    return c.json(
+      {
+        status: database.ok ? "ok" : "degraded",
+        database: database.ok,
+        storage: null,
+        responseTime: database.responseTime,
+        api: "secondary",
+        sync: {
+          healthy: !sync.stale,
+          lastSyncedAt: sync.lastSyncedAt,
+          staleForMs: sync.staleForMs,
+          reason: sync.reason,
+        },
+      },
+      database.ok ? 200 : 503
+    );
   } catch (error) {
     console.error("[health] PostgreSQL error:", error);
     return c.json({ status: "degraded", database: false, storage: null, responseTime: null, api: "secondary" }, 503);

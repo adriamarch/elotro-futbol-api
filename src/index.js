@@ -1,5 +1,28 @@
 // ElOtroFútbol - Worker API
-// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/admin/comments, /api/club-info, /api/admin/club-info
+// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/admin/comments, /api/club-info, /api/admin/club-info, /sitemap-noticias.xml
+
+// Escapa los caracteres especiales de XML para que un título o slug con
+// "&", "<", ">", comillas, etc. no rompa el XML del sitemap.
+function escaparXml(texto) {
+  return String(texto ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+// Convierte una fecha guardada por la base de datos ("YYYY-MM-DD
+// HH:MM:SS", UTC) o un ISO string en el formato de fecha simple
+// "YYYY-MM-DD" que espera <lastmod> en un sitemap. Si no hay fecha o no
+// se puede parsear, se omite (mejor no mandar <lastmod> que uno inventado
+// o mal formado).
+function fechaParaSitemap(valor) {
+  if (!valor) return null;
+  const fecha = new Date(valor.includes("T") || valor.endsWith("Z") ? valor : `${valor.replace(" ", "T")}Z`);
+  if (Number.isNaN(fecha.getTime())) return null;
+  return fecha.toISOString().slice(0, 10);
+}
 
 
 // Convierte una fecha a texto en el mismo formato que usa SQLite para
@@ -1412,6 +1435,53 @@ export default {
     const origenWriteId = request.headers.get("X-Write-Id") || null;
 
     if (method === "OPTIONS") return cors(new Response(null, { status: 204 }));
+
+    // ---------- SITEMAP DE NOTICIAS ----------
+    // GET /sitemap-noticias.xml — mismo endpoint que worker/src/index.js
+    // (API principal). El punto de entrada público real siempre es el
+    // worker principal (elotrofutbol.media pasa por él, y es él quien
+    // reenvía a Railway internamente si D1 falla — ver fetchRailway en
+    // worker/src/index.js), así que este endpoint aquí NO se usa en
+    // producción salvo que algún día esta API secundaria se exponga ella
+    // misma con su propio dominio/ruta pública. Se mantiene por si eso
+    // ocurre y para que el código de ambas APIs no diverja en esta parte.
+    if (path === "/sitemap-noticias.xml" && method === "GET") {
+      try {
+        const { results } = await env.DB.prepare(
+          `SELECT slug, fecha_publicacion, updated_at FROM articles
+           WHERE publicado = 1
+           ORDER BY fecha_publicacion DESC
+           LIMIT 50000`
+        ).all();
+
+        const urls = results.map((articulo) => {
+          const lastmod = fechaParaSitemap(articulo.updated_at || articulo.fecha_publicacion);
+          return [
+            "  <url>",
+            `    <loc>https://elotrofutbol.media/noticia.html?slug=${escaparXml(articulo.slug)}</loc>`,
+            lastmod ? `    <lastmod>${lastmod}</lastmod>` : null,
+            "    <changefreq>weekly</changefreq>",
+            "    <priority>0.6</priority>",
+            "  </url>",
+          ].filter(Boolean).join("\n");
+        }).join("\n");
+
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>\n`;
+
+        return cors(new Response(xml, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/xml; charset=UTF-8",
+            "Cache-Control": "public, max-age=3600",
+          },
+        }));
+      } catch (err) {
+        return cors(new Response(
+          `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9"></urlset>\n`,
+          { status: 200, headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "no-store" } }
+        ));
+      }
+    }
 
     try {
       // ---------- LOGIN ----------

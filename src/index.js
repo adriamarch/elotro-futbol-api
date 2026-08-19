@@ -1649,7 +1649,7 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         return json({ ok: true });
       } catch (err) {
         console.error("[contacto-prensa]", err);
-        return json({ error: "No se pudo enviar el mensaje. Inténtalo de nuevo o escribe directamente a prensa@elotrofutbol.media." }, 500);
+        return json({ error: "No se pudo enviar el mensaje. Inténtalo de nuevo o escribe directamente a contacto@elotrofutbol.media." }, 500);
       }
     }
 

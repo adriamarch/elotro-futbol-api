@@ -1,5 +1,5 @@
 // ElOtroFútbol - Worker API
-// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/admin/comments, /api/club-info, /api/admin/club-info, /sitemap-noticias.xml
+// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/admin/comments, /api/club-info, /api/admin/club-info, /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml
 
 // Escapa los caracteres especiales de XML para que un título o slug con
 // "&", "<", ">", comillas, etc. no rompa el XML del sitemap.
@@ -35,6 +35,31 @@ function fechaParaSitemap(valor) {
 // haya pasado, y las noticias programadas se quedarían sin publicar.
 function aSqliteDatetimeUTC(fecha) {
   return fecha.toISOString().slice(0, 19).replace("T", " ");
+}
+
+// Convierte una fecha guardada por SQLite o un ISO string al formato
+// RFC-822 que exige la especificación RSS 2.0 para <pubDate>
+// (p.ej. "Tue, 18 Aug 2026 10:00:00 GMT"). Si no hay fecha o no se
+// puede parsear, se omite (igual que fechaParaSitemap con <lastmod>).
+function fechaParaRss(valor) {
+  if (!valor) return null;
+  const fecha = new Date(valor.includes("T") || valor.endsWith("Z") ? valor : `${valor.replace(" ", "T")}Z`);
+  if (Number.isNaN(fecha.getTime())) return null;
+  return fecha.toUTCString();
+}
+
+// Quita etiquetas HTML y colapsa espacios para obtener un extracto de
+// texto plano a partir del contenido (HTML) de una noticia, usable como
+// <description> en RSS. Trunca a "limite" caracteres sin cortar una
+// palabra a la mitad.
+function extractoTexto(html, limite = 300) {
+  const texto = String(html ?? "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (texto.length <= limite) return texto;
+  return texto.slice(0, texto.lastIndexOf(" ", limite)) + "…";
 }
 
 // "fecha_partido" se guarda tal cual la escribe el redactor en el
@@ -372,6 +397,10 @@ async function enviarEmailNotificacion(env, { asunto, texto, html }, { destinata
   } catch (err) {
     console.log("Error al enviar email de notificación:", err.message);
   }
+}
+
+function emailValido(email) {
+  return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
 }
 // ---------- Equipos de un usuario (hasta 3 clubes) ----------
 // Se guardan en la columna "equipo" como un array JSON en texto, p. ej.
@@ -1562,6 +1591,68 @@ export default {
       return await ejecutarCronRespaldo(request, env, ctx);
     }
 
+    // ---------- HEALTH CHECK ----------
+    // Mismo endpoint que worker/src/index.js, replicado aquí para que la
+    // página pública de estado (estado.html) pueda comprobar también la
+    // salud de la API secundaria si algún día se expone con dominio
+    // propio (ver nota de /sitemap-noticias.xml más abajo sobre por qué
+    // hoy esto no se usa en producción).
+    if (path === "/api/health" && method === "GET") {
+      try {
+        const started = Date.now();
+        await env.DB.prepare("SELECT 1 AS ok").first();
+        return json({ status: "ok", database: true, storage: null, responseTime: Date.now() - started, api: "secondary", failover: false }, 200);
+      } catch (error) {
+        console.error("[health] D1 error:", error);
+        return json({ status: "degraded", database: false, storage: null, responseTime: null, api: "secondary", failover: false }, 503);
+      }
+    }
+
+    // ---------- CONTACTO DE PRENSA ----------
+    // Mismo endpoint que worker/src/index.js. Ver nota de arriba: no se usa
+    // en producción hoy (el punto de entrada público real es siempre el
+    // worker principal), se mantiene solo para que el código no diverja.
+    if (path === "/api/contacto-prensa" && method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ error: "JSON inválido" }, 400);
+      }
+      const nombre = (body && body.nombre ? String(body.nombre) : "").trim().slice(0, 200);
+      const email = (body && body.email ? String(body.email) : "").trim().toLowerCase();
+      const medio = (body && body.medio ? String(body.medio) : "").trim().slice(0, 200);
+      const mensaje = (body && body.mensaje ? String(body.mensaje) : "").trim().slice(0, 5000);
+
+      if (!nombre) return json({ error: "Indica tu nombre" }, 400);
+      if (!emailValido(email)) return json({ error: "Introduce un email válido" }, 400);
+      if (!mensaje) return json({ error: "Escribe un mensaje" }, 400);
+
+      try {
+        const textoPlano = [
+          `Nombre: ${nombre}`,
+          `Email: ${email}`,
+          medio ? `Medio/organización: ${medio}` : null,
+          "",
+          mensaje,
+        ].filter((l) => l !== null).join("\n");
+
+        await enviarEmailNotificacion(env, {
+          asunto: `Contacto de prensa: ${nombre}`,
+          texto: textoPlano,
+          html: `<p><strong>Nombre:</strong> ${escapeHtmlEmail(nombre)}</p>
+<p><strong>Email:</strong> ${escapeHtmlEmail(email)}</p>
+${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p>` : ""}
+<p><strong>Mensaje:</strong></p>
+<p>${escapeHtmlEmail(mensaje).replace(/\n/g, "<br>")}</p>`,
+        });
+        return json({ ok: true });
+      } catch (err) {
+        console.error("[contacto-prensa]", err);
+        return json({ error: "No se pudo enviar el mensaje. Inténtalo de nuevo o escribe directamente a prensa@elotrofutbol.media." }, 500);
+      }
+    }
+
     // ---------- SITEMAP DE NOTICIAS ----------
     // GET /sitemap-noticias.xml — mismo endpoint que worker/src/index.js
     // (API principal). El punto de entrada público real siempre es el
@@ -1574,7 +1665,7 @@ export default {
     if (path === "/sitemap-noticias.xml" && method === "GET") {
       try {
         const { results } = await env.DB.prepare(
-          `SELECT slug, fecha_publicacion, updated_at FROM articles
+          `SELECT slug, titulo, imagen_url, imagenes, fecha_publicacion, updated_at FROM articles
            WHERE publicado = 1
            ORDER BY fecha_publicacion DESC
            LIMIT 50000`
@@ -1582,17 +1673,38 @@ export default {
 
         const urls = results.map((articulo) => {
           const lastmod = fechaParaSitemap(articulo.updated_at || articulo.fecha_publicacion);
+
+          // Extensión "image:" del protocolo de sitemaps — ver comentario
+          // equivalente en worker/src/index.js.
+          let listaImagenes = [];
+          try {
+            const adicionales = articulo.imagenes ? JSON.parse(articulo.imagenes) : [];
+            listaImagenes = [articulo.imagen_url, ...(Array.isArray(adicionales) ? adicionales : [])]
+              .filter(Boolean);
+          } catch {
+            listaImagenes = articulo.imagen_url ? [articulo.imagen_url] : [];
+          }
+          listaImagenes = [...new Set(listaImagenes)];
+
+          const bloquesImagen = listaImagenes.map((src) => [
+            "    <image:image>",
+            `      <image:loc>${escaparXml(src)}</image:loc>`,
+            articulo.titulo ? `      <image:caption>${escaparXml(articulo.titulo)}</image:caption>` : null,
+            "    </image:image>",
+          ].filter(Boolean).join("\n")).join("\n");
+
           return [
             "  <url>",
             `    <loc>https://elotrofutbol.media/noticia.html?slug=${escaparXml(articulo.slug)}</loc>`,
             lastmod ? `    <lastmod>${lastmod}</lastmod>` : null,
             "    <changefreq>weekly</changefreq>",
             "    <priority>0.6</priority>",
+            bloquesImagen || null,
             "  </url>",
           ].filter(Boolean).join("\n");
         }).join("\n");
 
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>\n`;
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="https://www.google.com/schemas/sitemap-image/1.1">\n${urls}\n</urlset>\n`;
 
         return cors(new Response(xml, {
           status: 200,
@@ -1605,6 +1717,112 @@ export default {
         return cors(new Response(
           `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9"></urlset>\n`,
           { status: 200, headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "no-store" } }
+        ));
+      }
+    }
+
+    // ---------- GOOGLE NEWS SITEMAP ----------
+    // GET /sitemap-news.xml — mismo endpoint que worker/src/index.js.
+    // Ver comentario de /sitemap-noticias.xml arriba sobre por qué se
+    // mantiene aquí por paridad aunque no se use en producción.
+    if (path === "/sitemap-news.xml" && method === "GET") {
+      try {
+        const { results } = await env.DB.prepare(
+          `SELECT slug, titulo, categoria, fecha_publicacion FROM articles
+           WHERE publicado = 1
+             AND fecha_publicacion >= datetime('now', '-48 hours')
+           ORDER BY fecha_publicacion DESC
+           LIMIT 1000`
+        ).all();
+
+        const urls = results.map((articulo) => {
+          const fecha = new Date(
+            articulo.fecha_publicacion.includes("T") || articulo.fecha_publicacion.endsWith("Z")
+              ? articulo.fecha_publicacion
+              : `${articulo.fecha_publicacion.replace(" ", "T")}Z`
+          );
+          if (Number.isNaN(fecha.getTime())) return null;
+
+          return [
+            "  <url>",
+            `    <loc>https://elotrofutbol.media/noticia.html?slug=${escaparXml(articulo.slug)}</loc>`,
+            "    <news:news>",
+            "      <news:publication>",
+            "        <news:name>ELOTROFÚTBOLTV</news:name>",
+            "        <news:language>es</news:language>",
+            "      </news:publication>",
+            `      <news:publication_date>${fecha.toISOString()}</news:publication_date>`,
+            `      <news:title>${escaparXml(articulo.titulo)}</news:title>`,
+            articulo.categoria ? `      <news:keywords>${escaparXml(articulo.categoria)}</news:keywords>` : null,
+            "    </news:news>",
+            "  </url>",
+          ].filter(Boolean).join("\n");
+        }).filter(Boolean).join("\n");
+
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="https://www.google.com/schemas/sitemap-news/0.9">\n${urls}\n</urlset>\n`;
+
+        return cors(new Response(xml, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/xml; charset=UTF-8",
+            "Cache-Control": "public, max-age=600",
+          },
+        }));
+      } catch (err) {
+        return cors(new Response(
+          `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="https://www.google.com/schemas/sitemap-news/0.9"></urlset>\n`,
+          { status: 200, headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "no-store" } }
+        ));
+      }
+    }
+
+    // ---------- RSS ----------
+    // GET /rss.xml — mismo endpoint que worker/src/index.js (API
+    // principal). Ver comentario de /sitemap-noticias.xml arriba: este
+    // endpoint aquí no se usa en producción salvo failover, se mantiene
+    // por paridad de código entre ambas APIs.
+    if (path === "/rss.xml" && method === "GET") {
+      try {
+        const { results } = await env.DB.prepare(
+          `SELECT slug, titulo, subtitulo, contenido, categoria, autor_nombre, fecha_publicacion, updated_at
+           FROM articles
+           WHERE publicado = 1
+           ORDER BY fecha_publicacion DESC
+           LIMIT 100`
+        ).all();
+
+        const items = results.map((articulo) => {
+          const link = `https://elotrofutbol.media/noticia.html?slug=${escaparXml(articulo.slug)}`;
+          const pubDate = fechaParaRss(articulo.fecha_publicacion);
+          const descripcion = articulo.subtitulo?.trim() || extractoTexto(articulo.contenido);
+          return [
+            "  <item>",
+            `    <title>${escaparXml(articulo.titulo)}</title>`,
+            `    <link>${link}</link>`,
+            `    <guid isPermaLink="true">${link}</guid>`,
+            descripcion ? `    <description>${escaparXml(descripcion)}</description>` : null,
+            articulo.categoria ? `    <category>${escaparXml(articulo.categoria)}</category>` : null,
+            articulo.autor_nombre ? `    <author>${escaparXml(articulo.autor_nombre)}</author>` : null,
+            pubDate ? `    <pubDate>${pubDate}</pubDate>` : null,
+            "  </item>",
+          ].filter(Boolean).join("\n");
+        }).join("\n");
+
+        const ultimaActualizacion = fechaParaRss(results[0]?.updated_at || results[0]?.fecha_publicacion) || new Date().toUTCString();
+
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:atom="https://www.w3.org/2005/Atom">\n<channel>\n  <title>ELOTROFÚTBOLTV</title>\n  <link>https://elotrofutbol.media</link>\n  <description>Últimas noticias de fútbol modesto: Primera Federación, Segunda Federación y más.</description>\n  <language>es</language>\n  <lastBuildDate>${ultimaActualizacion}</lastBuildDate>\n  <atom:link href="https://elotrofutbol.media/rss.xml" rel="self" type="application/rss+xml" />\n${items}\n</channel>\n</rss>\n`;
+
+        return cors(new Response(xml, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/rss+xml; charset=UTF-8",
+            "Cache-Control": "public, max-age=3600",
+          },
+        }));
+      } catch (err) {
+        return cors(new Response(
+          `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0"><channel><title>ELOTROFÚTBOLTV</title><link>https://elotrofutbol.media</link><description>Últimas noticias de fútbol modesto.</description></channel></rss>\n`,
+          { status: 200, headers: { "Content-Type": "application/rss+xml; charset=UTF-8", "Cache-Control": "no-store" } }
         ));
       }
     }
@@ -3657,6 +3875,11 @@ export default {
       if (path === "/api/results" && method === "GET") {
         const competicion = url.searchParams.get("competicion");
         const estado = url.searchParams.get("estado");
+        const grupo = url.searchParams.get("grupo");
+        // Filtro por equipo (para la página de equipo y el desplegable de
+        // Resultados): un partido "pertenece" a un club tanto si juega en
+        // casa como fuera, así que se compara contra las dos columnas.
+        const club = url.searchParams.get("club");
         // El límite era fijo (100) e ignoraba el "?limit=" que ya mandaba
         // el frontend (el panel de admin pide 200 para no dejarse partidos
         // fuera). Si un resultado quedaba fuera de esos 100 primeros, el
@@ -3670,6 +3893,11 @@ export default {
         const binds = [];
         if (competicion) { query += " AND competicion = ?"; binds.push(competicion); }
         if (estado) { query += " AND estado = ?"; binds.push(estado); }
+        if (grupo) { query += " AND grupo = ?"; binds.push(grupo); }
+        if (club) {
+          query += " AND (equipo_local = ? OR equipo_visitante = ?)";
+          binds.push(club, club);
+        }
         query += ` ORDER BY jornada DESC, fecha_partido DESC LIMIT ${limit}`;
         const { results } = await env.DB.prepare(query).bind(...binds).all();
         return json({ results });

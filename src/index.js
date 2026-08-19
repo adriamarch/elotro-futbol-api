@@ -715,6 +715,56 @@ async function crearSesion(env, request, user) {
   return token;
 }
 
+// ---------- Sesiones de lectores (cuentas públicas, ver readers/reader_sessions) ----------
+// Mismo patrón que requireAuth/crearSesion de arriba, pero con su propio
+// payload de JWT (lleva "rid" en vez de "uid") para que un token de
+// lector nunca pueda confundirse con uno de redactor/admin ni colarse
+// en una ruta protegida del panel.
+async function requireReaderAuth(request, env) {
+  const auth = request.headers.get("Authorization") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return null;
+  const payload = await verifyJWT(token, env.JWT_SECRET);
+  if (!payload || !payload.rid) return null;
+  if (payload.sid) {
+    const sesion = await env.DB.prepare(
+      "SELECT id FROM reader_sessions WHERE id = ? AND reader_id = ? AND revoked_at IS NULL"
+    ).bind(payload.sid, payload.rid).first();
+    if (!sesion) return null;
+    env.DB.prepare("UPDATE reader_sessions SET last_seen_at = datetime('now') WHERE id = ?")
+      .bind(payload.sid).run().catch(() => {});
+  }
+  return payload;
+}
+
+async function crearSesionLector(env, request, reader) {
+  const userAgent = request.headers.get("User-Agent") || null;
+  const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || null;
+
+  const existente = await env.DB.prepare(
+    `SELECT id FROM reader_sessions WHERE reader_id = ? AND user_agent IS ? AND revoked_at IS NULL
+     ORDER BY last_seen_at DESC LIMIT 1`
+  ).bind(reader.id, userAgent).first();
+
+  let id;
+  if (existente) {
+    id = existente.id;
+    await env.DB.prepare(
+      `UPDATE reader_sessions SET ip = ?, last_seen_at = datetime('now') WHERE id = ?`
+    ).bind(ip, id).run();
+  } else {
+    id = generarIdSesion();
+    await env.DB.prepare(
+      `INSERT INTO reader_sessions (id, reader_id, user_agent, ip) VALUES (?, ?, ?, ?)`
+    ).bind(id, reader.id, userAgent, ip).run();
+  }
+
+  return createJWT(
+    { rid: reader.id, nombre: reader.nombre, email: reader.email, sid: id },
+    env.JWT_SECRET
+  );
+}
+
 // ---------- Cloudinary ----------
 // Sustituye a R2/Drive: los archivos de "Subir contenido" se guardan en
 // Cloudinary. Solo hacen falta 3 credenciales fijas (cloud name, api key,
@@ -1828,6 +1878,215 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
     }
 
     try {
+      // ================================================================
+      // ---------- CUENTAS DE LECTORES (registro/login público) ----------
+      // ================================================================
+      // Distinto del login de redactores/admin de arriba: esto es para
+      // cualquier visitante que quiera comentar las noticias firmando
+      // con su nombre real y una insignia de "verificado", en vez de
+      // escribir nombre+email sueltos en cada comentario. Usa las
+      // tablas "readers"/"reader_sessions" (ver migracion_readers.sql),
+      // completamente separadas de "users"/"sessions": un lector nunca
+      // tiene acceso al panel de administración.
+
+      // ---------- Registro ----------
+      if (path === "/api/readers/register" && method === "POST") {
+        const body = await request.json();
+        const nombre = normalizarTexto(body.nombre);
+        const email = normalizarTexto(body.email)?.toLowerCase() || null;
+        const password = typeof body.password === "string" ? body.password : "";
+
+        if (!nombre) return json({ error: "Falta tu nombre" }, 400);
+        if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ error: "Introduce un correo electrónico válido" }, 400);
+        if (password.length < 8) return json({ error: "La contraseña debe tener al menos 8 caracteres" }, 400);
+
+        const existente = await env.DB.prepare("SELECT id FROM readers WHERE email = ?").bind(email).first();
+        if (existente) return json({ error: "Ya existe una cuenta con ese correo. Inicia sesión o recupera tu contraseña." }, 409);
+
+        const salt = randomSalt();
+        const hash = await hashPassword(password, salt);
+        const tokenArr = new Uint8Array(32);
+        crypto.getRandomValues(tokenArr);
+        const verifToken = [...tokenArr].map((b) => b.toString(16).padStart(2, "0")).join("");
+        const verifExpira = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+
+        const insertado = await env.DB.prepare(
+          `INSERT INTO readers (nombre, email, password_hash, salt, verificacion_token, verificacion_token_expira)
+           VALUES (?, ?, ?, ?, ?, ?) RETURNING id`
+        ).bind(nombre, email, hash, salt, verifToken, verifExpira).first();
+
+        const enlace = `${SITIO_URL}/verificar-cuenta.html?token=${verifToken}`;
+        ctx.waitUntil(enviarEmailNotificacion(env, {
+          asunto: "Confirma tu cuenta — ELOTROFÚTBOLTV",
+          texto: `Hola ${nombre},\n\nGracias por registrarte en ELOTROFÚTBOLTV. Confirma tu correo entrando en este enlace (caduca en 30 minutos):\n${enlace}\n\nSi no has sido tú, ignora este correo.`,
+          html: plantillaEmail({
+            etiqueta: "Confirma tu cuenta",
+            titulo: `¡Bienvenido/a, ${nombre}!`,
+            parrafo: "Confirma tu correo para poder comentar las noticias con tu nombre. El enlace caduca en 30 minutos.",
+            boton: { texto: "Confirmar mi correo", url: enlace },
+          }),
+        }, { destinatario: email }));
+
+        return json({ ok: true, mensaje: "Cuenta creada. Revisa tu correo para confirmarla antes de iniciar sesión." }, 201);
+      }
+
+      // ---------- Confirmar correo (registro) ----------
+      if (path === "/api/readers/verificar" && method === "POST") {
+        const { token } = await request.json();
+        if (!token) return json({ error: "Falta el token" }, 400);
+
+        const lector = await env.DB.prepare(
+          "SELECT * FROM readers WHERE verificacion_token = ? AND activo = 1"
+        ).bind(token).first();
+        if (!lector || !lector.verificacion_token_expira || new Date(lector.verificacion_token_expira).getTime() < Date.now()) {
+          return json({ error: "El enlace no es válido o ha caducado. Vuelve a registrarte o pide uno nuevo." }, 401);
+        }
+
+        await env.DB.prepare(
+          "UPDATE readers SET email_verificado = 1, verificacion_token = NULL, verificacion_token_expira = NULL WHERE id = ?"
+        ).bind(lector.id).run();
+
+        const tokenSesion = await crearSesionLector(env, request, { ...lector, email_verificado: 1 });
+        return json({
+          ok: true,
+          token: tokenSesion,
+          reader: { id: lector.id, nombre: lector.nombre, email: lector.email, email_verificado: true },
+        });
+      }
+
+      // ---------- Reenviar correo de confirmación ----------
+      if (path === "/api/readers/reenviar-verificacion" && method === "POST") {
+        const { email } = await request.json();
+        const emailNorm = normalizarTexto(email)?.toLowerCase() || null;
+        if (!emailNorm) return json({ error: "Falta el correo" }, 400);
+
+        const lector = await env.DB.prepare(
+          "SELECT * FROM readers WHERE email = ? AND activo = 1 AND email_verificado = 0"
+        ).bind(emailNorm).first();
+
+        // Respuesta idéntica exista o no la cuenta, para no revelar si
+        // un correo está registrado (mismo criterio que forgot-password).
+        if (lector) {
+          const tokenArr = new Uint8Array(32);
+          crypto.getRandomValues(tokenArr);
+          const verifToken = [...tokenArr].map((b) => b.toString(16).padStart(2, "0")).join("");
+          const verifExpira = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+          await env.DB.prepare(
+            "UPDATE readers SET verificacion_token = ?, verificacion_token_expira = ? WHERE id = ?"
+          ).bind(verifToken, verifExpira, lector.id).run();
+
+          const enlace = `${SITIO_URL}/verificar-cuenta.html?token=${verifToken}`;
+          ctx.waitUntil(enviarEmailNotificacion(env, {
+            asunto: "Confirma tu cuenta — ELOTROFÚTBOLTV",
+            texto: `Hola ${lector.nombre},\n\nConfirma tu correo entrando en este enlace (caduca en 30 minutos):\n${enlace}`,
+            html: plantillaEmail({
+              etiqueta: "Confirma tu cuenta",
+              titulo: "Confirma tu correo",
+              parrafo: "El enlace caduca en 30 minutos.",
+              boton: { texto: "Confirmar mi correo", url: enlace },
+            }),
+          }, { destinatario: lector.email }));
+        }
+
+        return json({ ok: true, mensaje: "Si la cuenta existe y aún no está confirmada, te hemos enviado un nuevo enlace." });
+      }
+
+      // ---------- Login de lector ----------
+      if (path === "/api/readers/login" && method === "POST") {
+        const body = await request.json();
+        const email = normalizarTexto(body.email)?.toLowerCase() || null;
+        const password = typeof body.password === "string" ? body.password : "";
+        if (!email || !password) return json({ error: "Faltan credenciales" }, 400);
+
+        const lector = await env.DB.prepare("SELECT * FROM readers WHERE email = ? AND activo = 1").bind(email).first();
+        if (!lector) return json({ error: "Correo o contraseña incorrectos" }, 401);
+        const hash = await hashPassword(password, lector.salt);
+        if (hash !== lector.password_hash) return json({ error: "Correo o contraseña incorrectos" }, 401);
+        if (!lector.email_verificado) {
+          return json({ error: "Todavía no has confirmado tu correo. Revisa tu bandeja de entrada.", sinVerificar: true }, 403);
+        }
+
+        const token = await crearSesionLector(env, request, lector);
+        return json({
+          token,
+          reader: { id: lector.id, nombre: lector.nombre, email: lector.email, email_verificado: true },
+        });
+      }
+
+      // ---------- Cerrar sesión de lector ----------
+      if (path === "/api/readers/logout" && method === "POST") {
+        const payload = await requireReaderAuth(request, env);
+        if (payload && payload.sid) {
+          await env.DB.prepare("UPDATE reader_sessions SET revoked_at = datetime('now') WHERE id = ?").bind(payload.sid).run();
+        }
+        return json({ ok: true });
+      }
+
+      // ---------- Quién soy (recuperar sesión al recargar la página) ----------
+      if (path === "/api/readers/me" && method === "GET") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const lector = await env.DB.prepare("SELECT id, nombre, email, email_verificado FROM readers WHERE id = ? AND activo = 1").bind(payload.rid).first();
+        if (!lector) return json({ error: "No autorizado" }, 401);
+        return json({ reader: { ...lector, email_verificado: !!lector.email_verificado } });
+      }
+
+      // ---------- Recuperar contraseña de lector: paso 1 ----------
+      if (path === "/api/readers/forgot-password" && method === "POST") {
+        const { email } = await request.json();
+        const emailNorm = normalizarTexto(email)?.toLowerCase() || null;
+        if (!emailNorm) return json({ error: "Falta el correo" }, 400);
+
+        const lector = await env.DB.prepare("SELECT * FROM readers WHERE email = ? AND activo = 1").bind(emailNorm).first();
+        if (lector) {
+          const tokenArr = new Uint8Array(32);
+          crypto.getRandomValues(tokenArr);
+          const token = [...tokenArr].map((b) => b.toString(16).padStart(2, "0")).join("");
+          const expira = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+          await env.DB.prepare("UPDATE readers SET reset_token = ?, reset_token_expira = ? WHERE id = ?")
+            .bind(token, expira, lector.id).run();
+
+          const enlace = `${SITIO_URL}/recuperar-cuenta.html?token=${token}`;
+          ctx.waitUntil(enviarEmailNotificacion(env, {
+            asunto: "Recupera tu contraseña — ELOTROFÚTBOLTV",
+            texto: `Hola ${lector.nombre},\n\nHas pedido recuperar tu contraseña. Entra en este enlace para poner una nueva (caduca en 30 minutos):\n${enlace}\n\nSi no has sido tú, ignora este correo.`,
+            html: plantillaEmail({
+              etiqueta: "Recuperar contraseña",
+              titulo: "Pon una contraseña nueva",
+              parrafo: "Si no has pedido tú este cambio, ignora este correo. El enlace caduca en 30 minutos.",
+              boton: { texto: "Poner contraseña nueva", url: enlace },
+            }),
+          }, { destinatario: lector.email }));
+        }
+
+        return json({ ok: true, mensaje: "Si el correo está registrado, te hemos enviado un enlace para poner una nueva contraseña." });
+      }
+
+      // ---------- Recuperar contraseña de lector: paso 2 ----------
+      if (path === "/api/readers/forgot-password/confirmar" && method === "POST") {
+        const { token, nueva } = await request.json();
+        if (!token || !nueva) return json({ error: "Faltan campos" }, 400);
+        if (nueva.length < 8) return json({ error: "La nueva contraseña debe tener al menos 8 caracteres" }, 400);
+
+        const lector = await env.DB.prepare("SELECT * FROM readers WHERE reset_token = ? AND activo = 1").bind(token).first();
+        if (!lector || !lector.reset_token_expira || new Date(lector.reset_token_expira).getTime() < Date.now()) {
+          return json({ error: "El enlace no es válido o ha caducado. Pide uno nuevo desde \"He olvidado mi contraseña\"." }, 401);
+        }
+
+        const nuevaSalt = randomSalt();
+        const nuevaHash = await hashPassword(nueva, nuevaSalt);
+        await env.DB.prepare(
+          "UPDATE readers SET password_hash = ?, salt = ?, reset_token = NULL, reset_token_expira = NULL WHERE id = ?"
+        ).bind(nuevaHash, nuevaSalt, lector.id).run();
+
+        await env.DB.prepare(
+          "UPDATE reader_sessions SET revoked_at = datetime('now') WHERE reader_id = ? AND revoked_at IS NULL"
+        ).bind(lector.id).run();
+
+        return json({ ok: true });
+      }
+
+
       // ---------- LOGIN ----------
       if (path === "/api/login" && method === "POST") {
         const { username, password } = await request.json();
@@ -3624,7 +3883,7 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
       if (comentariosArticuloMatch && method === "GET") {
         const articleId = parseInt(comentariosArticuloMatch[1]);
         const { results: comentarios } = await env.DB.prepare(
-          "SELECT id, nombre, texto, created_at FROM comments WHERE article_id = ? AND estado = 'aprobado' ORDER BY created_at ASC"
+          "SELECT id, nombre, texto, created_at, reader_id FROM comments WHERE article_id = ? AND estado = 'aprobado' ORDER BY created_at ASC"
         ).bind(articleId).all();
         return json({ comentarios });
       }
@@ -3635,8 +3894,25 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         if (!articulo) return json({ error: "Noticia no encontrada" }, 404);
 
         const body = await request.json();
-        const nombre = normalizarTexto(body.nombre);
-        const email = normalizarTexto(body.email);
+
+        const payloadLector = await requireReaderAuth(request, env);
+        let readerId = null;
+        let nombre, email;
+        if (payloadLector) {
+          const lector = await env.DB.prepare(
+            "SELECT id, nombre, email FROM readers WHERE id = ? AND activo = 1 AND email_verificado = 1"
+          ).bind(payloadLector.rid).first();
+          if (lector) {
+            readerId = lector.id;
+            nombre = lector.nombre;
+            email = lector.email;
+          }
+        }
+        if (!readerId) {
+          nombre = normalizarTexto(body.nombre);
+          email = normalizarTexto(body.email);
+        }
+
         const texto = normalizarTexto(body.texto);
         if (!nombre) return json({ error: "Falta tu nombre" }, 400);
         if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ error: "El email no es válido" }, 400);
@@ -3645,8 +3921,8 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
 
         const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || null;
         await env.DB.prepare(
-          `INSERT INTO comments (article_id, nombre, email, texto, ip) VALUES (?, ?, ?, ?, ?)`
-        ).bind(articleId, nombre, email, texto, ip).run();
+          `INSERT INTO comments (article_id, nombre, email, texto, ip, reader_id) VALUES (?, ?, ?, ?, ?, ?)`
+        ).bind(articleId, nombre, email, texto, ip, readerId).run();
 
         return json({ ok: true, mensaje: "Comentario enviado. Se publicará en cuanto lo revise la redacción." });
       }

@@ -35,6 +35,13 @@ const RUTAS_EXCLUIDAS = new Set([
   "/api/login",
   "/api/forgot-password",
   "/api/forgot-password/confirmar",
+  // Login/logout de lectores: mismo motivo que "/api/login" de arriba
+  // (solo emiten/revocan un JWT, no hay datos de negocio que reproducir).
+  // El registro y la verificación de correo SÍ se dejan encolar (crean
+  // la fila en "readers", que si no se perdería tras un failover).
+  "/api/readers/login",
+  "/api/readers/logout",
+  "/api/readers/me",
   // Dispara internamente publicarArticulosProgramados/etc. (ver
   // ejecutarCronRespaldo en index.js), que ya hacen sus propias
   // escrituras SQL. No tiene body de negocio reproducible: encolarlo

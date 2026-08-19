@@ -277,6 +277,36 @@ CREATE TABLE sessions (
 );
 CREATE INDEX idx_sessions_user ON sessions(user_id);
 
+-- Cuentas de lectores (distintas de "users", solo redactores/admin):
+-- ver worker/migracion_readers.sql para la explicación completa.
+CREATE TABLE readers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  nombre TEXT NOT NULL,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  salt TEXT NOT NULL,
+  email_verificado INTEGER NOT NULL DEFAULT 0,
+  verificacion_token TEXT,
+  verificacion_token_expira TEXT,
+  reset_token TEXT,
+  reset_token_expira TEXT,
+  activo INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_readers_email ON readers(email);
+
+CREATE TABLE reader_sessions (
+  id TEXT PRIMARY KEY,
+  reader_id INTEGER NOT NULL,
+  user_agent TEXT,
+  ip TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+  revoked_at TEXT,
+  FOREIGN KEY (reader_id) REFERENCES readers(id)
+);
+CREATE INDEX idx_reader_sessions_reader ON reader_sessions(reader_id);
+
 CREATE INDEX idx_articles_categoria ON articles(categoria);
 CREATE INDEX idx_articles_publicado ON articles(publicado, fecha_publicacion);
 CREATE INDEX idx_results_competicion ON results(competicion, jornada);
@@ -371,10 +401,12 @@ CREATE TABLE comments (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   moderado_por_id INTEGER,
   moderado_at TEXT,
+  reader_id INTEGER REFERENCES readers(id),
   FOREIGN KEY (moderado_por_id) REFERENCES users(id)
 );
 CREATE INDEX idx_comments_article ON comments(article_id, estado);
 CREATE INDEX idx_comments_estado ON comments(estado, created_at);
+CREATE INDEX idx_comments_reader ON comments(reader_id);
 
 -- Ficha informativa de cada club (entrenador, estadio, fundación...).
 -- Ver worker/migracion_club_info.sql para el detalle.

@@ -2031,6 +2031,35 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         return json({ reader: { ...lector, email_verificado: !!lector.email_verificado } });
       }
 
+      // ---------- Cambio de contraseña propia (lector logueado) ----------
+      // Mismo patrón que /api/me/password para redactores: pide la
+      // contraseña actual, valida la nueva y cierra el resto de
+      // sesiones abiertas de este lector por seguridad.
+      if (path === "/api/readers/me/password" && method === "PUT") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const { actual, nueva } = await request.json();
+        if (!actual || !nueva) return json({ error: "Faltan campos" }, 400);
+        if (nueva.length < 8) return json({ error: "La nueva contraseña debe tener al menos 8 caracteres" }, 400);
+
+        const lector = await env.DB.prepare("SELECT * FROM readers WHERE id = ? AND activo = 1").bind(payload.rid).first();
+        if (!lector) return json({ error: "Cuenta no encontrada" }, 404);
+
+        const hashActual = await hashPassword(actual, lector.salt);
+        if (hashActual !== lector.password_hash) return json({ error: "La contraseña actual no es correcta" }, 401);
+
+        const nuevaSalt = randomSalt();
+        const nuevaHash = await hashPassword(nueva, nuevaSalt);
+        await env.DB.prepare("UPDATE readers SET password_hash = ?, salt = ? WHERE id = ?")
+          .bind(nuevaHash, nuevaSalt, lector.id).run();
+
+        await env.DB.prepare(
+          "UPDATE reader_sessions SET revoked_at = datetime('now') WHERE reader_id = ? AND id != ? AND revoked_at IS NULL"
+        ).bind(lector.id, payload.sid || "").run();
+
+        return json({ ok: true });
+      }
+
       // ---------- Recuperar contraseña de lector: paso 1 ----------
       if (path === "/api/readers/forgot-password" && method === "POST") {
         const { email } = await request.json();
@@ -2686,6 +2715,20 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         });
       }
 
+      // ---------- LECTORES (cuentas públicas, solo lectura para admins) ----------
+      // Solo lectura desde el panel: los lectores se gestionan a sí mismos
+      // (registro, verificación, contraseña) desde la web pública. Nunca se
+      // devuelve password_hash ni salt.
+      if (path === "/api/readers" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver los lectores" }, 403);
+        const { results } = await env.DB.prepare(
+          "SELECT id, nombre, email, email_verificado, activo, created_at FROM readers ORDER BY created_at DESC"
+        ).all();
+        return json({ readers: results });
+      }
+
       // ---------- USUARIOS (solo admins) ----------
       // Nunca se devuelve password_hash ni salt: las contraseñas están
       // cifradas y no se pueden consultar, solo restablecer.
@@ -3170,15 +3213,6 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
           }
         }
 
-        const longitudContenido = longitudTextoPlano(body.contenido);
-        if (longitudContenido < CONTENIDO_MIN) {
-          return json({ error: `El contenido debe tener al menos ${CONTENIDO_MIN} caracteres (tiene ${longitudContenido}).` }, 400);
-        }
-        if (longitudContenido > CONTENIDO_MAX) {
-          return json({ error: `El contenido no puede superar los ${CONTENIDO_MAX} caracteres (tiene ${longitudContenido}).` }, 400);
-        }
-        let slug = await slugUnico(env, body.slug || body.titulo, null);
-
         // Estado del borrador (solo aplica si no se publica): "terminado"
         // o "en_proceso", según lo que haya contestado el redactor en la
         // notificación que se le muestra al guardar como borrador. Si se
@@ -3186,6 +3220,19 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         const estadoBorrador = body.publicado === false && !programadoPara
           ? (body.estado_borrador === "terminado" ? "terminado" : "en_proceso")
           : null;
+
+        // Un borrador "en proceso" no tiene por qué cumplir los límites de
+        // longitud todavía: solo aplican a lo publicado o marcado "terminado".
+        const longitudContenido = longitudTextoPlano(body.contenido);
+        if (estadoBorrador !== "en_proceso") {
+          if (longitudContenido < CONTENIDO_MIN) {
+            return json({ error: `El contenido debe tener al menos ${CONTENIDO_MIN} caracteres (tiene ${longitudContenido}).` }, 400);
+          }
+          if (longitudContenido > CONTENIDO_MAX) {
+            return json({ error: `El contenido no puede superar los ${CONTENIDO_MAX} caracteres (tiene ${longitudContenido}).` }, 400);
+          }
+        }
+        let slug = await slugUnico(env, body.slug || body.titulo, null);
 
         // Varias fotos: se guardan como JSON (con su posición dentro del
         // texto y su foco de recorte); la marcada como portada hace además
@@ -3477,16 +3524,6 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
           }
         }
 
-        if (body.contenido !== undefined) {
-          const longitudContenido = longitudTextoPlano(body.contenido);
-          if (longitudContenido < CONTENIDO_MIN) {
-            return json({ error: `El contenido debe tener al menos ${CONTENIDO_MIN} caracteres (tiene ${longitudContenido}).` }, 400);
-          }
-          if (longitudContenido > CONTENIDO_MAX) {
-            return json({ error: `El contenido no puede superar los ${CONTENIDO_MAX} caracteres (tiene ${longitudContenido}).` }, 400);
-          }
-        }
-
         const imagenes = normalizarImagenes(body.imagenes);
         const imagenPortada = body.imagen_url || (imagenes[0] && imagenes[0].url) || null;
         const resultadoId = body.resultado_id ? parseInt(body.resultado_id, 10) : null;
@@ -3498,6 +3535,18 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         const estadoBorrador = body.publicado === false && !programadoPara
           ? (body.estado_borrador === "terminado" ? "terminado" : "en_proceso")
           : null;
+
+        // Un borrador "en proceso" no tiene por qué cumplir los límites de
+        // longitud todavía (mismo criterio que al crear la noticia).
+        if (body.contenido !== undefined && estadoBorrador !== "en_proceso") {
+          const longitudContenido = longitudTextoPlano(body.contenido);
+          if (longitudContenido < CONTENIDO_MIN) {
+            return json({ error: `El contenido debe tener al menos ${CONTENIDO_MIN} caracteres (tiene ${longitudContenido}).` }, 400);
+          }
+          if (longitudContenido > CONTENIDO_MAX) {
+            return json({ error: `El contenido no puede superar los ${CONTENIDO_MAX} caracteres (tiene ${longitudContenido}).` }, 400);
+          }
+        }
 
         // Si se ha elegido un autor en el formulario, se actualiza; si no
         // se manda nada, se deja el autor que ya tenía la noticia. Se

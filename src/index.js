@@ -1,5 +1,5 @@
 // ElOtroFútbol - Worker API
-// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/admin/comments, /api/club-info, /api/admin/club-info, /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml
+// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/comments/:id/vote, /api/comments/:id/report, /api/admin/comments, /api/admin/comments/reported, /api/club-info, /api/admin/club-info, /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml
 
 // Escapa los caracteres especiales de XML para que un título o slug con
 // "&", "<", ">", comillas, etc. no rompa el XML del sitemap.
@@ -12,11 +12,10 @@ function escaparXml(texto) {
     .replace(/'/g, "&apos;");
 }
 
-// Convierte una fecha guardada por la base de datos ("YYYY-MM-DD
-// HH:MM:SS", UTC) o un ISO string en el formato de fecha simple
-// "YYYY-MM-DD" que espera <lastmod> en un sitemap. Si no hay fecha o no
-// se puede parsear, se omite (mejor no mandar <lastmod> que uno inventado
-// o mal formado).
+// Convierte una fecha guardada por SQLite ("YYYY-MM-DD HH:MM:SS", UTC) o
+// un ISO string en el formato de fecha simple "YYYY-MM-DD" que espera
+// <lastmod> en un sitemap. Si no hay fecha o no se puede parsear, se omite
+// (mejor no mandar <lastmod> que mandar uno inventado o mal formado).
 function fechaParaSitemap(valor) {
   if (!valor) return null;
   const fecha = new Date(valor.includes("T") || valor.endsWith("Z") ? valor : `${valor.replace(" ", "T")}Z`);
@@ -108,6 +107,16 @@ function cors(resp) {
   resp.headers.set("Access-Control-Allow-Origin", "*");
   resp.headers.set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   resp.headers.set("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  // Sin esto, el JavaScript del navegador no puede leer estas cabeceras
+  // aunque viajen en la respuesta: por defecto, fetch() en un origen
+  // cruzado solo expone al código de la página un pequeño conjunto de
+  // cabeceras "seguras" (Content-Type, Cache-Control...), y cualquier
+  // cabecera personalizada como X-Failover-Backend queda oculta para
+  // response.headers.get(...) salvo que el servidor la liste aquí
+  // explícitamente. Sin esta línea, el frontend no tiene forma de saber
+  // que una respuesta con status 200 vino en realidad de Railway a través
+  // del reenvío interno del Worker (ver fetchRailway más abajo).
+  resp.headers.set("Access-Control-Expose-Headers", "X-Failover-Backend,X-Failover-Test,X-Failover-Reason");
   return resp;
 }
 function json(data, status = 200) {
@@ -371,6 +380,205 @@ function plantillaEmail({ etiqueta, titulo, filas = [], parrafo, boton }) {
 </html>`;
 }
 
+// ---------- Newsletter / boletín semanal ----------
+// Formulario público de suscripción (portada y pie de página) +
+// disparador programado que, una vez a la semana, manda un resumen de
+// las últimas noticias publicadas a todos los suscriptores activos.
+// Usa el mismo Resend que el resto de avisos por email del sitio.
+
+function generarTokenBaja() {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function emailValido(email) {
+  return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+}
+
+// Plantilla propia del boletín (distinta de plantillaEmail: aquí hace
+// falta listar varias noticias con foto, no una única tarjeta de aviso).
+function plantillaNewsletter({ articulos, bajaUrl }) {
+  const tarjetas = articulos
+    .map((a) => {
+      const url = `${SITIO_URL}/noticia.html?slug=${encodeURIComponent(a.slug)}`;
+      const foto = a.imagen_url
+        ? `<img src="${escapeHtmlEmail(a.imagen_url)}" alt="" width="504" style="display:block;width:100%;max-width:504px;border-radius:8px 8px 0 0;">`
+        : "";
+      return `
+        <tr>
+          <td style="padding:0 0 22px;">
+            <a href="${url}" style="text-decoration:none;">
+              ${foto}
+              <div style="padding:${foto ? "14px" : "0"} 2px 0;">
+                <span style="display:inline-block;background:#eef1f5;color:#d1132e;font-size:10.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;padding:3px 9px;border-radius:10px;margin-bottom:8px;">${escapeHtmlEmail(categoriaLabelEmail(a.categoria))}</span>
+                <h2 style="margin:0 0 4px;font-size:17px;line-height:1.35;color:#0c1b2e;font-family:Georgia,serif;">${escapeHtmlEmail(a.titulo)}</h2>
+              </div>
+            </a>
+          </td>
+        </tr>`;
+    })
+    .join("");
+
+  return `<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#eef1f5;font-family:Arial,Helvetica,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f5;padding:32px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 4px 18px rgba(12,27,46,.12);">
+          <tr>
+            <td style="background:#0c1b2e;padding:22px 28px;">
+              <img src="${SITIO_URL}/img/logo.png" alt="ELOTROFÚTBOLTV" height="34" style="display:block;">
+            </td>
+          </tr>
+          <tr><td style="height:4px;background:#d1132e;line-height:0;font-size:0;">&nbsp;</td></tr>
+          <tr>
+            <td style="padding:28px 28px 6px;">
+              <h1 style="margin:0 0 4px;font-size:19px;color:#0c1b2e;">Tu resumen semanal</h1>
+              <p style="margin:0;font-size:13px;color:#5a6270;">Lo más destacado de esta semana en ELOTROFÚTBOLTV.</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:20px 28px 0;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${tarjetas}</table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:18px 28px 34px;">
+              <table role="presentation" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td style="border-radius:24px;background:#d1132e;">
+                    <a href="${SITIO_URL}" style="display:inline-block;padding:12px 26px;font-family:Arial,sans-serif;font-size:13px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:#ffffff;text-decoration:none;">Ver más noticias</a>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:18px 28px;background:#f7f8fa;border-top:1px solid #eee;">
+              <p style="margin:0 0 6px;font-size:11.5px;color:#9aa0ab;">Recibes este correo porque te suscribiste al boletín de ELOTROFÚTBOLTV.</p>
+              <p style="margin:0;font-size:11.5px;color:#9aa0ab;"><a href="${bajaUrl}" style="color:#9aa0ab;">Darme de baja</a></p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
+function categoriaLabelEmail(cat) {
+  const CATEGORIAS = {
+    hypermotion: "LaLiga Hypermotion",
+    primera_federacion: "Primera Federación",
+    segunda_federacion: "Segunda Federación",
+    general: "General",
+    amistoso: "Amistoso",
+    arbitraje: "Arbitraje",
+  };
+  return CATEGORIAS[cat] || cat || "";
+}
+
+// Envía el boletín a todos los suscriptores activos vía Resend, en
+// lotes (la API de Resend admite varios destinatarios por llamada, pero
+// se agrupan en lotes moderados para no depender de un límite exacto
+// que pueda cambiar). Un fallo enviando un lote no interrumpe el resto.
+async function enviarBoletinALista(env, { destinatarios, articulos }) {
+  if (!env.RESEND_API_KEY) {
+    console.log("RESEND_API_KEY no configurado: boletín semanal omitido");
+    return;
+  }
+  const TAMANO_LOTE = 45; // límite prudente por debajo del máximo habitual de Resend por llamada
+  for (let i = 0; i < destinatarios.length; i += TAMANO_LOTE) {
+    const lote = destinatarios.slice(i, i + TAMANO_LOTE);
+    // El enlace de baja es individual por suscriptor, así que el HTML
+    // también tiene que serlo: se manda una llamada por persona dentro
+    // del lote en paralelo (Resend no permite variar el cuerpo entre
+    // destinatarios de una misma llamada).
+    await Promise.all(
+      lote.map(async (s) => {
+        const bajaUrl = `${SITIO_URL}/api/newsletter/baja?token=${encodeURIComponent(s.baja_token)}`;
+        try {
+          const resp = await fetch("https://api.resend.com/emails", {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${env.RESEND_API_KEY}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              from: env.RESEND_FROM || "ELOTROFÚTBOLTV <notificaciones@elotrofutbol.media>",
+              to: [s.email],
+              subject: "Tu resumen semanal de ELOTROFÚTBOLTV",
+              html: plantillaNewsletter({ articulos, bajaUrl }),
+            }),
+          });
+          if (!resp.ok) {
+            console.log("Error enviando boletín a", s.email, resp.status, await resp.text());
+          }
+        } catch (err) {
+          console.log("Error enviando boletín a", s.email, err.message);
+        }
+      })
+    );
+  }
+}
+
+// Comprueba si toca enviar el boletín semanal (han pasado 7 días o más
+// desde el último envío registrado, o nunca se envió) y, si toca, lo
+// manda con las noticias publicadas desde entonces. Llamado desde
+// "scheduled" en cada ejecución del cron junto con las demás tareas
+// programadas; como el cron ya corre cada minuto para otras cosas, aquí
+// solo se decide si ESTA ejecución concreta debe disparar el envío.
+async function enviarBoletinSemanalSiToca(env) {
+  try {
+    const fila = await env.DB.prepare(
+      "SELECT ultimo_envio_at FROM newsletter_envios WHERE id = 1"
+    ).first();
+    const ultimo = fila && fila.ultimo_envio_at ? new Date(fila.ultimo_envio_at + "Z") : null;
+    const ahora = new Date();
+    const SIETE_DIAS_MS = 7 * 24 * 60 * 60 * 1000;
+    if (ultimo && ahora - ultimo < SIETE_DIAS_MS) return; // aún no toca
+
+    const { results: destinatarios } = await env.DB.prepare(
+      "SELECT email, baja_token FROM newsletter_suscriptores WHERE activo = 1"
+    ).all();
+    if (!destinatarios.length) {
+      // No hay a quién mandarlo, pero se registra igualmente el intento
+      // para no comprobarlo en cada minuto durante toda la semana.
+      await env.DB.prepare(
+        "UPDATE newsletter_envios SET ultimo_envio_at = datetime('now') WHERE id = 1"
+      ).run();
+      return;
+    }
+
+    const desde = (ultimo || new Date(ahora - SIETE_DIAS_MS)).toISOString().replace("T", " ").slice(0, 19);
+    const { results: articulos } = await env.DB.prepare(
+      `SELECT slug, titulo, categoria, imagen_url FROM articles
+       WHERE publicado = 1 AND fecha_publicacion >= ?
+       ORDER BY fecha_publicacion DESC LIMIT 8`
+    ).bind(desde).all();
+
+    if (!articulos.length) {
+      // Nada nuevo que contar esta semana: se registra el envío igual
+      // (para que no se acumulen semanas) pero no se manda correo vacío.
+      await env.DB.prepare(
+        "UPDATE newsletter_envios SET ultimo_envio_at = datetime('now') WHERE id = 1"
+      ).run();
+      return;
+    }
+
+    await enviarBoletinALista(env, { destinatarios, articulos });
+    await env.DB.prepare(
+      "UPDATE newsletter_envios SET ultimo_envio_at = datetime('now') WHERE id = 1"
+    ).run();
+  } catch (err) {
+    console.log("Error en el envío semanal del boletín:", err.message);
+  }
+}
+
 async function enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario } = {}) {
   if (!env.RESEND_API_KEY) {
     console.log("RESEND_API_KEY no configurado: aviso por email omitido ->", asunto);
@@ -397,10 +605,6 @@ async function enviarEmailNotificacion(env, { asunto, texto, html }, { destinata
   } catch (err) {
     console.log("Error al enviar email de notificación:", err.message);
   }
-}
-
-function emailValido(email) {
-  return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
 }
 // ---------- Equipos de un usuario (hasta 3 clubes) ----------
 // Se guardan en la columna "equipo" como un array JSON en texto, p. ej.
@@ -511,14 +715,6 @@ function b64urlDecode(str) {
   return atob(str);
 }
 async function signHS256(data, secret) {
-  if (!secret) {
-    // Sin esta comprobación, un JWT_SECRET vacío/undefined revienta más
-    // abajo en crypto.subtle.importKey con "Zero-length key is not
-    // supported" -- un mensaje que no menciona la causa real (falta
-    // configurar la variable de entorno) y que aparece igual de críptico
-    // tanto al firmar un login nuevo como al verificar un token existente.
-    throw new Error("JWT_SECRET no está configurado (variable de entorno vacía o ausente)");
-  }
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
@@ -558,84 +754,15 @@ async function requireAuth(request, env, url) {
   // el JWT todavía no haya caducado. Los JWT antiguos (emitidos antes de
   // este cambio) no llevan "sid"; se siguen aceptando hasta que caduquen
   // por sí solos, para no desconectar a todo el mundo de golpe.
-  //
-  // IMPORTANTE (secundaria/Railway): esta base de datos es una RÉPLICA de
-  // D1, que recibe las sesiones nuevas con el retraso propio del
-  // sincronizador (por defecto hasta 60s, ver sync/scheduler.mjs). Si se
-  // exige aquí "la fila existe y no está revocada" igual que en la
-  // primaria, cualquier login o petición que llegue a la secundaria antes
-  // de que su sesión se haya sincronizado se rechaza como si el usuario no
-  // estuviera autenticado — en la práctica, esto tumbaba TODO el panel de
-  // administración durante un failover (todas las rutas protegidas usan
-  // requireAuth), mientras que las rutas públicas sin auth (como
-  // /api/results) seguían funcionando con normalidad, dando la falsa
-  // impresión de que "solo resultados funciona en la secundaria".
-  //
-  // La distinción correcta es entre "la fila NO existe todavía" (aún no
-  // sincronizada: el JWT ya demuestra que hubo un login válido, así que se
-  // deja pasar) y "la fila SÍ existe pero está revocada" (alguien cerró
-  // esa sesión explícitamente: eso sí debe bloquear, y ya habrá llegado a
-  // la secundaria en cuanto se sincronice el cierre de sesión).
   if (payload.sid) {
     const sesion = await env.DB.prepare(
-      "SELECT id, revoked_at FROM sessions WHERE id = ? AND user_id = ?"
+      "SELECT id FROM sessions WHERE id = ? AND user_id = ? AND revoked_at IS NULL"
     ).bind(payload.sid, payload.uid).first();
-    if (sesion && sesion.revoked_at) return null;
-    if (sesion) {
-      // No bloqueamos la respuesta por esto: es solo para que la lista de
-      // "Mis sesiones" muestre cuándo se ha usado cada una por última vez.
-      env.DB.prepare("UPDATE sessions SET last_seen_at = datetime('now') WHERE id = ?")
-        .bind(payload.sid).run().catch(() => {});
-    } else {
-      // FIX SEGURIDAD (2026-08): "sesion === null" es ambiguo. Puede
-      // significar de verdad "aún no sincronizada" (retraso normal del
-      // sincronizador, hasta ~60s) o puede significar "el sincronizador
-      // está caído/no desplegado y esta fila JAMÁS va a llegar" -- por
-      // ejemplo, si alguien revocó esta sesión hace horas y el proceso
-      // sync/scheduler.mjs lleva parado desde entonces. Sin distinguir
-      // ambos casos, un JWT robado o de una sesión cerrada explícitamente
-      // se aceptaría en la secundaria de forma indefinida, precisamente
-      // en el escenario donde más importa (failover con la primaria caída).
-      //
-      // Se comprueba la frescura real del sincronizador consultando
-      // sync_cursor para la tabla "sessions" (actualizado por
-      // sync/incremental.mjs en cada pasada que toca esa tabla). Si el
-      // cursor está más desactualizado que UMBRAL_SYNC_STALE_MS, se
-      // considera que el sincronizador no está operativo y se falla
-      // cerrado (se rechaza el token) en vez de fiarse ciegamente del JWT.
-      //
-      // Margen elegido: 5 minutos. El intervalo normal del scheduler es de
-      // 60s (SYNC_INTERVAL_MS), así que 5 minutos da margen de sobra para
-      // picos de carga o un reintento puntual sin generar falsos rechazos,
-      // pero sigue detectando un sincronizador realmente caído mucho antes
-      // de que se convierta en un problema de horas o días.
-      const UMBRAL_SYNC_STALE_MS = 5 * 60 * 1000;
-      let sincronizadorSano = false;
-      try {
-        const cursorSessions = await env.DB.prepare(
-          "SELECT last_synced_at FROM sync_cursor WHERE table_name = ?"
-        ).bind("sessions").first();
-        if (cursorSessions && cursorSessions.last_synced_at) {
-          const antiguedadMs = Date.now() - new Date(cursorSessions.last_synced_at).getTime();
-          sincronizadorSano = antiguedadMs <= UMBRAL_SYNC_STALE_MS;
-        }
-        // Si no hay fila de cursor todavía (p. ej. justo tras el
-        // despliegue inicial, antes de la primera pasada), no se puede
-        // afirmar que el sincronizador esté sano: se trata igual que
-        // "caído" y se falla cerrado, por prudencia.
-      } catch (error) {
-        // Si ni siquiera se puede leer sync_cursor (tabla no migrada,
-        // Postgres con problemas, etc.), tampoco hay forma de confiar en
-        // que la sincronización esté funcionando: se falla cerrado.
-        console.error("[requireAuth] no se pudo comprobar sync_cursor de sessions:", error.message);
-        sincronizadorSano = false;
-      }
-      if (!sincronizadorSano) return null;
-      // El sincronizador está operativo y al día: se asume que esta fila
-      // en concreto todavía no ha llegado por el retraso normal de una
-      // pasada (segundos), no porque esté todo caído. El JWT firmado con
-      // JWT_SECRET es prueba suficiente de que el login fue legítimo.
-    }
+    if (!sesion) return null;
+    // No bloqueamos la respuesta por esto: es solo para que la lista de
+    // "Mis sesiones" muestre cuándo se ha usado cada una por última vez.
+    env.DB.prepare("UPDATE sessions SET last_seen_at = datetime('now') WHERE id = ?")
+      .bind(payload.sid).run().catch(() => {});
   }
   return payload;
 }
@@ -849,7 +976,20 @@ async function procesarSubidaArchivo(env, file, opciones) {
     throw error;
   }
   const fileBytes = await file.arrayBuffer();
-  return subirACloudinary(env, fileBytes, file.type);
+  const subida = await subirACloudinary(env, fileBytes, file.type);
+  // El hash se calcula sobre los bytes ya leídos, así no hace falta
+  // volver a leer el archivo entero una segunda vez.
+  subida.hash = await sha256Hex(fileBytes);
+  return subida;
+}
+
+// Hash SHA-256 (en hexadecimal) del contenido binario de un archivo.
+// Se usa para detectar duplicados por contenido real, no por nombre: dos
+// archivos con el mismo hash son bit a bit idénticos aunque se hayan
+// renombrado o se les haya cambiado el título/descripción al subirlos.
+async function sha256Hex(arrayBuffer) {
+  const digest = await crypto.subtle.digest("SHA-256", arrayBuffer);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 async function borrarDeCloudinary(env, publicId, resourceType) {
@@ -1495,100 +1635,12 @@ async function publicarArticulosProgramados(env) {
     });
   }
 }
+const RAILWAY_URL =
+  "https://elotro-futbol-api-production-e57c.up.railway.app";
 
-/*
- * ================================================================
- * CRON DE RESPALDO — implementación
- * ================================================================
- *
- * Llamado por /api/internal/cron-respaldo (ver arriba). Un cron
- * externo en Railway lo invoca cada minuto; aquí se decide si de
- * verdad hace falta actuar.
- */
-
-// URL pública del Worker principal para comprobar si sigue vivo antes de
-// actuar. Se puede sobrescribir con la variable de entorno PRIMARY_HEALTH_URL,
-// pero por defecto usa el mismo dominio propio que ya usa el frontend (ver
-// public/js/config.js) en vez del workers.dev subdomain de la cuenta, que
-// se ha demostrado inestable (se desactivaba solo).
-const PRIMARY_HEALTH_URL_POR_DEFECTO = "https://api.elotrofutbol.media/api/health";
-
-// Si el primario no contesta en este tiempo, se considera caído. Corto a
-// propósito: este endpoint lo llama un cron cada minuto, así que no puede
-// quedarse colgado esperando -- mejor asumir que está caído y, en el peor
-// caso, no hacer nada este minuto concreto (se reintenta en el siguiente).
-const TIMEOUT_COMPROBACION_PRIMARIA_MS = 8000;
-
-async function primariaEstaViva(env) {
-  const url = env.PRIMARY_HEALTH_URL || PRIMARY_HEALTH_URL_POR_DEFECTO;
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_COMPROBACION_PRIMARIA_MS);
-    const res = await fetch(url, { signal: controller.signal });
-    clearTimeout(timeoutId);
-    // Un 503 de /api/health significa "Worker vivo pero D1 degradado": en
-    // ese caso SÍ debe actuar el respaldo, porque el cron del primario usa
-    // ese mismo D1 y probablemente esté fallando igual. Solo se considera
-    // "viva" si responde 2xx con database: true.
-    if (!res.ok) return false;
-    const data = await res.json().catch(() => null);
-    return !!(data && data.database === true);
-  } catch {
-    // Error de red, timeout, DNS... el primario no es alcanzable.
-    return false;
-  }
-}
-
-async function ejecutarCronRespaldo(request, env, ctx) {
-  const secretoEsperado = env.INTERNAL_CRON_SECRET;
-  if (!secretoEsperado) {
-    // Igual que drainPendingWrites en el primario: fallo cerrado si no
-    // hay secreto configurado, para que este endpoint nunca quede
-    // accesible sin protección por un descuido de configuración.
-    return json({ error: "Endpoint interno no configurado" }, 503);
-  }
-  const secretoRecibido = request.headers.get("X-Internal-Cron-Secret");
-  if (!secretoRecibido || secretoRecibido !== secretoEsperado) {
-    return json({ error: "No autorizado" }, 401);
-  }
-
-  const primariaViva = await primariaEstaViva(env);
-  if (primariaViva) {
-    // El primario sigue sirviendo tráfico con D1 sano: su propio cron
-    // trigger ya se encarga de estas tareas. Actuar aquí también
-    // publicaría cada noticia programada dos veces (una desde cada
-    // backend). No se hace nada, y se informa en la respuesta para que
-    // el log del cron externo en Railway quede claro.
-    return json({ ok: true, actuado: false, motivo: "primaria_viva" });
-  }
-
-  console.warn("[cron-respaldo] Primaria no responde: ejecutando tareas programadas contra Postgres.");
-
-  const resultados = {};
-  try {
-    await publicarArticulosProgramados(env);
-    resultados.articulos = "ok";
-  } catch (error) {
-    console.error("[cron-respaldo] Error publicando artículos programados:", error);
-    resultados.articulos = `error: ${error.message}`;
-  }
-  try {
-    await iniciarPartidosProgramadosCuyaHoraHaLlegado(env);
-    resultados.partidos = "ok";
-  } catch (error) {
-    console.error("[cron-respaldo] Error iniciando partidos programados:", error);
-    resultados.partidos = `error: ${error.message}`;
-  }
-  try {
-    await revisarPartidosDesatendidos(env, ctx);
-    resultados.avisos = "ok";
-  } catch (error) {
-    console.error("[cron-respaldo] Error revisando partidos desatendidos:", error);
-    resultados.avisos = `error: ${error.message}`;
-  }
-
-  return json({ ok: true, actuado: true, motivo: "primaria_caida", resultados });
-}
+const FAILOVER_HEADER = "X-Failover-Backend";
+const FAILOVER_TEST_HEADER = "X-Failover-Test";
+const FAILOVER_REASON_HEADER = "X-Failover-Reason";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1596,72 +1648,368 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // Presente solo cuando server-railway.js ya decidió que esta escritura
-    // se va a encolar en pending_writes para reproducirse luego contra D1
-    // (ver server-railway.js: candidataAEncolar). Se guarda en la propia
-    // fila creada aquí (origin_write_id, si la petición es un INSERT de
-    // artículo/resultado) para que, cuando D1 reproduzca esta misma
-    // escritura más tarde con el mismo X-Write-Id (ver drainPendingWrites
-    // en worker/src/index.js), sync/incremental.mjs pueda reconciliar
-    // ambas filas como una sola en vez de duplicar. Ver
-    // worker/migracion_origin_write_id.sql para el porqué completo.
-    const origenWriteId = request.headers.get("X-Write-Id") || null;
+    /*
+     * ============================================================
+     * CORS
+     * ============================================================
+     */
 
-    if (method === "OPTIONS") return cors(new Response(null, { status: 204 }));
+    if (method === "OPTIONS") {
+      return cors(new Response(null, { status: 204 }));
+    }
 
     /*
      * ============================================================
-     * CRON DE RESPALDO (tareas programadas cuando el primario cae)
-     * ============================================================
+     * SITEMAP DE NOTICIAS
      *
-     * El Worker principal de Cloudflare tiene un cron trigger
-     * (worker/wrangler.toml, "* * * * *") que cada minuto publica
-     * noticias programadas, arranca partidos programados y avisa de
-     * partidos desatendidos (ver publicarArticulosProgramados,
-     * iniciarPartidosProgramadosCuyaHoraHaLlegado y
-     * revisarPartidosDesatendidos, todas abajo). Ese cron SOLO existe
-     * en el Worker principal -- deliberadamente desactivado aquí en
-     * el wrangler.toml heredado de este directorio, para no disparar
-     * la misma tarea dos veces si ambos backends estuvieran vivos a
-     * la vez.
+     * GET /sitemap-noticias.xml
      *
-     * Si el Worker principal deja de responder por completo (no solo
-     * D1, sino el propio dominio inalcanzable), su cron deja de
-     * ejecutarse y nada lo sustituye: las noticias programadas no se
-     * publican solas, los partidos programados no arrancan. Este
-     * endpoint es el respaldo para ese caso: un cron EXTERNO
-     * configurado en Railway (ver README de este directorio) lo llama
-     * cada minuto, protegido por un secreto compartido
-     * (INTERNAL_CRON_SECRET). Antes de ejecutar nada, comprueba que el
-     * primario de verdad no responde -- si respondiera, no hace nada,
-     * precisamente para no duplicar publicaciones.
+     * El sitemap.xml estático de /public solo lista páginas fijas
+     * (portada, categorías...) porque no puede conocer las noticias, que
+     * viven en la base de datos. Este endpoint genera al vuelo el sitemap
+     * de todas las noticias publicadas, para que robots.txt pueda
+     * apuntarlo y Google las descubra sin depender solo de enlaces
+     * internos.
+     *
+     * Cacheado 1 hora (incluso en el propio Cloudflare, vía "cache:" de
+     * fetch) porque un sitemap no necesita estar al segundo: lo importante
+     * es que exista y se actualice con regularidad, no en tiempo real.
      * ============================================================
      */
-    if (path === "/api/internal/cron-respaldo" && method === "POST") {
-      return await ejecutarCronRespaldo(request, env, ctx);
-    }
 
-    // ---------- HEALTH CHECK ----------
-    // Mismo endpoint que worker/src/index.js, replicado aquí para que la
-    // página pública de estado (estado.html) pueda comprobar también la
-    // salud de la API secundaria si algún día se expone con dominio
-    // propio (ver nota de /sitemap-noticias.xml más abajo sobre por qué
-    // hoy esto no se usa en producción).
-    if (path === "/api/health" && method === "GET") {
+    if (path === "/sitemap-noticias.xml" && method === "GET") {
       try {
-        const started = Date.now();
-        await env.DB.prepare("SELECT 1 AS ok").first();
-        return json({ status: "ok", database: true, storage: null, responseTime: Date.now() - started, api: "secondary", failover: false }, 200);
-      } catch (error) {
-        console.error("[health] D1 error:", error);
-        return json({ status: "degraded", database: false, storage: null, responseTime: null, api: "secondary", failover: false }, 503);
+        const { results } = await env.DB.prepare(
+          `SELECT slug, titulo, imagen_url, imagenes, fecha_publicacion, updated_at FROM articles
+           WHERE publicado = 1
+           ORDER BY fecha_publicacion DESC
+           LIMIT 50000`
+        ).all();
+
+        const urls = results.map((articulo) => {
+          const lastmod = fechaParaSitemap(articulo.updated_at || articulo.fecha_publicacion);
+
+          // Extensión "image:" del protocolo de sitemaps: además de la
+          // <loc> de la noticia, se listan sus imágenes para que Google
+          // las pueda indexar en Google Imágenes aunque no las rastree
+          // desde la propia página. Se juntan "imagen_url" (portada) y el
+          // array JSON "imagenes", sin duplicados.
+          let listaImagenes = [];
+          try {
+            const adicionales = articulo.imagenes ? JSON.parse(articulo.imagenes) : [];
+            listaImagenes = [articulo.imagen_url, ...(Array.isArray(adicionales) ? adicionales : [])]
+              .filter(Boolean);
+          } catch {
+            listaImagenes = articulo.imagen_url ? [articulo.imagen_url] : [];
+          }
+          listaImagenes = [...new Set(listaImagenes)];
+
+          const bloquesImagen = listaImagenes.map((src) => [
+            "    <image:image>",
+            `      <image:loc>${escaparXml(src)}</image:loc>`,
+            articulo.titulo ? `      <image:caption>${escaparXml(articulo.titulo)}</image:caption>` : null,
+            "    </image:image>",
+          ].filter(Boolean).join("\n")).join("\n");
+
+          return [
+            "  <url>",
+            `    <loc>https://elotrofutbol.media/noticia.html?slug=${escaparXml(articulo.slug)}</loc>`,
+            lastmod ? `    <lastmod>${lastmod}</lastmod>` : null,
+            "    <changefreq>weekly</changefreq>",
+            "    <priority>0.6</priority>",
+            bloquesImagen || null,
+            "  </url>",
+          ].filter(Boolean).join("\n");
+        }).join("\n");
+
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="https://www.google.com/schemas/sitemap-image/1.1">\n${urls}\n</urlset>\n`;
+
+        return cors(new Response(xml, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/xml; charset=UTF-8",
+            "Cache-Control": "public, max-age=3600",
+          },
+        }));
+      } catch (err) {
+        // Si la base de datos falla, mejor devolver un sitemap vacío pero
+        // válido que un error 500: así un rastreador que llegue en ese
+        // momento no ve un sitemap "roto", solo uno sin URLs esta vez.
+        return cors(new Response(
+          `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9"></urlset>\n`,
+          { status: 200, headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "no-store" } }
+        ));
       }
     }
 
-    // ---------- CONTACTO DE PRENSA ----------
-    // Mismo endpoint que worker/src/index.js. Ver nota de arriba: no se usa
-    // en producción hoy (el punto de entrada público real es siempre el
-    // worker principal), se mantiene solo para que el código no diverja.
+    /*
+     * ============================================================
+     * GOOGLE NEWS SITEMAP
+     *
+     * GET /sitemap-news.xml
+     *
+     * El sitemap normal (/sitemap-noticias.xml) sirve para que Google
+     * indexe las noticias en la búsqueda normal, pero para aparecer en
+     * Google News específicamente hace falta un sitemap con el
+     * namespace "news" (news:publication, news:publication_date,
+     * news:title) y, según la propia especificación de Google, con
+     * SOLO las noticias de las últimas 48 horas (a diferencia del
+     * sitemap normal, que lista todo el histórico). Un artículo con más
+     * de 48h simplemente deja de aparecer aquí sin que eso afecte a su
+     * indexación normal, que sigue cubierta por /sitemap-noticias.xml.
+     * ============================================================
+     */
+
+    if (path === "/sitemap-news.xml" && method === "GET") {
+      try {
+        const { results } = await env.DB.prepare(
+          `SELECT slug, titulo, categoria, fecha_publicacion FROM articles
+           WHERE publicado = 1
+             AND fecha_publicacion >= datetime('now', '-48 hours')
+           ORDER BY fecha_publicacion DESC
+           LIMIT 1000`
+        ).all();
+
+        const urls = results.map((articulo) => {
+          // news:publication_date exige fecha+hora en formato W3C
+          // (ISO 8601), no la fecha simple "YYYY-MM-DD" que usa
+          // <lastmod> en el sitemap normal.
+          const fecha = new Date(
+            articulo.fecha_publicacion.includes("T") || articulo.fecha_publicacion.endsWith("Z")
+              ? articulo.fecha_publicacion
+              : `${articulo.fecha_publicacion.replace(" ", "T")}Z`
+          );
+          if (Number.isNaN(fecha.getTime())) return null;
+
+          return [
+            "  <url>",
+            `    <loc>https://elotrofutbol.media/noticia.html?slug=${escaparXml(articulo.slug)}</loc>`,
+            "    <news:news>",
+            "      <news:publication>",
+            "        <news:name>ELOTROFÚTBOLTV</news:name>",
+            "        <news:language>es</news:language>",
+            "      </news:publication>",
+            `      <news:publication_date>${fecha.toISOString()}</news:publication_date>`,
+            `      <news:title>${escaparXml(articulo.titulo)}</news:title>`,
+            articulo.categoria ? `      <news:keywords>${escaparXml(articulo.categoria)}</news:keywords>` : null,
+            "    </news:news>",
+            "  </url>",
+          ].filter(Boolean).join("\n");
+        }).filter(Boolean).join("\n");
+
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="https://www.google.com/schemas/sitemap-news/0.9">\n${urls}\n</urlset>\n`;
+
+        return cors(new Response(xml, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/xml; charset=UTF-8",
+            // Cacheado más corto que el sitemap normal: al depender de
+            // una ventana móvil de 48h, conviene refrescarlo más a
+            // menudo para que un artículo recién cumplidas las 48h
+            // desaparezca sin esperar una hora entera.
+            "Cache-Control": "public, max-age=600",
+          },
+        }));
+      } catch (err) {
+        return cors(new Response(
+          `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="https://www.google.com/schemas/sitemap-news/0.9"></urlset>\n`,
+          { status: 200, headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "no-store" } }
+        ));
+      }
+    }
+
+    /*
+     * ============================================================
+     * FEED RSS
+     *
+     * GET /rss.xml
+     *
+     * RSS 2.0 estándar con las últimas noticias publicadas, para
+     * agregadores (Google News, lectores RSS, otros medios que enlacen
+     * la web). Mismo patrón y mismo cacheado que /sitemap-noticias.xml:
+     * se genera al vuelo desde la base de datos y se cachea 1 hora,
+     * porque un feed no necesita estar al segundo.
+     * ============================================================
+     */
+
+    if (path === "/rss.xml" && method === "GET") {
+      try {
+        const { results } = await env.DB.prepare(
+          `SELECT slug, titulo, subtitulo, contenido, categoria, autor_nombre, fecha_publicacion, updated_at
+           FROM articles
+           WHERE publicado = 1
+           ORDER BY fecha_publicacion DESC
+           LIMIT 100`
+        ).all();
+
+        const items = results.map((articulo) => {
+          const link = `https://elotrofutbol.media/noticia.html?slug=${escaparXml(articulo.slug)}`;
+          const pubDate = fechaParaRss(articulo.fecha_publicacion);
+          const descripcion = articulo.subtitulo?.trim() || extractoTexto(articulo.contenido);
+          return [
+            "  <item>",
+            `    <title>${escaparXml(articulo.titulo)}</title>`,
+            `    <link>${link}</link>`,
+            `    <guid isPermaLink="true">${link}</guid>`,
+            descripcion ? `    <description>${escaparXml(descripcion)}</description>` : null,
+            articulo.categoria ? `    <category>${escaparXml(articulo.categoria)}</category>` : null,
+            articulo.autor_nombre ? `    <author>${escaparXml(articulo.autor_nombre)}</author>` : null,
+            pubDate ? `    <pubDate>${pubDate}</pubDate>` : null,
+            "  </item>",
+          ].filter(Boolean).join("\n");
+        }).join("\n");
+
+        const ultimaActualizacion = fechaParaRss(results[0]?.updated_at || results[0]?.fecha_publicacion) || new Date().toUTCString();
+
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:atom="https://www.w3.org/2005/Atom">\n<channel>\n  <title>ELOTROFÚTBOLTV</title>\n  <link>https://elotrofutbol.media</link>\n  <description>Últimas noticias de fútbol modesto: Primera Federación, Segunda Federación y más.</description>\n  <language>es</language>\n  <lastBuildDate>${ultimaActualizacion}</lastBuildDate>\n  <atom:link href="https://elotrofutbol.media/rss.xml" rel="self" type="application/rss+xml" />\n${items}\n</channel>\n</rss>\n`;
+
+        return cors(new Response(xml, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/rss+xml; charset=UTF-8",
+            "Cache-Control": "public, max-age=3600",
+          },
+        }));
+      } catch (err) {
+        // Mismo criterio que el sitemap: mejor un feed vacío pero válido
+        // que un error 500.
+        return cors(new Response(
+          `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0"><channel><title>ELOTROFÚTBOLTV</title><link>https://elotrofutbol.media</link><description>Últimas noticias de fútbol modesto.</description></channel></rss>\n`,
+          { status: 200, headers: { "Content-Type": "application/rss+xml; charset=UTF-8", "Cache-Control": "no-store" } }
+        ));
+      }
+    }
+
+    /*
+     * ============================================================
+     * FAILOVER_TEST
+     *
+     * FAILOVER_TEST=1
+     *
+     * NO ejecutamos el backend principal.
+     * Mandamos la petición directamente a Railway.
+     *
+     * Esto permite comprobar que el failover funciona de verdad.
+     * ============================================================
+     */
+
+    if (env.FAILOVER_TEST === "1") {
+      console.log("[FAILOVER] TEST ACTIVADO → Railway");
+
+      return await fetchRailway(
+        request,
+        path,
+        "FAILOVER_TEST"
+      );
+    }
+
+    /*
+     * ============================================================
+     * HEALTH CHECK
+     *
+     * Este endpoint comprueba el backend PRINCIPAL.
+     *
+     * Si D1 funciona:
+     *   200
+     *
+     * Si D1 falla:
+     *   503
+     *
+     * Esto permite detectar que el backend principal está
+     * realmente degradado.
+     * ============================================================
+     */
+
+    if (path === "/api/health" && method === "GET") {
+      try {
+        const started = Date.now();
+
+        await env.DB.prepare(
+          "SELECT 1 AS ok"
+        ).first();
+
+        return json(
+          {
+            status: "ok",
+            database: true,
+            storage: null,
+            responseTime: Date.now() - started,
+            api: "primary",
+            failover: false
+          },
+          200
+        );
+      } catch (error) {
+        console.error("[health] D1 error:", error);
+
+        return json(
+          {
+            status: "degraded",
+            database: false,
+            storage: null,
+            responseTime: null,
+            api: "primary",
+            failover: false
+          },
+          503
+        );
+      }
+    }
+
+    /*
+     * ============================================================
+     * NEWSLETTER / BOLETÍN SEMANAL
+     *
+     * POST /api/newsletter/suscribir  { email }
+     * GET  /api/newsletter/baja?token=...
+     *
+     * Suscripción pública desde el formulario de portada/pie de página.
+     * Sin autenticación (cualquiera puede suscribirse), pero valida el
+     * formato del email y no revela si un email ya estaba suscrito (para
+     * no filtrar esa información a quien pruebe direcciones ajenas): en
+     * ambos casos responde igual, éxito.
+     * ============================================================
+     */
+
+    if (path === "/api/newsletter/suscribir" && method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ error: "JSON inválido" }, 400);
+      }
+      const email = (body && body.email ? String(body.email) : "").trim().toLowerCase();
+      if (!emailValido(email)) {
+        return json({ error: "Introduce un email válido" }, 400);
+      }
+      try {
+        const existente = await env.DB.prepare(
+          "SELECT id, activo FROM newsletter_suscriptores WHERE email = ?"
+        ).bind(email).first();
+        if (existente) {
+          if (!existente.activo) {
+            await env.DB.prepare(
+              "UPDATE newsletter_suscriptores SET activo = 1, baja_at = NULL WHERE id = ?"
+            ).bind(existente.id).run();
+          }
+          return json({ ok: true });
+        }
+        await env.DB.prepare(
+          "INSERT INTO newsletter_suscriptores (email, baja_token) VALUES (?, ?)"
+        ).bind(email, generarTokenBaja()).run();
+        return json({ ok: true });
+      } catch (err) {
+        console.error("[newsletter/suscribir]", err);
+        return json({ error: "No se pudo completar la suscripción" }, 500);
+      }
+    }
+
+    // ---------- Contacto de prensa ----------
+    // Formulario público (página contacto.html): no requiere autenticación,
+    // pero sí validación básica para no ser un vector fácil de spam/abuso.
+    // No se guarda en base de datos (no hace falta un historial consultable
+    // desde el panel todavía): se reenvía directamente por email al buzón
+    // del medio vía Resend, igual que el resto de notificaciones.
     if (path === "/api/contacto-prensa" && method === "POST") {
       let body;
       try {
@@ -1703,179 +2051,483 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
       }
     }
 
-    // ---------- SITEMAP DE NOTICIAS ----------
-    // GET /sitemap-noticias.xml — mismo endpoint que worker/src/index.js
-    // (API principal). El punto de entrada público real siempre es el
-    // worker principal (elotrofutbol.media pasa por él, y es él quien
-    // reenvía a Railway internamente si D1 falla — ver fetchRailway en
-    // worker/src/index.js), así que este endpoint aquí NO se usa en
-    // producción salvo que algún día esta API secundaria se exponga ella
-    // misma con su propio dominio/ruta pública. Se mantiene por si eso
-    // ocurre y para que el código de ambas APIs no diverja en esta parte.
-    if (path === "/sitemap-noticias.xml" && method === "GET") {
+    if (path === "/api/newsletter/baja" && method === "GET") {
+      const token = url.searchParams.get("token") || "";
+      if (!token) return new Response("Enlace no válido.", { status: 400 });
       try {
-        const { results } = await env.DB.prepare(
-          `SELECT slug, titulo, imagen_url, imagenes, fecha_publicacion, updated_at FROM articles
-           WHERE publicado = 1
-           ORDER BY fecha_publicacion DESC
-           LIMIT 50000`
-        ).all();
+        const res = await env.DB.prepare(
+          "UPDATE newsletter_suscriptores SET activo = 0, baja_at = datetime('now') WHERE baja_token = ? AND activo = 1"
+        ).bind(token).run();
+        const huboBaja = res && res.meta && res.meta.changes > 0;
+        return new Response(
+          `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Baja del boletín</title></head>
+           <body style="font-family:Arial,sans-serif;max-width:480px;margin:60px auto;text-align:center;color:#0c1b2e;">
+             <h1 style="font-size:20px;">${huboBaja ? "Te has dado de baja" : "Ese enlace ya no es válido"}</h1>
+             <p style="color:#5a6270;">${huboBaja ? "Ya no recibirás el boletín semanal de ELOTROFÚTBOLTV." : "Puede que ya te hubieras dado de baja antes."}</p>
+             <p><a href="${SITIO_URL}" style="color:#d1132e;">Volver a la portada</a></p>
+           </body></html>`,
+          { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } }
+        );
+      } catch (err) {
+        console.error("[newsletter/baja]", err);
+        return new Response("No se pudo procesar la baja.", { status: 500 });
+      }
+    }
 
-        const urls = results.map((articulo) => {
-          const lastmod = fechaParaSitemap(articulo.updated_at || articulo.fecha_publicacion);
+    /*
+     * ============================================================
+     * DRENAJE DE LA COLA DE ESCRITURAS PENDIENTES (secundaria -> D1)
+     *
+     * Invocado por Railway (worker-secondary/src/pending-writes.js /
+     * sync/scheduler.mjs) cada vez que detecta que D1 ha vuelto a
+     * responder. Reproduce, una a una y en orden de creación, las
+     * escrituras que se atendieron en Postgres durante un failover y que
+     * todavía no se aplicaron aquí -- ver db/migrations/003_pending_writes.sql
+     * en worker-secondary para el porqué completo.
+     *
+     * Protegido por un secreto compartido (INTERNAL_SYNC_SECRET) en vez de
+     * requireAuth normal: quien llama es el propio backend, no un usuario
+     * con sesión, y este endpoint no debe ser alcanzable por el público.
+     * ============================================================
+     */
 
-          // Extensión "image:" del protocolo de sitemaps — ver comentario
-          // equivalente en worker/src/index.js.
-          let listaImagenes = [];
-          try {
-            const adicionales = articulo.imagenes ? JSON.parse(articulo.imagenes) : [];
-            listaImagenes = [articulo.imagen_url, ...(Array.isArray(adicionales) ? adicionales : [])]
-              .filter(Boolean);
-          } catch {
-            listaImagenes = articulo.imagen_url ? [articulo.imagen_url] : [];
+    if (path === "/api/internal/drain-pending-writes" && method === "POST") {
+      return await drainPendingWrites(request, env, ctx);
+    }
+
+    /*
+     * ============================================================
+     * FUNCIONAMIENTO NORMAL
+     *
+     * Aquí debe ejecutarse el código ORIGINAL de tu Worker.
+     *
+     * IMPORTANTE:
+     *
+     * NO hagas:
+     *
+     * fetch("https://api.elotrofutbol.media/...")
+     *
+     * porque este Worker ya está detrás de ese dominio.
+     *
+     * Tu código principal debe ejecutarse directamente aquí.
+     * ============================================================
+     */
+
+    try {
+      const primaryResponse = await handlePrimary(
+        request,
+        env,
+        ctx
+      );
+
+      /*
+       * ==========================================================
+       * RESPUESTA NORMAL DEL PRINCIPAL
+       * ==========================================================
+       *
+       * 2xx / 3xx / 4xx:
+       *
+       * No hacemos failover.
+       *
+       * Solo hacemos failover ante errores 5xx.
+       */
+
+      if (primaryResponse.status < 500) {
+        const headers = new Headers(
+          primaryResponse.headers
+        );
+
+        headers.set(
+          FAILOVER_HEADER,
+          "PRIMARY"
+        );
+
+        headers.set(
+          FAILOVER_TEST_HEADER,
+          "false"
+        );
+
+        return new Response(
+          primaryResponse.body,
+          {
+            status: primaryResponse.status,
+            statusText: primaryResponse.statusText,
+            headers
           }
-          listaImagenes = [...new Set(listaImagenes)];
-
-          const bloquesImagen = listaImagenes.map((src) => [
-            "    <image:image>",
-            `      <image:loc>${escaparXml(src)}</image:loc>`,
-            articulo.titulo ? `      <image:caption>${escaparXml(articulo.titulo)}</image:caption>` : null,
-            "    </image:image>",
-          ].filter(Boolean).join("\n")).join("\n");
-
-          return [
-            "  <url>",
-            `    <loc>https://elotrofutbol.media/noticia.html?slug=${escaparXml(articulo.slug)}</loc>`,
-            lastmod ? `    <lastmod>${lastmod}</lastmod>` : null,
-            "    <changefreq>weekly</changefreq>",
-            "    <priority>0.6</priority>",
-            bloquesImagen || null,
-            "  </url>",
-          ].filter(Boolean).join("\n");
-        }).join("\n");
-
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="https://www.google.com/schemas/sitemap-image/1.1">\n${urls}\n</urlset>\n`;
-
-        return cors(new Response(xml, {
-          status: 200,
-          headers: {
-            "Content-Type": "application/xml; charset=UTF-8",
-            "Cache-Control": "public, max-age=3600",
-          },
-        }));
-      } catch (err) {
-        return cors(new Response(
-          `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9"></urlset>\n`,
-          { status: 200, headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "no-store" } }
-        ));
+        );
       }
+
+      /*
+       * ==========================================================
+       * PRINCIPAL RESPONDE 5XX
+       *
+       * → RAILWAY
+       * ==========================================================
+       */
+
+      console.error(
+        `[FAILOVER] Principal respondió ${primaryResponse.status}. ` +
+        `Activando Railway.`
+      );
+
+      return await fetchRailway(
+        request,
+        path,
+        `PRIMARY_${primaryResponse.status}`
+      );
+
+    } catch (primaryError) {
+
+      /*
+       * ==========================================================
+       * ERROR DE EJECUCIÓN DEL PRINCIPAL
+       *
+       * → RAILWAY
+       * ==========================================================
+       */
+
+      console.error(
+        "[FAILOVER] Error en backend principal:",
+        primaryError
+      );
+
+      return await fetchRailway(
+        request,
+        path,
+        "PRIMARY_EXCEPTION"
+      );
     }
+  },
 
-    // ---------- GOOGLE NEWS SITEMAP ----------
-    // GET /sitemap-news.xml — mismo endpoint que worker/src/index.js.
-    // Ver comentario de /sitemap-noticias.xml arriba sobre por qué se
-    // mantiene aquí por paridad aunque no se use en producción.
-    if (path === "/sitemap-news.xml" && method === "GET") {
-      try {
-        const { results } = await env.DB.prepare(
-          `SELECT slug, titulo, categoria, fecha_publicacion FROM articles
-           WHERE publicado = 1
-             AND fecha_publicacion >= datetime('now', '-48 hours')
-           ORDER BY fecha_publicacion DESC
-           LIMIT 1000`
-        ).all();
+  // Disparador programado (cron trigger, ver "crons" en wrangler.toml):
+  // revisa cada minuto si hay alguna noticia programada cuya hora ya ha
+  // llegado y, si es así, la publica sola sin que nadie tenga que entrar
+  // al panel a esa hora.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(publicarArticulosProgramados(env));
+    ctx.waitUntil(iniciarPartidosProgramadosCuyaHoraHaLlegado(env));
+    ctx.waitUntil(revisarPartidosDesatendidos(env, ctx));
+    ctx.waitUntil(enviarBoletinSemanalSiToca(env));
+  },
+};
 
-        const urls = results.map((articulo) => {
-          const fecha = new Date(
-            articulo.fecha_publicacion.includes("T") || articulo.fecha_publicacion.endsWith("Z")
-              ? articulo.fecha_publicacion
-              : `${articulo.fecha_publicacion.replace(" ", "T")}Z`
-          );
-          if (Number.isNaN(fecha.getTime())) return null;
 
-          return [
-            "  <url>",
-            `    <loc>https://elotrofutbol.media/noticia.html?slug=${escaparXml(articulo.slug)}</loc>`,
-            "    <news:news>",
-            "      <news:publication>",
-            "        <news:name>ELOTROFÚTBOLTV</news:name>",
-            "        <news:language>es</news:language>",
-            "      </news:publication>",
-            `      <news:publication_date>${fecha.toISOString()}</news:publication_date>`,
-            `      <news:title>${escaparXml(articulo.titulo)}</news:title>`,
-            articulo.categoria ? `      <news:keywords>${escaparXml(articulo.categoria)}</news:keywords>` : null,
-            "    </news:news>",
-            "  </url>",
-          ].filter(Boolean).join("\n");
-        }).filter(Boolean).join("\n");
+/*
+ * ================================================================
+ * EJECUTAR RAILWAY
+ * ================================================================
+ */
 
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="https://www.google.com/schemas/sitemap-news/0.9">\n${urls}\n</urlset>\n`;
+/*
+ * ================================================================
+ * DRENAJE DE LA COLA DE ESCRITURAS PENDIENTES
+ *
+ * Railway (worker-secondary) es quien guarda la cola en Postgres, porque
+ * el Worker de Cloudflare no puede abrir una conexión TCP normal a
+ * Postgres (el driver "pg" necesita sockets que el runtime de Workers no
+ * ofrece salvo la API específica de cloudflare:sockets, que "pg" no usa).
+ * Por eso el flujo es al revés de lo que sería más natural: Railway LEE su
+ * propia cola y la EMPUJA aquí por HTTP, en vez de que el Worker vaya a
+ * buscarla.
+ *
+ * Body esperado: { writes: [{ write_id, method, path, query_string, body,
+ * authorization_header }, ...] }, en el mismo orden en que se crearon (así
+ * dos escrituras sobre el mismo registro se aplican en el orden correcto).
+ *
+ * Para cada una se construye un Request sintético y se llama directamente
+ * a handlePrimary -- la MISMA función que atiende peticiones normales, con
+ * las mismas validaciones y checks de permiso, para no crear un segundo
+ * camino de escritura con reglas distintas.
+ *
+ * Devuelve el resultado de cada intento para que Railway actualice su cola
+ * (applied/failed) -- este endpoint no borra ni modifica pending_writes,
+ * eso es responsabilidad exclusiva de quien la guarda.
+ * ================================================================
+ */
+async function drainPendingWrites(request, env, ctx) {
+  const secretEsperado = env.INTERNAL_SYNC_SECRET;
+  if (!secretEsperado) {
+    // Fallo cerrado: si no hay secreto configurado, este endpoint no debe
+    // aceptar NADA, ni siquiera con una cabecera vacía coincidiendo con
+    // "undefined" por error de configuración en ambos lados.
+    return json({ error: "Endpoint interno no configurado" }, 503);
+  }
+  const secretRecibido = request.headers.get("X-Internal-Sync-Secret");
+  if (!secretRecibido || secretRecibido !== secretEsperado) {
+    return json({ error: "No autorizado" }, 401);
+  }
 
-        return cors(new Response(xml, {
-          status: 200,
-          headers: {
-            "Content-Type": "application/xml; charset=UTF-8",
-            "Cache-Control": "public, max-age=600",
-          },
-        }));
-      } catch (err) {
-        return cors(new Response(
-          `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="https://www.google.com/schemas/sitemap-news/0.9"></urlset>\n`,
-          { status: 200, headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "no-store" } }
-        ));
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return json({ error: "JSON inválido" }, 400);
+  }
+  const writes = Array.isArray(payload?.writes) ? payload.writes : [];
+  if (writes.length === 0) return json({ results: [] });
+  // Límite defensivo: un lote descontrolado (p.ej. un bug generando miles
+  // de filas) no debe poder tumbar esta invocación ni consumir todo el CPU
+  // time del Worker. Railway simplemente manda el resto en la siguiente
+  // llamada (se ejecuta cada vez que detecta que D1 volvió).
+  const LOTE_MAXIMO = 50;
+  const lote = writes.slice(0, LOTE_MAXIMO);
+
+  const resultados = [];
+  for (const w of lote) {
+    if (!w || !w.write_id || !w.method || !w.path) {
+      resultados.push({ write_id: w?.write_id ?? null, status: "failed", result_status: null, result_body: "Entrada de cola inválida (faltan campos)" });
+      continue;
+    }
+    try {
+      const urlInterna = `https://internal.elotrofutbol.media${w.path}${w.query_string || ""}`;
+      const headers = new Headers();
+      if (w.authorization_header) headers.set("Authorization", w.authorization_header);
+      headers.set("Content-Type", "application/json");
+      // Mismo write_id que, si esta escritura creó una fila en Postgres
+      // durante el failover, ya se guardó en su columna origin_write_id
+      // (ver server-railway.js/pending-writes.js). Al reproducirla aquí
+      // contra D1 con el mismo id, la fila que D1 cree (si es un INSERT)
+      // queda etiquetada igual, y sync/incremental.mjs puede reconciliarla
+      // con la de Postgres en vez de duplicarla -- ver
+      // worker/migracion_origin_write_id.sql para el porqué completo.
+      if (w.write_id) headers.set("X-Write-Id", w.write_id);
+      const reqSintetico = new Request(urlInterna, {
+        method: w.method,
+        headers,
+        body: (w.method === "GET" || w.method === "HEAD") ? undefined : (w.body ?? undefined),
+      });
+      const resp = await handlePrimary(reqSintetico, env, ctx);
+      const cuerpoResp = await resp.text().catch(() => "");
+      resultados.push({
+        write_id: w.write_id,
+        status: resp.status < 400 ? "applied" : "failed",
+        result_status: resp.status,
+        // Se trunca por si el error incluye algo largo (stack, HTML de
+        // error genérico); esto es solo para diagnóstico en pending_writes.
+        result_body: cuerpoResp.slice(0, 2000),
+      });
+    } catch (error) {
+      console.error(`[drain-pending-writes] error reproduciendo ${w.method} ${w.path}:`, error);
+      resultados.push({
+        write_id: w.write_id,
+        status: "failed",
+        result_status: null,
+        result_body: String(error?.message || error).slice(0, 2000),
+      });
+    }
+  }
+
+  return json({ results: resultados });
+}
+
+async function fetchRailway(
+  request,
+  path,
+  reason
+) {
+  const railwayUrl =
+    RAILWAY_URL +
+    path +
+    new URL(request.url).search;
+
+  console.log(
+    `[FAILOVER] Railway → ${request.method} ${path} (${reason})`
+  );
+
+  try {
+    /*
+     * request.clone() es importante.
+     *
+     * Permite enviar el mismo request a Railway aunque
+     * anteriormente haya sido utilizado por el backend principal.
+     */
+
+    const railwayHeaders = new Headers(request.headers);
+    // Marca INTERNA (no confundir con FAILOVER_REASON_HEADER, que va en la
+    // respuesta hacia el navegador): le dice a server-railway.js que esta
+    // petición llega por un failover real gestionado por el Worker, no por
+    // alguien pegando directamente a Railway (pruebas manuales, curl,
+    // etc.). Es la señal que usa pending-writes.js para decidir si una
+    // escritura debe encolarse para reproducirse luego contra D1 -- sin
+    // esto, tráfico de prueba contra Railway generaría entradas de cola
+    // que nunca deberían haber existido.
+    railwayHeaders.set("X-Failover-Origin", "worker-primary");
+    railwayHeaders.set("X-Failover-Origin-Reason", reason);
+
+    const railwayRequest = new Request(
+      railwayUrl,
+      {
+        method: request.method,
+        headers: railwayHeaders,
+
+        body:
+          request.method === "GET" ||
+          request.method === "HEAD"
+            ? undefined
+            : request.clone().body,
+
+        redirect: "follow"
       }
-    }
+    );
 
-    // ---------- RSS ----------
-    // GET /rss.xml — mismo endpoint que worker/src/index.js (API
-    // principal). Ver comentario de /sitemap-noticias.xml arriba: este
-    // endpoint aquí no se usa en producción salvo failover, se mantiene
-    // por paridad de código entre ambas APIs.
-    if (path === "/rss.xml" && method === "GET") {
-      try {
-        const { results } = await env.DB.prepare(
-          `SELECT slug, titulo, subtitulo, contenido, categoria, autor_nombre, fecha_publicacion, updated_at
-           FROM articles
-           WHERE publicado = 1
-           ORDER BY fecha_publicacion DESC
-           LIMIT 100`
-        ).all();
+    const railwayResponse =
+      await fetch(railwayRequest);
 
-        const items = results.map((articulo) => {
-          const link = `https://elotrofutbol.media/noticia.html?slug=${escaparXml(articulo.slug)}`;
-          const pubDate = fechaParaRss(articulo.fecha_publicacion);
-          const descripcion = articulo.subtitulo?.trim() || extractoTexto(articulo.contenido);
-          return [
-            "  <item>",
-            `    <title>${escaparXml(articulo.titulo)}</title>`,
-            `    <link>${link}</link>`,
-            `    <guid isPermaLink="true">${link}</guid>`,
-            descripcion ? `    <description>${escaparXml(descripcion)}</description>` : null,
-            articulo.categoria ? `    <category>${escaparXml(articulo.categoria)}</category>` : null,
-            articulo.autor_nombre ? `    <author>${escaparXml(articulo.autor_nombre)}</author>` : null,
-            pubDate ? `    <pubDate>${pubDate}</pubDate>` : null,
-            "  </item>",
-          ].filter(Boolean).join("\n");
-        }).join("\n");
+    const headers =
+      new Headers(railwayResponse.headers);
 
-        const ultimaActualizacion = fechaParaRss(results[0]?.updated_at || results[0]?.fecha_publicacion) || new Date().toUTCString();
+    /*
+     * Cabeceras para verificar visualmente el failover.
+     */
 
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:atom="https://www.w3.org/2005/Atom">\n<channel>\n  <title>ELOTROFÚTBOLTV</title>\n  <link>https://elotrofutbol.media</link>\n  <description>Últimas noticias de fútbol modesto: Primera Federación, Segunda Federación y más.</description>\n  <language>es</language>\n  <lastBuildDate>${ultimaActualizacion}</lastBuildDate>\n  <atom:link href="https://elotrofutbol.media/rss.xml" rel="self" type="application/rss+xml" />\n${items}\n</channel>\n</rss>\n`;
+    headers.set(
+      FAILOVER_HEADER,
+      "RAILWAY"
+    );
 
-        return cors(new Response(xml, {
-          status: 200,
-          headers: {
-            "Content-Type": "application/rss+xml; charset=UTF-8",
-            "Cache-Control": "public, max-age=3600",
-          },
-        }));
-      } catch (err) {
-        return cors(new Response(
-          `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0"><channel><title>ELOTROFÚTBOLTV</title><link>https://elotrofutbol.media</link><description>Últimas noticias de fútbol modesto.</description></channel></rss>\n`,
-          { status: 200, headers: { "Content-Type": "application/rss+xml; charset=UTF-8", "Cache-Control": "no-store" } }
-        ));
+    headers.set(
+      FAILOVER_TEST_HEADER,
+      reason === "FAILOVER_TEST"
+        ? "true"
+        : "false"
+    );
+
+    headers.set(
+      FAILOVER_REASON_HEADER,
+      reason
+    );
+
+    headers.set(
+      "Cache-Control",
+      "no-store"
+    );
+
+    // Sin esto, el frontend no puede leer X-Failover-Backend/etc: por
+    // defecto el navegador oculta cabeceras personalizadas a fetch() en
+    // peticiones cross-origin salvo que se listen aquí explícitamente
+    // (ver el mismo razonamiento en la función cors() de este archivo).
+    headers.set(
+      "Access-Control-Expose-Headers",
+      "X-Failover-Backend,X-Failover-Test,X-Failover-Reason"
+    );
+
+    /*
+     * Si Railway responde correctamente,
+     * devolvemos su respuesta original.
+     */
+
+    return new Response(
+      railwayResponse.body,
+      {
+        status: railwayResponse.status,
+        statusText: railwayResponse.statusText,
+        headers
       }
-    }
+    );
+
+  } catch (railwayError) {
+
+    /*
+     * ============================================================
+     * FALLAN PRINCIPAL Y RAILWAY
+     * ============================================================
+     */
+
+    console.error(
+      "[FAILOVER] Railway también ha fallado:",
+      railwayError
+    );
+
+    return new Response(
+      JSON.stringify(
+        {
+          status: "FAILOVER_ERROR",
+          backend: "NONE",
+          message:
+            "Primary and Railway unavailable",
+          failover_reason: reason,
+          railway_error:
+            railwayError?.message ||
+            String(railwayError)
+        },
+        null,
+        2
+      ),
+      {
+        status: 502,
+        headers: {
+          "Content-Type":
+            "application/json",
+          "Cache-Control":
+            "no-store",
+
+          // Sin estas dos cabeceras CORS, el navegador rechaza la
+          // respuesta antes de que el código de la página llegue a verla
+          // (fetch() rechaza la promesa con un error de CORS genérico en
+          // vez de dejar leer el status 502), así que el frontend nunca
+          // se entera de que ambas APIs han caído -- ve un error de red
+          // indistinguible de cualquier otro fallo de conexión.
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Expose-Headers":
+            "X-Failover-Backend,X-Failover-Test,X-Failover-Reason",
+
+          [FAILOVER_HEADER]:
+            "NONE",
+
+          [FAILOVER_TEST_HEADER]:
+            reason === "FAILOVER_TEST"
+              ? "true"
+              : "false",
+
+          [FAILOVER_REASON_HEADER]:
+            reason
+        }
+      }
+    );
+  }
+}
+
+
+/*
+ * ================================================================
+ * BACKEND PRINCIPAL
+ * ================================================================
+ *
+ * IMPORTANTE:
+ *
+ * AQUÍ VA EL RESTO DEL CÓDIGO ACTUAL DE TU WORKER.
+ *
+ * Es decir:
+ *
+ * - login
+ * - artículos
+ * - partidos
+ * - D1
+ * - Minuto a Minuto
+ * - usuarios
+ * - notificaciones
+ * - etc.
+ *
+ * NO pongas otro "export default".
+ *
+ * Todo tu código actual debe ejecutarse desde esta función.
+ * ================================================================
+ */
+
+async function handlePrimary(request, env, ctx) {
+
+  const url = new URL(request.url);
+  const path = url.pathname;
+  // Presente solo cuando esta petición es la reproducción, contra D1, de
+  // una escritura que se atendió antes en Postgres/Railway durante un
+  // failover (ver server-railway.js y drainPendingWrites más arriba). Se
+  // usa para etiquetar con el mismo id la fila que se cree aquí (si la
+  // petición es un INSERT de artículo/resultado), de modo que
+  // sync/incremental.mjs pueda reconciliarla con la ya creada en Postgres
+  // en vez de duplicarla. NULL en cualquier petición normal (sin
+  // failover), que es la inmensa mayoría.
+  const origenWriteId = request.headers.get("X-Write-Id") || null;
+  const method = request.method;
 
     try {
       // ================================================================
@@ -2053,6 +2705,9 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         await env.DB.prepare("UPDATE readers SET password_hash = ?, salt = ? WHERE id = ?")
           .bind(nuevaHash, nuevaSalt, lector.id).run();
 
+        // Igual que con redactores: cerrar la contraseña cierra el
+        // resto de sesiones abiertas en otros dispositivos/navegadores,
+        // manteniendo la sesión actual.
         await env.DB.prepare(
           "UPDATE reader_sessions SET revoked_at = datetime('now') WHERE reader_id = ? AND id != ? AND revoked_at IS NULL"
         ).bind(lector.id, payload.sid || "").run();
@@ -2715,6 +3370,26 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         });
       }
 
+      // ---------- NEWSLETTER: suscriptores (solo admins) ----------
+      if (path === "/api/newsletter/suscriptores" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver los suscriptores" }, 403);
+        const { results } = await env.DB.prepare(
+          "SELECT id, email, activo, created_at, baja_at FROM newsletter_suscriptores ORDER BY created_at DESC"
+        ).all();
+        return json({ suscriptores: results });
+      }
+
+      if (path.match(/^\/api\/newsletter\/suscriptores\/\d+$/) && method === "DELETE") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede eliminar suscriptores" }, 403);
+        const id = Number(path.split("/").pop());
+        await env.DB.prepare("DELETE FROM newsletter_suscriptores WHERE id = ?").bind(id).run();
+        return json({ ok: true });
+      }
+
       // ---------- LECTORES (cuentas públicas, solo lectura para admins) ----------
       // Solo lectura desde el panel: los lectores se gestionan a sí mismos
       // (registro, verificación, contraseña) desde la web pública. Nunca se
@@ -2981,6 +3656,31 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
 
         if (!file || typeof file === "string") return json({ error: "Falta el archivo" }, 400);
         if (!titulo) return json({ error: "Falta el título" }, 400);
+        if (titulo.length > 200) return json({ error: "El título es demasiado largo (máximo 200 caracteres)" }, 400);
+        if (descripcion.length > 2000) return json({ error: "La descripción es demasiado larga (máximo 2000 caracteres)" }, 400);
+        if (file.size === 0) return json({ error: "El archivo está vacío" }, 400);
+
+        // Antes de gastar tiempo y ancho de banda subiendo el archivo a
+        // Cloudinary, calculamos su hash y comprobamos si ya existe algo
+        // idéntico en la mediateca. Así el aviso de "ya se ha subido
+        // este archivo" llega rápido y sin subir nada dos veces.
+        let hashArchivo;
+        try {
+          const bytesParaHash = await file.arrayBuffer();
+          hashArchivo = await sha256Hex(bytesParaHash);
+        } catch (err) {
+          return json({ error: "No se pudo leer el archivo" }, 400);
+        }
+        const duplicado = await env.DB.prepare(
+          "SELECT id, titulo, autor_nombre FROM media WHERE hash_archivo = ?"
+        ).bind(hashArchivo).first();
+        if (duplicado) {
+          return json({
+            error: `Este archivo ya se subió antes con el título "${duplicado.titulo}"${duplicado.autor_nombre ? ` (por ${duplicado.autor_nombre})` : ""}. No se puede subir el mismo contenido dos veces.`,
+            duplicado: true,
+            mediaId: duplicado.id,
+          }, 409);
+        }
 
         // Se sube el archivo completo, byte a byte, sin ninguna
         // recodificación ni compresión: se guarda en Cloudinary
@@ -2992,18 +3692,31 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
           subida = await procesarSubidaArchivo(env, file, { permitirVideo: true });
         } catch (err) {
           if (err.esValidacion) return json({ error: err.message }, 400);
-          return json({ error: "No se pudo subir el archivo a Cloudinary", detail: err.message }, 502);
+          return json({ error: "No se pudo subir el archivo a Cloudinary. Comprueba tu conexión e inténtalo de nuevo.", detail: err.message }, 502);
         }
         const esFoto = esImagenPermitida(file.type);
 
-        await env.DB.prepare(
-          `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(
-          subida.publicId, subida.resourceType, subida.url,
-          titulo, descripcion || null, esFoto ? "foto" : "video",
-          file.name, file.type, file.size, payload.uid, payload.nombre, club || null
-        ).run();
+        try {
+          await env.DB.prepare(
+            `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(
+            subida.publicId, subida.resourceType, subida.url,
+            titulo, descripcion || null, esFoto ? "foto" : "video",
+            file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo
+          ).run();
+        } catch (err) {
+          // Red de seguridad final por si dos subidas del mismo archivo
+          // llegan casi a la vez (condición de carrera): el índice único
+          // de la base de datos rechaza la segunda, y aquí deshacemos lo
+          // ya subido a Cloudinary para no dejar un archivo huérfano.
+          const esDuplicadoBD = /unique/i.test(err.message || "");
+          ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType));
+          if (esDuplicadoBD) {
+            return json({ error: "Este archivo ya se ha subido (se ha detectado justo ahora, puede que alguien lo subiera al mismo tiempo).", duplicado: true }, 409);
+          }
+          return json({ error: "No se pudo guardar el archivo. Inténtalo de nuevo.", detail: err.message }, 500);
+        }
 
         ctx.waitUntil(enviarEmailNotificacion(env, {
           asunto: `Nuevo ${esFoto ? "foto" : "vídeo"} subido: ${titulo}`,
@@ -3221,8 +3934,10 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
           ? (body.estado_borrador === "terminado" ? "terminado" : "en_proceso")
           : null;
 
-        // Un borrador "en proceso" no tiene por qué cumplir los límites de
-        // longitud todavía: solo aplican a lo publicado o marcado "terminado".
+        // Un borrador guardado como "en proceso" (todavía se está
+        // escribiendo) no tiene por qué cumplir los límites de longitud:
+        // esos límites solo aplican a lo que se publica o se marca como
+        // borrador "terminado".
         const longitudContenido = longitudTextoPlano(body.contenido);
         if (estadoBorrador !== "en_proceso") {
           if (longitudContenido < CONTENIDO_MIN) {
@@ -3524,10 +4239,6 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
           }
         }
 
-        const imagenes = normalizarImagenes(body.imagenes);
-        const imagenPortada = body.imagen_url || (imagenes[0] && imagenes[0].url) || null;
-        const resultadoId = body.resultado_id ? parseInt(body.resultado_id, 10) : null;
-
         // Igual que al crear: si se guarda como borrador, se registra si
         // el redactor lo ha marcado como "terminado" o "en_proceso" en la
         // notificación del panel, para decidir más abajo si se avisa por
@@ -3537,7 +4248,7 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
           : null;
 
         // Un borrador "en proceso" no tiene por qué cumplir los límites de
-        // longitud todavía (mismo criterio que al crear la noticia).
+        // longitud todavía (ver mismo criterio al crear la noticia).
         if (body.contenido !== undefined && estadoBorrador !== "en_proceso") {
           const longitudContenido = longitudTextoPlano(body.contenido);
           if (longitudContenido < CONTENIDO_MIN) {
@@ -3547,6 +4258,10 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
             return json({ error: `El contenido no puede superar los ${CONTENIDO_MAX} caracteres (tiene ${longitudContenido}).` }, 400);
           }
         }
+
+        const imagenes = normalizarImagenes(body.imagenes);
+        const imagenPortada = body.imagen_url || (imagenes[0] && imagenes[0].url) || null;
+        const resultadoId = body.resultado_id ? parseInt(body.resultado_id, 10) : null;
 
         // Si se ha elegido un autor en el formulario, se actualiza; si no
         // se manda nada, se deja el autor que ya tenía la noticia. Se
@@ -3926,13 +4641,22 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
       }
 
       // ---------- Comentarios de lectores ----------
+      // Número de denuncias distintas que hacen que un comentario se
+      // oculte automáticamente de la web en espera de revisión manual.
+      const DENUNCIAS_PARA_OCULTAR = 3;
+
       // Público: solo texto/nombre/email del propio comentario, sin
-      // exponer nunca el email de otros comentarios ya aprobados.
+      // exponer nunca el email de otros comentarios ya aprobados. Los
+      // comentarios aprobados pero auto-ocultados por denuncias no se
+      // devuelven hasta que un admin los revise.
       const comentariosArticuloMatch = path.match(/^\/api\/articles\/(\d+)\/comments$/);
       if (comentariosArticuloMatch && method === "GET") {
         const articleId = parseInt(comentariosArticuloMatch[1]);
         const { results: comentarios } = await env.DB.prepare(
-          "SELECT id, nombre, texto, created_at, reader_id FROM comments WHERE article_id = ? AND estado = 'aprobado' ORDER BY created_at ASC"
+          `SELECT id, nombre, texto, created_at, likes, dislikes, reader_id
+           FROM comments
+           WHERE article_id = ? AND estado = 'aprobado' AND oculto_por_denuncia = 0
+           ORDER BY created_at ASC`
         ).bind(articleId).all();
         return json({ comentarios });
       }
@@ -3944,6 +4668,10 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
 
         const body = await request.json();
 
+        // Si quien comenta tiene sesión de lector (cuenta verificada),
+        // se ignoran el nombre/email que mande el body y se usan los de
+        // su cuenta: así nadie puede firmar un comentario con un nombre
+        // distinto al de su cuenta ya verificada.
         const payloadLector = await requireReaderAuth(request, env);
         let readerId = null;
         let nombre, email;
@@ -3976,6 +4704,448 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         return json({ ok: true, mensaje: "Comentario enviado. Se publicará en cuanto lo revise la redacción." });
       }
 
+      // ---------- Encuestas ----------
+      // Solo puede votar un lector con cuenta, logueado (sesión válida,
+      // vía requireReaderAuth, igual que para comentar) y con el email
+      // verificado: mismo requisito que ya existe para comentar. Una
+      // encuesta puede vivir en una noticia (article_id), en portada
+      // (en_portada), en ambos sitios, o solo en portada sin noticia.
+
+      // Cierra automáticamente las encuestas cuya fecha límite ya pasó.
+      // Se llama antes de leer resultados/listas para no depender de un
+      // cron aparte; es barato (solo toca las que tocan) y evita que se
+      // seleccione en el filtro "abierta" pero de verdad se pueda votar.
+      async function cerrarEncuestasCaducadas(env) {
+        await env.DB.prepare(
+          `UPDATE polls SET estado = 'cerrada', updated_at = datetime('now')
+           WHERE estado = 'abierta' AND cierra_en IS NOT NULL AND cierra_en <= datetime('now')`
+        ).run();
+      }
+
+      // Arma el objeto de encuesta con recuento de votos por opción y,
+      // si se pasa readerId, qué opción votó ese lector (o null si no ha
+      // votado). Los recuentos siempre se devuelven (no hay razón para
+      // ocultar resultados agregados), lo único restringido es el voto.
+      async function obtenerEncuestaConResultados(env, poll, readerId) {
+        const { results: opciones } = await env.DB.prepare(
+          `SELECT po.id, po.texto, po.orden, COUNT(pv.id) AS votos
+           FROM poll_options po
+           LEFT JOIN poll_votes pv ON pv.option_id = po.id
+           WHERE po.poll_id = ?
+           GROUP BY po.id
+           ORDER BY po.orden ASC, po.id ASC`
+        ).bind(poll.id).all();
+
+        const totalVotos = opciones.reduce((acc, o) => acc + o.votos, 0);
+
+        let miVoto = null;
+        if (readerId) {
+          const voto = await env.DB.prepare(
+            "SELECT option_id FROM poll_votes WHERE poll_id = ? AND reader_id = ?"
+          ).bind(poll.id, readerId).first();
+          if (voto) miVoto = voto.option_id;
+        }
+
+        return {
+          id: poll.id,
+          pregunta: poll.pregunta,
+          article_id: poll.article_id,
+          en_portada: !!poll.en_portada,
+          estado: poll.estado,
+          cierra_en: poll.cierra_en,
+          total_votos: totalVotos,
+          mi_voto: miVoto,
+          opciones: opciones.map((o) => ({ id: o.id, texto: o.texto, votos: o.votos })),
+        };
+      }
+
+      // Comprueba que quien llama es un lector con cuenta activa, sesión
+      // válida y correo verificado. Devuelve el id del lector, o null +
+      // motivo si no cumple algún requisito (para poder distinguir en el
+      // frontend "no has iniciado sesión" de "verifica tu correo").
+      async function requireReaderVerificado(request, env) {
+        const payloadLector = await requireReaderAuth(request, env);
+        if (!payloadLector) return { readerId: null, motivo: "no_logueado" };
+        const lector = await env.DB.prepare(
+          "SELECT id, email_verificado FROM readers WHERE id = ? AND activo = 1"
+        ).bind(payloadLector.rid).first();
+        if (!lector) return { readerId: null, motivo: "no_logueado" };
+        if (!lector.email_verificado) return { readerId: null, motivo: "no_verificado" };
+        return { readerId: lector.id, motivo: null };
+      }
+
+      // Público: encuesta(s) destacada(s) en portada, ya abiertas o
+      // cerradas (para poder seguir mostrando resultados finales un
+      // tiempo tras cerrarse). Puede haber varias a la vez, ordenadas
+      // por orden_portada.
+      if (path === "/api/polls/portada" && method === "GET") {
+        await cerrarEncuestasCaducadas(env);
+        const { results: encuestas } = await env.DB.prepare(
+          `SELECT * FROM polls WHERE en_portada = 1 ORDER BY orden_portada ASC, id DESC`
+        ).all();
+
+        const { readerId } = await requireReaderVerificado(request, env);
+        const conResultados = await Promise.all(
+          encuestas.map((p) => obtenerEncuestaConResultados(env, p, readerId))
+        );
+        return json({ encuestas: conResultados });
+      }
+
+      // Público: la encuesta ligada a una noticia concreta (si tiene).
+      const encuestaArticuloMatch = path.match(/^\/api\/articles\/(\d+)\/poll$/);
+      if (encuestaArticuloMatch && method === "GET") {
+        await cerrarEncuestasCaducadas(env);
+        const articleId = parseInt(encuestaArticuloMatch[1]);
+        const poll = await env.DB.prepare(
+          "SELECT * FROM polls WHERE article_id = ? ORDER BY id DESC LIMIT 1"
+        ).bind(articleId).first();
+        if (!poll) return json({ encuesta: null });
+
+        const { readerId } = await requireReaderVerificado(request, env);
+        const conResultados = await obtenerEncuestaConResultados(env, poll, readerId);
+        return json({ encuesta: conResultados });
+      }
+
+      // Público: votar. Exige lector con cuenta activa, sesión válida y
+      // correo verificado; si no cumple alguno de los tres, error 403
+      // con un "motivo" que el frontend usa para mostrar el aviso
+      // correcto (iniciar sesión / verificar correo) en vez de las
+      // opciones de voto.
+      const votoEncuestaMatch = path.match(/^\/api\/polls\/(\d+)\/vote$/);
+      if (votoEncuestaMatch && method === "POST") {
+        const pollId = parseInt(votoEncuestaMatch[1]);
+        const { readerId, motivo } = await requireReaderVerificado(request, env);
+        if (!readerId) return json({ error: "No autorizado para votar", motivo }, 403);
+
+        const poll = await env.DB.prepare("SELECT * FROM polls WHERE id = ?").bind(pollId).first();
+        if (!poll) return json({ error: "Encuesta no encontrada" }, 404);
+        if (poll.estado !== "abierta" || (poll.cierra_en && poll.cierra_en <= new Date().toISOString().slice(0, 19).replace("T", " "))) {
+          if (poll.estado === "abierta") {
+            await env.DB.prepare("UPDATE polls SET estado = 'cerrada', updated_at = datetime('now') WHERE id = ?").bind(poll.id).run();
+          }
+          return json({ error: "Esta encuesta ya está cerrada" }, 409);
+        }
+
+        const body = await request.json();
+        const optionId = parseInt(body.option_id);
+        if (!optionId) return json({ error: "Falta la opción elegida" }, 400);
+        const opcion = await env.DB.prepare(
+          "SELECT id FROM poll_options WHERE id = ? AND poll_id = ?"
+        ).bind(optionId, pollId).first();
+        if (!opcion) return json({ error: "Opción no válida para esta encuesta" }, 400);
+
+        // Un solo voto por lector y encuesta: si ya había votado, esto
+        // cambia su voto a la nueva opción en vez de sumar uno nuevo.
+        await env.DB.prepare(
+          `INSERT INTO poll_votes (poll_id, option_id, reader_id) VALUES (?, ?, ?)
+           ON CONFLICT(poll_id, reader_id) DO UPDATE SET option_id = excluded.option_id, created_at = datetime('now')`
+        ).bind(pollId, optionId, readerId).run();
+
+        const conResultados = await obtenerEncuestaConResultados(env, poll, readerId);
+        return json({ ok: true, encuesta: conResultados });
+      }
+
+      // ---------- Encuestas: gestión desde el panel (redactores/admin) ----------
+      // Listado para el panel: todas las encuestas, con su recuento de
+      // votos y, si está ligada, el título de la noticia para mostrarlo
+      // en la tabla sin tener que hacer una petición aparte.
+      if (path === "/api/admin/polls" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        await cerrarEncuestasCaducadas(env);
+
+        const { results: encuestas } = await env.DB.prepare(
+          `SELECT p.*, a.titulo AS articulo_titulo, a.slug AS articulo_slug
+           FROM polls p
+           LEFT JOIN articles a ON a.id = p.article_id
+           ORDER BY p.created_at DESC`
+        ).all();
+
+        const conResultados = await Promise.all(
+          encuestas.map(async (p) => ({
+            ...(await obtenerEncuestaConResultados(env, p, null)),
+            articulo_titulo: p.articulo_titulo || null,
+            articulo_slug: p.articulo_slug || null,
+            orden_portada: p.orden_portada,
+          }))
+        );
+        return json({ encuestas: conResultados });
+      }
+
+      // Crear encuesta. article_id y en_portada son independientes: se
+      // puede marcar cualquier combinación (incluida ninguna, aunque en
+      // ese caso la encuesta no se mostraría en ningún sitio del
+      // frontend hasta que se ligue a algo).
+      if (path === "/api/admin/polls" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+
+        const body = await request.json();
+        const pregunta = normalizarTexto(body.pregunta);
+        if (!pregunta) return json({ error: "Falta la pregunta de la encuesta" }, 400);
+        if (pregunta.length > 200) return json({ error: `La pregunta es demasiado larga (máximo 200 caracteres, tiene ${pregunta.length})` }, 400);
+
+        const opciones = Array.isArray(body.opciones)
+          ? body.opciones.map((o) => normalizarTexto(o)).filter(Boolean)
+          : [];
+        if (opciones.length < 2) return json({ error: "La encuesta necesita al menos 2 opciones" }, 400);
+        if (opciones.length > 10) return json({ error: "Máximo 10 opciones por encuesta" }, 400);
+        const opcionLarga = opciones.find((o) => o.length > 100);
+        if (opcionLarga) return json({ error: `Una opción es demasiado larga (máximo 100 caracteres): "${opcionLarga.slice(0, 40)}..."` }, 400);
+        const opcionesUnicas = new Set(opciones.map((o) => o.toLowerCase()));
+        if (opcionesUnicas.size !== opciones.length) return json({ error: "Hay opciones repetidas: cada opción debe ser distinta" }, 400);
+
+        let articleId = null;
+        if (body.article_id) {
+          const articulo = await env.DB.prepare("SELECT id FROM articles WHERE id = ?").bind(parseInt(body.article_id)).first();
+          if (!articulo) return json({ error: "La noticia indicada no existe" }, 400);
+          articleId = articulo.id;
+        }
+
+        const enPortada = body.en_portada ? 1 : 0;
+        const ordenPortada = Number.isFinite(body.orden_portada) ? body.orden_portada : 0;
+        const cierraEn = normalizarTexto(body.cierra_en) || null;
+        if (cierraEn) {
+          const fechaCierre = new Date(cierraEn.replace(" ", "T"));
+          if (isNaN(fechaCierre.getTime())) return json({ error: "La fecha de cierre no es válida" }, 400);
+          if (fechaCierre.getTime() <= Date.now()) return json({ error: "La fecha de cierre debe ser futura" }, 400);
+        }
+
+        const { meta } = await env.DB.prepare(
+          `INSERT INTO polls (pregunta, article_id, en_portada, orden_portada, cierra_en, autor_id)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).bind(pregunta, articleId, enPortada, ordenPortada, cierraEn, payload.uid).run();
+
+        const pollId = meta.last_row_id;
+        for (let i = 0; i < opciones.length; i++) {
+          await env.DB.prepare(
+            "INSERT INTO poll_options (poll_id, texto, orden) VALUES (?, ?, ?)"
+          ).bind(pollId, opciones[i], i).run();
+        }
+
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "crear_encuesta", entidad: "encuesta", entidad_id: pollId,
+          descripcion: `Ha creado la encuesta "${pregunta}"`,
+        }));
+
+        const poll = await env.DB.prepare("SELECT * FROM polls WHERE id = ?").bind(pollId).first();
+        return json({ ok: true, encuesta: await obtenerEncuestaConResultados(env, poll, null) });
+      }
+
+      // Editar encuesta existente: pregunta, a qué noticia está ligada,
+      // si sale en portada y en qué orden, y fecha de cierre. Las
+      // opciones solo se pueden editar (texto, añadir, quitar) mientras
+      // la encuesta no tenga ningún voto todavía: en cuanto hay un voto,
+      // tocar las opciones desbarataría los resultados (o directamente
+      // los borraría, por el ON DELETE CASCADE de poll_votes.option_id),
+      // así que a partir de ahí "opciones" en el body se ignora.
+      const editarEncuestaMatch = path.match(/^\/api\/admin\/polls\/(\d+)$/);
+      if (editarEncuestaMatch && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const pollId = parseInt(editarEncuestaMatch[1]);
+        const poll = await env.DB.prepare("SELECT * FROM polls WHERE id = ?").bind(pollId).first();
+        if (!poll) return json({ error: "Encuesta no encontrada" }, 404);
+        if (!(await puedeEditarEntidad(env, payload, "encuesta", poll.autor_id))) {
+          return json({ error: "No tienes permiso para editar esta encuesta" }, 403);
+        }
+
+        const body = await request.json();
+        const pregunta = normalizarTexto(body.pregunta) || poll.pregunta;
+        if (pregunta.length > 200) return json({ error: `La pregunta es demasiado larga (máximo 200 caracteres, tiene ${pregunta.length})` }, 400);
+
+        let articleId = poll.article_id;
+        if (body.article_id !== undefined) {
+          if (body.article_id === null || body.article_id === "") {
+            articleId = null;
+          } else {
+            const articulo = await env.DB.prepare("SELECT id FROM articles WHERE id = ?").bind(parseInt(body.article_id)).first();
+            if (!articulo) return json({ error: "La noticia indicada no existe" }, 400);
+            articleId = articulo.id;
+          }
+        }
+
+        const enPortada = body.en_portada !== undefined ? (body.en_portada ? 1 : 0) : poll.en_portada;
+        const ordenPortada = Number.isFinite(body.orden_portada) ? body.orden_portada : poll.orden_portada;
+        const cierraEn = body.cierra_en !== undefined ? (normalizarTexto(body.cierra_en) || null) : poll.cierra_en;
+        if (cierraEn) {
+          const fechaCierre = new Date(cierraEn.replace(" ", "T"));
+          if (isNaN(fechaCierre.getTime())) return json({ error: "La fecha de cierre no es válida" }, 400);
+        }
+        const estado = body.estado === "abierta" || body.estado === "cerrada" ? body.estado : poll.estado;
+
+        // ¿Tiene votos ya? Si los tiene, "opciones" se ignora aunque
+        // venga en el body (protege los resultados existentes).
+        const { total_votos: totalVotosActuales } = await env.DB.prepare(
+          "SELECT COUNT(*) AS total_votos FROM poll_votes WHERE poll_id = ?"
+        ).bind(pollId).first();
+
+        if (Array.isArray(body.opciones) && totalVotosActuales === 0) {
+          const opciones = body.opciones.map((o) => normalizarTexto(o)).filter(Boolean);
+          if (opciones.length < 2) return json({ error: "La encuesta necesita al menos 2 opciones" }, 400);
+          if (opciones.length > 10) return json({ error: "Máximo 10 opciones por encuesta" }, 400);
+          const opcionLarga = opciones.find((o) => o.length > 100);
+          if (opcionLarga) return json({ error: `Una opción es demasiado larga (máximo 100 caracteres): "${opcionLarga.slice(0, 40)}..."` }, 400);
+          const opcionesUnicas = new Set(opciones.map((o) => o.toLowerCase()));
+          if (opcionesUnicas.size !== opciones.length) return json({ error: "Hay opciones repetidas: cada opción debe ser distinta" }, 400);
+
+          await env.DB.prepare("DELETE FROM poll_options WHERE poll_id = ?").bind(pollId).run();
+          for (let i = 0; i < opciones.length; i++) {
+            await env.DB.prepare(
+              "INSERT INTO poll_options (poll_id, texto, orden) VALUES (?, ?, ?)"
+            ).bind(pollId, opciones[i], i).run();
+          }
+        }
+
+        await env.DB.prepare(
+          `UPDATE polls SET pregunta = ?, article_id = ?, en_portada = ?, orden_portada = ?,
+                            cierra_en = ?, estado = ?, updated_at = datetime('now')
+           WHERE id = ?`
+        ).bind(pregunta, articleId, enPortada, ordenPortada, cierraEn, estado, pollId).run();
+
+        const actualizada = await env.DB.prepare("SELECT * FROM polls WHERE id = ?").bind(pollId).first();
+        return json({ ok: true, encuesta: await obtenerEncuestaConResultados(env, actualizada, null) });
+      }
+
+      // Cerrar/reabrir encuesta manualmente (atajo sin tener que mandar
+      // el resto de campos, para el botón de "Cerrar" del panel).
+      const cerrarEncuestaMatch = path.match(/^\/api\/admin\/polls\/(\d+)\/cerrar$/);
+      if (cerrarEncuestaMatch && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const pollId = parseInt(cerrarEncuestaMatch[1]);
+        const poll = await env.DB.prepare("SELECT * FROM polls WHERE id = ?").bind(pollId).first();
+        if (!poll) return json({ error: "Encuesta no encontrada" }, 404);
+        if (!(await puedeEditarEntidad(env, payload, "encuesta", poll.autor_id))) {
+          return json({ error: "No tienes permiso para cerrar esta encuesta" }, 403);
+        }
+        await env.DB.prepare(
+          "UPDATE polls SET estado = 'cerrada', updated_at = datetime('now') WHERE id = ?"
+        ).bind(pollId).run();
+        return json({ ok: true });
+      }
+
+      const reabrirEncuestaMatch = path.match(/^\/api\/admin\/polls\/(\d+)\/reabrir$/);
+      if (reabrirEncuestaMatch && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const pollId = parseInt(reabrirEncuestaMatch[1]);
+        const poll = await env.DB.prepare("SELECT * FROM polls WHERE id = ?").bind(pollId).first();
+        if (!poll) return json({ error: "Encuesta no encontrada" }, 404);
+        if (!(await puedeEditarEntidad(env, payload, "encuesta", poll.autor_id))) {
+          return json({ error: "No tienes permiso para reabrir esta encuesta" }, 403);
+        }
+        await env.DB.prepare(
+          "UPDATE polls SET estado = 'abierta', updated_at = datetime('now') WHERE id = ?"
+        ).bind(pollId).run();
+        return json({ ok: true });
+      }
+
+      // Borrar encuesta (arrastra opciones y votos por ON DELETE CASCADE).
+      if (editarEncuestaMatch && method === "DELETE") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const pollId = parseInt(editarEncuestaMatch[1]);
+        const poll = await env.DB.prepare("SELECT * FROM polls WHERE id = ?").bind(pollId).first();
+        if (!poll) return json({ error: "Encuesta no encontrada" }, 404);
+        if (!(await puedeEditarEntidad(env, payload, "encuesta", poll.autor_id))) {
+          return json({ error: "No tienes permiso para borrar esta encuesta" }, 403);
+        }
+        await env.DB.prepare("DELETE FROM polls WHERE id = ?").bind(pollId).run();
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "borrar_encuesta", entidad: "encuesta", entidad_id: pollId,
+          descripcion: `Ha borrado la encuesta "${poll.pregunta}"`,
+        }));
+        return json({ ok: true });
+      }
+
+      // Votos (like/dislike) de un comentario ya publicado. `votanteId` es
+      // un identificador anónimo generado por el navegador (localStorage),
+      // no una cuenta: solo sirve para no permitir votar dos veces el
+      // mismo comentario desde el mismo navegador, y para poder cambiar o
+      // quitar el voto. Enviar `valor: 0` quita el voto ya emitido.
+      const votoComentarioMatch = path.match(/^\/api\/comments\/(\d+)\/vote$/);
+      if (votoComentarioMatch && method === "POST") {
+        const id = parseInt(votoComentarioMatch[1]);
+        const comentario = await env.DB.prepare(
+          "SELECT id FROM comments WHERE id = ? AND estado = 'aprobado' AND oculto_por_denuncia = 0"
+        ).bind(id).first();
+        if (!comentario) return json({ error: "Comentario no encontrado" }, 404);
+
+        const body = await request.json();
+        const votanteId = normalizarTexto(body.votanteId);
+        const valor = Number(body.valor);
+        if (!votanteId) return json({ error: "Falta identificador de votante" }, 400);
+        if (![1, -1, 0].includes(valor)) return json({ error: "Voto no válido" }, 400);
+
+        const existente = await env.DB.prepare(
+          "SELECT valor FROM comment_votes WHERE comment_id = ? AND votante_id = ?"
+        ).bind(id, votanteId).first();
+
+        if (valor === 0) {
+          if (existente) {
+            const columna = existente.valor === 1 ? "likes" : "dislikes";
+            await env.DB.prepare("DELETE FROM comment_votes WHERE comment_id = ? AND votante_id = ?").bind(id, votanteId).run();
+            await env.DB.prepare(`UPDATE comments SET ${columna} = MAX(0, ${columna} - 1) WHERE id = ?`).bind(id).run();
+          }
+        } else if (!existente) {
+          await env.DB.prepare(
+            "INSERT INTO comment_votes (comment_id, votante_id, valor) VALUES (?, ?, ?)"
+          ).bind(id, votanteId, valor).run();
+          const columna = valor === 1 ? "likes" : "dislikes";
+          await env.DB.prepare(`UPDATE comments SET ${columna} = ${columna} + 1 WHERE id = ?`).bind(id).run();
+        } else if (existente.valor !== valor) {
+          await env.DB.prepare(
+            "UPDATE comment_votes SET valor = ?, created_at = datetime('now') WHERE comment_id = ? AND votante_id = ?"
+          ).bind(valor, id, votanteId).run();
+          const columnaQuitar = existente.valor === 1 ? "likes" : "dislikes";
+          const columnaSumar = valor === 1 ? "likes" : "dislikes";
+          await env.DB.prepare(`UPDATE comments SET ${columnaQuitar} = MAX(0, ${columnaQuitar} - 1), ${columnaSumar} = ${columnaSumar} + 1 WHERE id = ?`).bind(id).run();
+        }
+        // valor === existente.valor: ya tenía ese voto, no hay nada que hacer.
+
+        const actualizado = await env.DB.prepare("SELECT likes, dislikes FROM comments WHERE id = ?").bind(id).first();
+        return json({ ok: true, likes: actualizado.likes, dislikes: actualizado.dislikes, votoActual: valor });
+      }
+
+      // Denuncia de un comentario. Se guarda para revisión manual del
+      // admin en el panel; si un comentario acumula varias denuncias de
+      // navegadores distintos se oculta automáticamente de la web (sin
+      // borrarlo ni tocar su moderación) hasta que un admin lo revise.
+      const denunciaComentarioMatch = path.match(/^\/api\/comments\/(\d+)\/report$/);
+      if (denunciaComentarioMatch && method === "POST") {
+        const id = parseInt(denunciaComentarioMatch[1]);
+        const comentario = await env.DB.prepare(
+          "SELECT id FROM comments WHERE id = ? AND estado = 'aprobado'"
+        ).bind(id).first();
+        if (!comentario) return json({ error: "Comentario no encontrado" }, 404);
+
+        const body = await request.json();
+        const denuncianteId = normalizarTexto(body.votanteId || body.denuncianteId);
+        const motivo = normalizarTexto(body.motivo) || null;
+        if (!denuncianteId) return json({ error: "Falta identificador de denunciante" }, 400);
+
+        const yaDenunciado = await env.DB.prepare(
+          "SELECT id FROM comment_reports WHERE comment_id = ? AND denunciante_id = ?"
+        ).bind(id, denuncianteId).first();
+        if (yaDenunciado) return json({ ok: true, mensaje: "Ya habías denunciado este comentario." });
+
+        const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || null;
+        await env.DB.prepare(
+          "INSERT INTO comment_reports (comment_id, denunciante_id, motivo, ip) VALUES (?, ?, ?, ?)"
+        ).bind(id, denuncianteId, motivo, ip).run();
+
+        const resultado = await env.DB.prepare(
+          "UPDATE comments SET denuncias = denuncias + 1 WHERE id = ? RETURNING denuncias"
+        ).bind(id).first();
+
+        if (resultado && resultado.denuncias >= DENUNCIAS_PARA_OCULTAR) {
+          await env.DB.prepare("UPDATE comments SET oculto_por_denuncia = 1 WHERE id = ?").bind(id).run();
+        }
+
+        return json({ ok: true, mensaje: "Comentario denunciado. La redacción lo revisará." });
+      }
+
       // Admin: listar (por estado), aprobar/rechazar y borrar.
       if (path === "/api/admin/comments" && method === "GET") {
         const payload = await requireAuth(request, env);
@@ -3989,6 +5159,45 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
            WHERE c.estado = ? ORDER BY c.created_at DESC`
         ).bind(estado).all();
         return json({ comentarios });
+      }
+
+      // Admin: comentarios denunciados por lectores, en espera de
+      // revisión manual (independiente de su `estado` de moderación:
+      // normalmente estarán aprobados). Ordenados por más denunciados
+      // primero para priorizar los casos más claros.
+      if (path === "/api/admin/comments/reported" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede moderar comentarios" }, 403);
+
+        const { results: comentarios } = await env.DB.prepare(
+          `SELECT c.*, a.titulo AS articulo_titulo, a.slug AS articulo_slug
+           FROM comments c JOIN articles a ON a.id = c.article_id
+           WHERE c.denuncias > 0 ORDER BY c.oculto_por_denuncia DESC, c.denuncias DESC, c.created_at DESC`
+        ).all();
+        return json({ comentarios });
+      }
+
+      // Admin: quitar la ocultación automática de un comentario denunciado
+      // (queda de nuevo visible en la web, si sigue "aprobado") sin tocar
+      // el contador de denuncias, que se conserva como registro.
+      const desocultarComentarioMatch = path.match(/^\/api\/admin\/comments\/(\d+)\/unhide$/);
+      if (desocultarComentarioMatch && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede moderar comentarios" }, 403);
+
+        const id = parseInt(desocultarComentarioMatch[1]);
+        const resultado = await env.DB.prepare(
+          "UPDATE comments SET oculto_por_denuncia = 0 WHERE id = ?"
+        ).bind(id).run();
+        if (!resultado.meta.changes) return json({ error: "Comentario no encontrado" }, 404);
+
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "revisar_denuncia_comentario", entidad: "comentario", entidad_id: id,
+          descripcion: "Ha vuelto a mostrar un comentario que estaba oculto por denuncias",
+        }));
+        return json({ ok: true });
       }
 
       const comentarioMatch = path.match(/^\/api\/admin\/comments\/(\d+)$/);
@@ -4225,6 +5434,25 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         }
         query += ` ORDER BY jornada DESC, fecha_partido DESC LIMIT ${limit}`;
         const { results } = await env.DB.prepare(query).bind(...binds).all();
+        // Se añade el instante del último evento (gol, tarjeta, cambio...)
+        // registrado en el minuto a minuto de cada partido, para que el
+        // panel de admin pueda distinguir un partido realmente desatendido
+        // de uno que sigue corriendo por encima de los umbrales normales
+        // pero en el que el redactor SÍ está metiendo eventos (ver
+        // avisoPartidoDesatendido en admin.js, que ya no marca "Sin
+        // cubrir" si hay actividad reciente). Solo tiene sentido pedirlo
+        // para partidos en juego, que son los únicos que ese aviso evalúa.
+        const idsEnJuego = results.filter(r => r.estado === "en_juego").map(r => r.id);
+        if (idsEnJuego.length) {
+          const placeholders = idsEnJuego.map(() => "?").join(",");
+          const { results: ultimosEventos } = await env.DB.prepare(
+            `SELECT resultado_id, MAX(created_at) AS ultimo_evento_at FROM match_events
+             WHERE resultado_id IN (${placeholders}) GROUP BY resultado_id`
+          ).bind(...idsEnJuego).all();
+          const mapaUltimoEvento = {};
+          ultimosEventos.forEach(e => { mapaUltimoEvento[e.resultado_id] = e.ultimo_evento_at; });
+          results.forEach(r => { r.ultimo_evento_at = mapaUltimoEvento[r.id] || null; });
+        }
         return json({ results });
       }
 
@@ -4880,15 +6108,4 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
     } catch (err) {
       return json({ error: "Error del servidor", detail: err.message }, 500);
     }
-  },
-
-  // Disparador programado (cron trigger, ver "crons" en wrangler.toml):
-  // revisa cada minuto si hay alguna noticia programada cuya hora ya ha
-  // llegado y, si es así, la publica sola sin que nadie tenga que entrar
-  // al panel a esa hora.
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(publicarArticulosProgramados(env));
-    ctx.waitUntil(iniciarPartidosProgramadosCuyaHoraHaLlegado(env));
-    ctx.waitUntil(revisarPartidosDesatendidos(env, ctx));
-  },
-};
+}

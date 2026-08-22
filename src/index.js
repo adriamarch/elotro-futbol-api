@@ -401,7 +401,7 @@ function emailValido(email) {
 function plantillaNewsletter({ articulos, bajaUrl }) {
   const tarjetas = articulos
     .map((a) => {
-      const url = `${SITIO_URL}/noticia.html?slug=${encodeURIComponent(a.slug)}`;
+      const url = urlNoticia(a.categoria, a.slug);
       const foto = a.imagen_url
         ? `<img src="${escapeHtmlEmail(a.imagen_url)}" alt="" width="504" style="display:block;width:100%;max-width:504px;border-radius:8px 8px 0 0;">`
         : "";
@@ -480,6 +480,25 @@ function categoriaLabelEmail(cat) {
     arbitraje: "Arbitraje",
   };
   return CATEGORIAS[cat] || cat || "";
+}
+
+// Convierte el valor interno de "categoria" (algunos con guion bajo, como
+// "primera_federacion") en el segmento de URL bonita (con guion normal,
+// "primera-federacion"), para que /futbol/[categoria]/slug quede siempre
+// con guiones y no mezcle formatos. Si llega una categoría vacía o
+// desconocida, cae a "general" para no generar una URL con un segmento
+// vacío o con guion bajo suelto.
+function categoriaUrlSlug(cat) {
+  const normalizada = (cat || "").toString().trim().toLowerCase().replace(/_/g, "-");
+  return normalizada || "general";
+}
+
+// Construye la URL "bonita" (/futbol/categoria/slug) de una noticia a
+// partir de su categoría y slug. Único punto donde se arma este formato
+// en el worker, para que un cambio futuro de estructura de URLs no
+// obligue a tocar cada sitio donde se enlaza a una noticia.
+function urlNoticia(categoria, slug) {
+  return `${SITIO_URL}/futbol/${categoriaUrlSlug(categoria)}/${encodeURIComponent(slug)}`;
 }
 
 // Envía el boletín a todos los suscriptores activos vía Resend, en
@@ -1716,7 +1735,7 @@ async function publicarArticulosProgramados(env) {
 
     await enviarEmailNotificacion(env, {
       asunto: `Nueva ${tipoLabel.toLowerCase()} publicada (programada): ${articulo.titulo}`,
-      texto: `Se ha publicado automáticamente, tal y como estaba programada, "${articulo.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmada por ${firmaAutores}.\n\nVerla en la web: ${SITIO_URL}/noticia.html?slug=${articulo.slug}`,
+      texto: `Se ha publicado automáticamente, tal y como estaba programada, "${articulo.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmada por ${firmaAutores}.\n\nVerla en la web: ${urlNoticia(articulo.categoria, articulo.slug)}`,
       html: plantillaEmail({
         etiqueta: `Nueva ${tipoLabel.toLowerCase()} (programada)`,
         titulo: articulo.titulo,
@@ -1725,7 +1744,7 @@ async function publicarArticulosProgramados(env) {
           { etiqueta: "Autor", valor: firmaAutores },
           { etiqueta: "Categoría", valor: articulo.club || articulo.categoria },
         ],
-        boton: { texto: "Ver la noticia", url: `${SITIO_URL}/noticia.html?slug=${articulo.slug}` },
+        boton: { texto: "Ver la noticia", url: urlNoticia(articulo.categoria, articulo.slug) },
       }),
     });
 
@@ -1780,7 +1799,7 @@ export default {
     if (path === "/sitemap-noticias.xml" && method === "GET") {
       try {
         const { results } = await env.DB.prepare(
-          `SELECT slug, titulo, imagen_url, imagenes, fecha_publicacion, updated_at FROM articles
+          `SELECT slug, titulo, categoria, imagen_url, imagenes, fecha_publicacion, updated_at FROM articles
            WHERE publicado = 1
            ORDER BY fecha_publicacion DESC
            LIMIT 50000`
@@ -1813,7 +1832,7 @@ export default {
 
           return [
             "  <url>",
-            `    <loc>https://elotrofutbol.media/noticia.html?slug=${escaparXml(articulo.slug)}</loc>`,
+            `    <loc>${escaparXml(urlNoticia(articulo.categoria, articulo.slug))}</loc>`,
             lastmod ? `    <lastmod>${lastmod}</lastmod>` : null,
             "    <changefreq>weekly</changefreq>",
             "    <priority>0.6</priority>",
@@ -1883,7 +1902,7 @@ export default {
 
           return [
             "  <url>",
-            `    <loc>https://elotrofutbol.media/noticia.html?slug=${escaparXml(articulo.slug)}</loc>`,
+            `    <loc>${escaparXml(urlNoticia(articulo.categoria, articulo.slug))}</loc>`,
             "    <news:news>",
             "      <news:publication>",
             "        <news:name>ELOTROFÚTBOLTV</news:name>",
@@ -1943,7 +1962,7 @@ export default {
         ).all();
 
         const items = results.map((articulo) => {
-          const link = `https://elotrofutbol.media/noticia.html?slug=${escaparXml(articulo.slug)}`;
+          const link = urlNoticia(articulo.categoria, articulo.slug);
           const pubDate = fechaParaRss(articulo.fecha_publicacion);
           const descripcion = articulo.subtitulo?.trim() || extractoTexto(articulo.contenido);
           return [
@@ -3993,6 +4012,11 @@ async function handlePrimary(request, env, ctx) {
         const autorId = url.searchParams.get("autor_id");
         const destacado = url.searchParams.get("destacado");
         const busqueda = url.searchParams.get("q");
+        // Filtro por slug exacto: lo usa el _worker.js de Cloudflare Pages
+        // para resolver, dado el slug suelto de un enlace antiguo
+        // (noticia.html?slug=...), a qué categoría pertenece y así poder
+        // hacer el 301 a la URL bonita /futbol/{categoria}/{slug}.
+        const slugExacto = url.searchParams.get("slug");
         const limit = parseInt(url.searchParams.get("limit") || "30", 10);
         let admin = url.searchParams.get("admin") === "1";
         if (admin) {
@@ -4007,6 +4031,7 @@ async function handlePrimary(request, env, ctx) {
         if (!admin) {
           query += " AND publicado = 1";
         }
+        if (slugExacto) { query += " AND slug = ?"; binds.push(slugExacto); }
         if (categoria) { query += " AND categoria = ?"; binds.push(categoria); }
         if (club) { query += " AND club = ?"; binds.push(club); }
         if (tipo) { query += " AND tipo = ?"; binds.push(tipo); }
@@ -4159,7 +4184,7 @@ async function handlePrimary(request, env, ctx) {
         } else if (publicado) {
           ctx.waitUntil(enviarEmailNotificacion(env, {
             asunto: `Nueva ${tipoLabel.toLowerCase()} publicada: ${body.titulo}`,
-            texto: `${payload.nombre} ha publicado "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmada por ${firmaAutores}.\n\nVerla en la web: ${SITIO_URL}/noticia.html?slug=${slug}`,
+            texto: `${payload.nombre} ha publicado "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmada por ${firmaAutores}.\n\nVerla en la web: ${urlNoticia(body.categoria, slug)}`,
             html: plantillaEmail({
               etiqueta: `Nueva ${tipoLabel.toLowerCase()}`,
               titulo: body.titulo,
@@ -4169,7 +4194,7 @@ async function handlePrimary(request, env, ctx) {
                 { etiqueta: "Subida por", valor: payload.nombre },
                 { etiqueta: "Categoría", valor: body.club || body.categoria },
               ],
-              boton: { texto: "Ver la noticia", url: `${SITIO_URL}/noticia.html?slug=${slug}` },
+              boton: { texto: "Ver la noticia", url: urlNoticia(body.categoria, slug) },
             }),
           }));
         } else if (estadoBorrador === "terminado") {
@@ -5537,7 +5562,7 @@ async function handlePrimary(request, env, ctx) {
 
         const estado = url.searchParams.get("estado") || "pendiente";
         const { results: comentarios } = await env.DB.prepare(
-          `SELECT c.*, a.titulo AS articulo_titulo, a.slug AS articulo_slug
+          `SELECT c.*, a.titulo AS articulo_titulo, a.slug AS articulo_slug, a.categoria AS articulo_categoria
            FROM comments c JOIN articles a ON a.id = c.article_id
            WHERE c.estado = ? ORDER BY c.created_at DESC`
         ).bind(estado).all();
@@ -5554,7 +5579,7 @@ async function handlePrimary(request, env, ctx) {
         if (payload.rol !== "admin") return json({ error: "Solo un administrador puede moderar comentarios" }, 403);
 
         const { results: comentarios } = await env.DB.prepare(
-          `SELECT c.*, a.titulo AS articulo_titulo, a.slug AS articulo_slug
+          `SELECT c.*, a.titulo AS articulo_titulo, a.slug AS articulo_slug, a.categoria AS articulo_categoria
            FROM comments c JOIN articles a ON a.id = c.article_id
            WHERE c.denuncias > 0 ORDER BY c.oculto_por_denuncia DESC, c.denuncias DESC, c.created_at DESC`
         ).all();
@@ -5978,7 +6003,7 @@ async function handlePrimary(request, env, ctx) {
         // que todavía no ha salido) y, de haber varias, la más reciente
         // primero.
         const { results: noticiasVinculadas } = await env.DB.prepare(
-          `SELECT slug, titulo, tipo FROM articles
+          `SELECT slug, titulo, tipo, categoria FROM articles
            WHERE resultado_id = ? AND publicado = 1
            ORDER BY fecha_publicacion DESC LIMIT 5`
         ).bind(id).all();

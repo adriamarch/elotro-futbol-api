@@ -2,6 +2,9 @@
   "name": "elotrofutbol-api-secondary",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "start": "node src/server-railway.js",
     "cron:respaldo": "node scripts/cron-respaldo.mjs",

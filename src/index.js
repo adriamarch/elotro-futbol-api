@@ -3810,6 +3810,14 @@ async function handlePrimary(request, env, ctx) {
         }
         const esFoto = esImagenPermitida(file.type) || ((!file.type || file.type === "application/octet-stream") && extensionImagenPermitida(file.name));
 
+        // hash_archivo es una columna añadida por una migración manual
+        // que hay que ejecutar aparte: si no se ha aplicado en esta base
+        // de datos, la columna no existe y el INSERT de más abajo fallaba
+        // siempre (con el archivo YA subido a Cloudinary, lo peor
+        // posible). Se intenta primero con hash_archivo y, si falla
+        // específicamente porque la columna no existe (mensaje de
+        // SQLite o de PostgreSQL, según cuál esté detrás de env.DB aquí),
+        // se reintenta sin ella.
         try {
           await env.DB.prepare(
             `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo)
@@ -3820,6 +3828,22 @@ async function handlePrimary(request, env, ctx) {
             file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo
           ).run();
         } catch (err) {
+          const esColumnaFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /hash_archivo/i.test(err.message || "");
+          if (esColumnaFaltante) {
+            try {
+              await env.DB.prepare(
+                `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ).bind(
+                subida.publicId, subida.resourceType, subida.url,
+                titulo, descripcion || null, esFoto ? "foto" : "video",
+                file.name, file.type, file.size, payload.uid, payload.nombre, club || null
+              ).run();
+            } catch (err2) {
+              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType));
+              return json({ error: "No se pudo guardar el archivo. Inténtalo de nuevo.", detail: err2.message }, 500);
+            }
+          } else {
           // Red de seguridad final por si dos subidas del mismo archivo
           // llegan casi a la vez (condición de carrera): el índice único
           // de la base de datos rechaza la segunda, y aquí deshacemos lo
@@ -3830,6 +3854,7 @@ async function handlePrimary(request, env, ctx) {
             return json({ error: "Este archivo ya se ha subido (se ha detectado justo ahora, puede que alguien lo subiera al mismo tiempo).", duplicado: true }, 409);
           }
           return json({ error: "No se pudo guardar el archivo. Inténtalo de nuevo.", detail: err.message }, 500);
+          }
         }
 
         ctx.waitUntil(enviarEmailNotificacion(env, {

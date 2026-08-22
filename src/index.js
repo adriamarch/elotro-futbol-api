@@ -975,7 +975,9 @@ async function subirACloudinary(env, fileBytes, mimeType, nombreArchivo) {
     body: form,
   });
   if (!resp.ok) {
-    throw new Error("Error al subir a Cloudinary: " + (await resp.text()));
+    const cuerpoError = await resp.text();
+    console.error(`Cloudinary respondió ${resp.status} al subir "${nombreArchivo || "(sin nombre)"}" (${mimeType || "tipo desconocido"}): ${cuerpoError}`);
+    throw new Error(`Cloudinary (${resp.status}): ${cuerpoError}`);
   }
   const data = await resp.json();
   // HEIC/HEIF (formato por defecto de las fotos de iPhone) no lo renderiza
@@ -3773,9 +3775,19 @@ async function handlePrimary(request, env, ctx) {
         } catch (err) {
           return json({ error: "No se pudo leer el archivo" }, 400);
         }
-        const duplicado = await env.DB.prepare(
-          "SELECT id, titulo, autor_nombre FROM media WHERE hash_archivo = ?"
-        ).bind(hashArchivo).first();
+        // La comprobación de duplicados es un "extra": si por lo que sea
+        // falla (p. ej. la columna hash_archivo no existe todavía porque
+        // no se ha ejecutado migracion_media_hash.sql en esta base de
+        // datos), no debe tirar abajo la subida entera. Se registra el
+        // fallo pero se continúa sin bloquear por duplicado en ese caso.
+        let duplicado = null;
+        try {
+          duplicado = await env.DB.prepare(
+            "SELECT id, titulo, autor_nombre FROM media WHERE hash_archivo = ?"
+          ).bind(hashArchivo).first();
+        } catch (err) {
+          console.error("Comprobación de duplicados en /api/media falló (se continúa sin bloquear):", err.message);
+        }
         if (duplicado) {
           return json({
             error: `Este archivo ya se subió antes con el título "${duplicado.titulo}"${duplicado.autor_nombre ? ` (por ${duplicado.autor_nombre})` : ""}. No se puede subir el mismo contenido dos veces.`,

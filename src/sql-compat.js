@@ -4,7 +4,16 @@ export function translateSql(sql, params = []) {
     .replace(/date\('now'\)/gi, "CURRENT_DATE")
     .replace(/datetime\('now',\s*\?\)/gi, "(CURRENT_TIMESTAMP + ?::interval)")
     .replace(/datetime\('now',\s*'([+-])([^']+) minutes'\)/gi, "(CURRENT_TIMESTAMP + INTERVAL '$1$2 minutes')")
-    .replace(/datetime\('now'\)/gi, "CURRENT_TIMESTAMP");
+    // "datetime('now', '-28 days')" / "'+3 days'": usado por el panel de
+    // analíticas para acotar el rango (ver /api/admin/analiticas/* en
+    // index.js). Mismo patrón que la traducción de "minutes" de arriba,
+    // pero con "days" y sin límite en el número de dígitos.
+    .replace(/datetime\('now',\s*'([+-])([^']+) days'\)/gi, "(CURRENT_TIMESTAMP + INTERVAL '$1$2 days')")
+    .replace(/datetime\('now'\)/gi, "CURRENT_TIMESTAMP")
+    // "date(columna)" (SQLite) -> "columna::date" (Postgres), usado para
+    // agrupar la evolución diaria de vistas por día en vez de por
+    // timestamp exacto.
+    .replace(/\bdate\(([a-zA-Z_][\w.]*)\)/gi, "$1::date");
   out = out.replace(/programado_para\s*(<=|>)\s*CURRENT_TIMESTAMP/gi, "programado_para::timestamptz $1 CURRENT_TIMESTAMP");
   // "columna IS ?" es válido en SQLite (comparación tolerante a NULL, se
   // comporta como "=" salvo que alguno de los dos lados sea NULL), pero en

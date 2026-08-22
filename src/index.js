@@ -1,5 +1,5 @@
 // ElOtroFútbol - Worker API
-// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/comments/:id/vote, /api/comments/:id/report, /api/admin/comments, /api/admin/comments/reported, /api/club-info, /api/admin/club-info, /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml
+// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/comments/:id/vote, /api/comments/:id/report, /api/admin/comments, /api/admin/comments/reported, /api/club-info, /api/admin/club-info, /api/track/view, /api/track/reading, /api/admin/analiticas/*, /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml
 
 // Escapa los caracteres especiales de XML para que un título o slug con
 // "&", "<", ">", comillas, etc. no rompa el XML del sitemap.
@@ -905,9 +905,62 @@ async function sha1Hex(text) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// ---------- Analíticas propias (vistas y tiempo de lectura) ----------
+// Ver db/migrations/006_analiticas.sql para las tablas article_views/
+// article_reading y public/panel-analiticas.html (panel) para cómo se
+// consumen estos datos. Mismas funciones que worker/src/index.js (D1),
+// duplicadas aquí para que el panel funcione igual sirviéndose desde
+// este worker (Postgres/Railway).
+
+// Hash no reversible de IP + User-Agent + día, solo para poder deduplicar
+// varias vistas de la misma persona el mismo día sin guardar nada que la
+// identifique. Cambia cada día a propósito (no hace falta identificar de
+// forma permanente a nadie, solo evitar inflar "visitas únicas" con
+// recargas de la misma sesión de lectura).
+async function hashVisitante(request, env) {
+  const ip = request.headers.get("CF-Connecting-IP") || "0.0.0.0";
+  const ua = request.headers.get("User-Agent") || "";
+  const dia = new Date().toISOString().slice(0, 10);
+  return sha1Hex(`${ip}|${ua}|${dia}|${env.JWT_SECRET || ""}`);
+}
+
+// Clasifica el tráfico a partir de la cabecera Referer, igual que hace
+// GA4 con sus canales por defecto: directo (sin referer o referer del
+// propio dominio con origin distinto, ver más abajo), buscador, redes
+// sociales, o referido genérico (cualquier otra web que enlaza).
+const DOMINIOS_BUSCADORES = ["google.", "bing.", "duckduckgo.", "yahoo.", "ecosia.", "yandex."];
+const DOMINIOS_REDES_SOCIALES = ["facebook.com", "twitter.com", "x.com", "t.co", "instagram.com", "tiktok.com", "whatsapp.com", "telegram.org", "t.me", "linkedin.com", "reddit.com", "threads.net"];
+
+function clasificarFuenteTrafico(referer, siteUrl) {
+  if (!referer) return { fuente: "directo", dominio: null };
+  let dominioReferer;
+  try {
+    dominioReferer = new URL(referer).hostname.replace(/^www\./, "");
+  } catch {
+    return { fuente: "directo", dominio: null };
+  }
+  let dominioPropio = "";
+  try {
+    dominioPropio = new URL(siteUrl).hostname.replace(/^www\./, "");
+  } catch {}
+  if (dominioPropio && dominioReferer === dominioPropio) return { fuente: "interno", dominio: null };
+  if (DOMINIOS_BUSCADORES.some((d) => dominioReferer.includes(d))) return { fuente: "buscador", dominio: dominioReferer };
+  if (DOMINIOS_REDES_SOCIALES.some((d) => dominioReferer.includes(d))) return { fuente: "redes_sociales", dominio: dominioReferer };
+  return { fuente: "referido", dominio: dominioReferer };
+}
+
+// Mismo criterio simple que describirDispositivo() (arriba, para las
+// sesiones), reducido a las tres categorías que muestra el panel.
+function clasificarDispositivo(userAgent) {
+  const ua = userAgent || "";
+  if (/iPad|Tablet/i.test(ua)) return "tablet";
+  if (/Mobi|iPhone|Android/i.test(ua)) return "movil";
+  return "escritorio";
+}
+
 // Sube un archivo a Cloudinary sin ninguna transformación (se conserva la
 // calidad original). Devuelve { publicId, resourceType, url }.
-async function subirACloudinary(env, fileBytes, mimeType) {
+async function subirACloudinary(env, fileBytes, mimeType, nombreArchivo) {
   const timestamp = Math.floor(Date.now() / 1000);
   const signature = await sha1Hex(`timestamp=${timestamp}${env.CLOUDINARY_API_SECRET}`);
 
@@ -925,7 +978,23 @@ async function subirACloudinary(env, fileBytes, mimeType) {
     throw new Error("Error al subir a Cloudinary: " + (await resp.text()));
   }
   const data = await resp.json();
-  return { publicId: data.public_id, resourceType: data.resource_type, url: data.secure_url };
+  // HEIC/HEIF (formato por defecto de las fotos de iPhone) no lo renderiza
+  // ningún navegador directamente: si se devuelve tal cual, la miniatura
+  // de previsualización del panel (que usa la URL en crudo, sin pasar por
+  // cloudinaryOptimizada) se queda rota, aunque la imagen ya esté bien
+  // subida y en el sitio público sí se vea (ahí siempre se pide con
+  // f_auto). Se inserta f_auto/q_auto para que la URL guardada sea
+  // directamente compatible con cualquier navegador desde el primer
+  // momento, sin perder la posibilidad de pedir luego otras
+  // transformaciones sobre esa misma URL en el resto del sitio.
+  let url = data.secure_url;
+  const esHeic = mimeType === "image/heic" || mimeType === "image/heif" || /\.(heic|heif)$/i.test(nombreArchivo || "");
+  if (esHeic) {
+    const marca = "/upload/";
+    const i = url.indexOf(marca);
+    if (i !== -1) url = url.slice(0, i + marca.length) + "f_auto,q_auto/" + url.slice(i + marca.length);
+  }
+  return { publicId: data.public_id, resourceType: data.resource_type, url };
 }
 
 // ---------- Validación de archivos subidos (imágenes y vídeos) ----------
@@ -936,11 +1005,22 @@ async function subirACloudinary(env, fileBytes, mimeType) {
 // los formatos admitidos, los límites de tamaño y los mensajes de error
 // son siempre los mismos en toda la web en vez de estar duplicados (y
 // potencialmente desincronizados) en cada sitio donde se sube algo.
-const TIPOS_IMAGEN_PERMITIDOS = ["image/jpeg", "image/png", "image/webp", "image/gif", "image/avif"];
+const TIPOS_IMAGEN_PERMITIDOS = ["image/jpeg", "image/png", "image/webp", "image/gif", "image/avif", "image/heic", "image/heif"];
 const TIPOS_VIDEO_PERMITIDOS = ["video/mp4", "video/quicktime", "video/webm", "video/x-matroska", "video/mpeg"];
 // Las imágenes no tienen límite de tamaño propio: Cloudinary y el límite
 // de payload de Workers son los únicos topes reales.
 const LIMITE_VIDEO_BYTES = 90 * 1024 * 1024; // 90 MB (el plan gratis de Workers corta la petición entera a los 100 MB)
+
+// Algunos navegadores (sobre todo en Android, o Safari en ciertas
+// versiones) no rellenan bien file.type para archivos HEIC/HEIF y lo
+// dejan vacío o con un valor genérico: si eso pasa, se cae a mirar la
+// extensión del nombre del archivo antes de rechazarlo, para no dar un
+// falso error de "formato no compatible" con una foto que en realidad sí
+// se podría subir.
+function extensionImagenPermitida(nombreArchivo) {
+  const ext = (nombreArchivo || "").split(".").pop().toLowerCase();
+  return ["jpg", "jpeg", "png", "webp", "gif", "avif", "heic", "heif"].includes(ext);
+}
 
 function esImagenPermitida(mimeType) {
   return TIPOS_IMAGEN_PERMITIDOS.includes(mimeType);
@@ -954,13 +1034,19 @@ function validarArchivoSubida(file, { permitirVideo = false } = {}) {
   if (esImagenPermitida(file.type)) {
     return null;
   }
+  // MIME vacío o no reconocido (típico de HEIC en algunos navegadores):
+  // se admite igualmente si la extensión del archivo es una de las
+  // permitidas, en vez de rechazarlo directamente.
+  if ((!file.type || file.type === "application/octet-stream") && extensionImagenPermitida(file.name)) {
+    return null;
+  }
   if (permitirVideo && TIPOS_VIDEO_PERMITIDOS.includes(file.type)) {
     if (file.size > LIMITE_VIDEO_BYTES) return "El vídeo no puede superar los 90 MB";
     return null;
   }
   return permitirVideo
-    ? "Solo se admiten fotos (JPG, PNG, WEBP, GIF, AVIF) o vídeos (MP4, MOV, WEBM, MKV, MPEG)"
-    : "Solo se admiten imágenes en un formato compatible (JPG, PNG, WEBP, GIF o AVIF)";
+    ? "Solo se admiten fotos (JPG, PNG, WEBP, GIF, AVIF, HEIC/HEIF) o vídeos (MP4, MOV, WEBM, MKV, MPEG)"
+    : "Solo se admiten imágenes en un formato compatible (JPG, PNG, WEBP, GIF, AVIF o HEIC/HEIF)";
 }
 
 // Valida el archivo y, si es correcto, lo sube a Cloudinary tal cual
@@ -968,18 +1054,30 @@ function validarArchivoSubida(file, { permitirVideo = false } = {}) {
 // `esValidacion: true` cuando el problema es el propio archivo (para
 // devolver un 400 con el mensaje tal cual), y un error normal si falla
 // la subida a Cloudinary (para devolver un 502).
-async function procesarSubidaArchivo(env, file, opciones) {
+// Valida el archivo y, si es correcto, lo sube a Cloudinary tal cual
+// llega, sin recomprimir ni transformar. Lanza un error con
+// `esValidacion: true` cuando el problema es el propio archivo (para
+// devolver un 400 con el mensaje tal cual), y un error normal si falla
+// la subida a Cloudinary (para devolver un 502).
+// `fileBytes`, si se pasa, evita volver a leer el archivo entero por
+// segunda vez cuando quien llama ya lo había leído antes (p. ej. para
+// calcular el hash de duplicados en /api/media): con archivos grandes
+// (vídeos de decenas de MB), tener dos copias del archivo entero vivas
+// en memoria a la vez podía agotar la memoria del Worker (límite de
+// 128 MB) y tirar la petición entera con un 502 sin ningún mensaje de
+// error legible.
+async function procesarSubidaArchivo(env, file, opciones, fileBytes) {
   const errorValidacion = validarArchivoSubida(file, opciones);
   if (errorValidacion) {
     const error = new Error(errorValidacion);
     error.esValidacion = true;
     throw error;
   }
-  const fileBytes = await file.arrayBuffer();
-  const subida = await subirACloudinary(env, fileBytes, file.type);
+  const bytes = fileBytes || (await file.arrayBuffer());
+  const subida = await subirACloudinary(env, bytes, file.type, file.name);
   // El hash se calcula sobre los bytes ya leídos, así no hace falta
   // volver a leer el archivo entero una segunda vez.
-  subida.hash = await sha256Hex(fileBytes);
+  subida.hash = await sha256Hex(bytes);
   return subida;
 }
 
@@ -3663,11 +3761,15 @@ async function handlePrimary(request, env, ctx) {
         // Antes de gastar tiempo y ancho de banda subiendo el archivo a
         // Cloudinary, calculamos su hash y comprobamos si ya existe algo
         // idéntico en la mediateca. Así el aviso de "ya se ha subido
-        // este archivo" llega rápido y sin subir nada dos veces.
-        let hashArchivo;
+        // este archivo" llega rápido y sin subir nada dos veces. Estos
+        // mismos bytes se reutilizan más abajo para la subida en sí (ver
+        // procesarSubidaArchivo): con archivos grandes, leer el archivo
+        // dos veces significaba tener dos copias enteras en memoria a la
+        // vez y podía agotar la memoria del Worker.
+        let fileBytes, hashArchivo;
         try {
-          const bytesParaHash = await file.arrayBuffer();
-          hashArchivo = await sha256Hex(bytesParaHash);
+          fileBytes = await file.arrayBuffer();
+          hashArchivo = await sha256Hex(fileBytes);
         } catch (err) {
           return json({ error: "No se pudo leer el archivo" }, 400);
         }
@@ -3689,12 +3791,12 @@ async function handlePrimary(request, env, ctx) {
         // punto único que usa /api/subir-imagen.
         let subida;
         try {
-          subida = await procesarSubidaArchivo(env, file, { permitirVideo: true });
+          subida = await procesarSubidaArchivo(env, file, { permitirVideo: true }, fileBytes);
         } catch (err) {
           if (err.esValidacion) return json({ error: err.message }, 400);
           return json({ error: "No se pudo subir el archivo a Cloudinary. Comprueba tu conexión e inténtalo de nuevo.", detail: err.message }, 502);
         }
-        const esFoto = esImagenPermitida(file.type);
+        const esFoto = esImagenPermitida(file.type) || ((!file.type || file.type === "application/octet-stream") && extensionImagenPermitida(file.name));
 
         try {
           await env.DB.prepare(
@@ -4168,6 +4270,81 @@ async function handlePrimary(request, env, ctx) {
           : await obtenerAlineaciones(env, "article_id", article.id);
 
         return json({ article });
+      }
+
+      // ---------- Tracking: registrar una vista de noticia ----------
+      // Lo llama el cliente (ver public/js/analiticas-tracking.js) justo
+      // al abrir noticia.html, una vez por carga de página. Público, sin
+      // autenticación: cualquier lector genera vistas.
+      if (path === "/api/track/view" && method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const slugOId = typeof body.slug === "string" ? body.slug : "";
+        if (!slugOId) return json({ error: "Falta el slug de la noticia" }, 400);
+
+        const articulo = await env.DB.prepare(
+          "SELECT id FROM articles WHERE (slug = ?1 OR id = ?2) AND publicado = 1"
+        ).bind(slugOId, isNaN(slugOId) ? -1 : parseInt(slugOId)).first();
+        if (!articulo) return json({ error: "Noticia no encontrada" }, 404);
+
+        const visitanteHash = await hashVisitante(request, env);
+        const { fuente, dominio } = clasificarFuenteTrafico(request.headers.get("Referer"), SITIO_URL);
+        const dispositivo = clasificarDispositivo(request.headers.get("User-Agent"));
+
+        const inserted = await env.DB.prepare(
+          `INSERT INTO article_views (article_id, visitante_hash, fuente, referer_dominio, dispositivo)
+           VALUES (?, ?, ?, ?, ?) RETURNING id`
+        ).bind(articulo.id, visitanteHash, fuente, dominio, dispositivo).first();
+
+        // El id de la vista se devuelve para que el beacon de tiempo de
+        // lectura (más abajo) lo referencie al salir de la página; así
+        // cada fila de article_reading queda ligada a la vista exacta
+        // que la originó, no solo al artículo.
+        return json({ ok: true, view_id: inserted.id });
+      }
+
+      // ---------- Tracking: cerrar una vista con el tiempo de lectura ----------
+      // Se manda con navigator.sendBeacon, tanto en un "heartbeat"
+      // periódico mientras la pestaña sigue abierta como en el cierre
+      // final (ver public/js/analiticas-tracking.js): puede llegar varias
+      // veces para la MISMA vista, y en cualquier momento (o no llegar
+      // nunca, si se cierra el navegador de golpe) -- no se puede exigir
+      // que exista una vista "abierta" de forma estricta, solo que
+      // view_id sea uno real.
+      //
+      // UPSERT en vez de INSERT: con el heartbeat, la primera llamada
+      // para un view_id crea la fila y las siguientes la ACTUALIZAN (no
+      // añaden filas nuevas), así el AVG(segundos)/AVG(scroll_maximo) del
+      // panel sigue contando cada vista una sola vez aunque haya mandado
+      // varios heartbeats. Requiere el índice único de
+      // db/migrations/007_article_reading_upsert.sql sobre
+      // article_reading(view_id).
+      if (path === "/api/track/reading" && method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const viewId = parseInt(body.view_id, 10);
+        let segundos = parseInt(body.segundos, 10);
+        const scrollMaximo = body.scroll_maximo != null ? Math.max(0, Math.min(100, parseInt(body.scroll_maximo, 10))) : null;
+        if (!viewId || isNaN(segundos)) return json({ error: "Faltan datos" }, 400);
+        // Tope de 30 minutos por vista: una pestaña olvidada abierta no
+        // debe desvirtuar la media de tiempo de lectura.
+        segundos = Math.max(0, Math.min(segundos, 1800));
+
+        const vista = await env.DB.prepare("SELECT article_id FROM article_views WHERE id = ?").bind(viewId).first();
+        if (!vista) return json({ error: "Vista no encontrada" }, 404);
+
+        // No se usa el helper genérico "?" -> "$n" de sql-compat aquí
+        // porque translateSql() no traduce ON CONFLICT (no hace falta,
+        // es sintaxis nativa de Postgres en ambos lados D1/Postgres para
+        // este caso -- D1/SQLite acepta "ON CONFLICT(col) DO UPDATE"
+        // igual). Se mantiene el mismo texto de consulta en los dos
+        // workers (D1 y Postgres) a propósito, para que no diverjan.
+        await env.DB.prepare(
+          `INSERT INTO article_reading (view_id, article_id, segundos, scroll_maximo)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT (view_id) DO UPDATE
+           SET segundos = EXCLUDED.segundos, scroll_maximo = EXCLUDED.scroll_maximo`
+        ).bind(viewId, vista.article_id, segundos, scrollMaximo).run();
+
+        return json({ ok: true });
       }
 
       if (articleMatch && method === "PUT") {
@@ -5146,6 +5323,175 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true, mensaje: "Comentario denunciado. La redacción lo revisará." });
       }
 
+      // ================================================================
+      // ---------- PANEL DE ANALÍTICAS (datos propios, no GSC) ----------
+      // ================================================================
+      // Alimenta public/panel-analiticas.html sustituyendo los datos de
+      // ejemplo del mockup por consultas reales sobre article_views/
+      // article_reading (ver db/migrations/006_analiticas.sql). Solo
+      // admin: estos números son de gestión interna, no algo que un
+      // redactor normal necesite ver de otras noticias.
+      //
+      // Todos aceptan ?dias=7|28|90|365 (por defecto 28), igual que el
+      // selector de rango del mockup. Mismas consultas que
+      // worker/src/index.js (D1); aquí corren sobre Postgres, traducidas
+      // por sql-compat.js (datetime('now', '-N days') y date(columna)).
+
+      if (path.startsWith("/api/admin/analiticas") && method === "GET") {
+        const payload = await requireAuth(request, env, url);
+        if (!payload || payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las analíticas" }, 403);
+
+        const diasPermitidos = [7, 28, 90, 365];
+        let dias = parseInt(url.searchParams.get("dias") || "28", 10);
+        if (!diasPermitidos.includes(dias)) dias = 28;
+        const desde = `datetime('now', '-${dias} days')`;
+
+        // ---------- Resumen: KPIs + evolución diaria + dispositivos ----------
+        if (path === "/api/admin/analiticas/resumen") {
+          const kpis = await env.DB.prepare(
+            `SELECT
+               COUNT(*) AS paginas_vistas,
+               COUNT(DISTINCT visitante_hash) AS visitantes,
+               COUNT(DISTINCT article_id) AS noticias_con_vistas
+             FROM article_views WHERE created_at >= ${desde}`
+          ).first();
+
+          // AVG(segundos): tiempo medio de lectura, para el KPI "Tiempo
+          // medio". AVG(scroll_maximo): % medio de la noticia que se ha
+          // llegado a ver en pantalla, para el KPI "Lectura completa"
+          // (ver kpiCompletitud en panel-analiticas.html) -- no hay una
+          // señal de "terminó de leer" más precisa que el scroll
+          // alcanzado, así que se usa directamente como proxy.
+          const lectura = await env.DB.prepare(
+            `SELECT AVG(segundos) AS media_segundos, AVG(scroll_maximo) AS media_scroll
+             FROM article_reading WHERE created_at >= ${desde}`
+          ).first();
+
+          const { results: evolucion } = await env.DB.prepare(
+            `SELECT date(created_at) AS fecha,
+                    COUNT(*) AS vistas,
+                    COUNT(DISTINCT visitante_hash) AS visitantes
+             FROM article_views
+             WHERE created_at >= ${desde}
+             GROUP BY date(created_at)
+             ORDER BY fecha ASC`
+          ).all();
+
+          const { results: dispositivosFilas } = await env.DB.prepare(
+            `SELECT dispositivo, COUNT(*) AS vistas
+             FROM article_views WHERE created_at >= ${desde}
+             GROUP BY dispositivo`
+          ).all();
+
+          // El panel (panel-analiticas.html -> cargarResumen) espera los
+          // KPIs como campos sueltos en la raíz del JSON (data.vistas,
+          // data.visitantes, data.tiempo_medio_segundos, data.completitud)
+          // y "dispositivos" como un objeto {movil, escritorio, tablet: N},
+          // no como el array de filas {dispositivo, vistas} que devuelve
+          // la consulta SQL de arriba. Se traduce aquí para no tener que
+          // tocar el frontend (que ya funciona igual para mas-leidas/
+          // fuentes/autores/tiempo-lectura, cuyo formato sí coincide).
+          const dispositivos = { movil: 0, escritorio: 0, tablet: 0 };
+          for (const fila of dispositivosFilas || []) {
+            if (fila.dispositivo in dispositivos) dispositivos[fila.dispositivo] = Number(fila.vistas) || 0;
+          }
+
+          return json({
+            vistas: kpis?.paginas_vistas || 0,
+            visitantes: kpis?.visitantes || 0,
+            noticias_con_vistas: kpis?.noticias_con_vistas || 0,
+            tiempo_medio_segundos: Math.round(lectura?.media_segundos || 0),
+            completitud: Math.round((lectura?.media_scroll || 0) * 10) / 10,
+            evolucion_diaria: evolucion || [],
+            dispositivos,
+            // Se conserva también "kpis" (formato anterior, anidado) por
+            // si algún otro consumidor de esta ruta lo esperaba así; no
+            // estorba, el frontend actual solo lee los campos de arriba.
+            kpis: {
+              paginas_vistas: kpis?.paginas_vistas || 0,
+              visitantes: kpis?.visitantes || 0,
+              noticias_con_vistas: kpis?.noticias_con_vistas || 0,
+              tiempo_medio_lectura_segundos: Math.round(lectura?.media_segundos || 0),
+            },
+          });
+        }
+
+        // ---------- Noticias más leídas ----------
+        if (path === "/api/admin/analiticas/mas-leidas") {
+          const limit = Math.min(parseInt(url.searchParams.get("limit") || "10", 10), 50);
+          const { results } = await env.DB.prepare(
+            `SELECT a.id, a.slug, a.titulo, a.categoria, a.autor_nombre,
+                    COUNT(v.id) AS vistas,
+                    COUNT(DISTINCT v.visitante_hash) AS visitantes,
+                    (SELECT AVG(r.segundos) FROM article_reading r WHERE r.article_id = a.id AND r.created_at >= ${desde}) AS tiempo_medio_segundos
+             FROM article_views v
+             JOIN articles a ON a.id = v.article_id
+             WHERE v.created_at >= ${desde}
+             GROUP BY a.id
+             ORDER BY vistas DESC
+             LIMIT ?`
+          ).bind(limit).all();
+          return json({ noticias: (results || []).map((n) => ({ ...n, tiempo_medio_segundos: Math.round(n.tiempo_medio_segundos || 0) })) });
+        }
+
+        // ---------- Tráfico por fuente ----------
+        if (path === "/api/admin/analiticas/fuentes") {
+          const { results } = await env.DB.prepare(
+            `SELECT fuente, COUNT(*) AS vistas
+             FROM article_views WHERE created_at >= ${desde}
+             GROUP BY fuente ORDER BY vistas DESC`
+          ).all();
+          const { results: referidos } = await env.DB.prepare(
+            `SELECT referer_dominio AS dominio, fuente, COUNT(*) AS vistas
+             FROM article_views
+             WHERE created_at >= ${desde} AND referer_dominio IS NOT NULL
+             GROUP BY referer_dominio, fuente ORDER BY vistas DESC LIMIT 15`
+          ).all();
+          return json({ fuentes: results || [], dominios: referidos || [] });
+        }
+
+        // ---------- Rendimiento por autor ----------
+        if (path === "/api/admin/analiticas/autores") {
+          const { results } = await env.DB.prepare(
+            `SELECT a.autor_nombre AS autor,
+                    COUNT(DISTINCT a.id) AS noticias,
+                    COUNT(v.id) AS vistas,
+                    AVG(r.segundos) AS tiempo_medio_segundos
+             FROM articles a
+             JOIN article_views v ON v.article_id = a.id AND v.created_at >= ${desde}
+             LEFT JOIN article_reading r ON r.article_id = a.id AND r.created_at >= ${desde}
+             WHERE a.autor_nombre IS NOT NULL
+             GROUP BY a.autor_nombre
+             ORDER BY vistas DESC`
+          ).all();
+          return json({ autores: (results || []).map((au) => ({ ...au, tiempo_medio_segundos: Math.round(au.tiempo_medio_segundos || 0) })) });
+        }
+
+        // ---------- Tiempo medio de lectura por categoría ----------
+        if (path === "/api/admin/analiticas/tiempo-lectura") {
+          const { results } = await env.DB.prepare(
+            `SELECT a.categoria,
+                    AVG(r.segundos) AS tiempo_medio_segundos,
+                    COUNT(r.id) AS lecturas,
+                    AVG(r.scroll_maximo) AS scroll_medio
+             FROM article_reading r
+             JOIN articles a ON a.id = r.article_id
+             WHERE r.created_at >= ${desde}
+             GROUP BY a.categoria
+             ORDER BY tiempo_medio_segundos DESC`
+          ).all();
+          return json({
+            categorias: (results || []).map((c) => ({
+              ...c,
+              tiempo_medio_segundos: Math.round(c.tiempo_medio_segundos || 0),
+              scroll_medio: Math.round(c.scroll_medio || 0),
+            })),
+          });
+        }
+
+        return json({ error: "Ruta de analíticas no encontrada" }, 404);
+      }
+
       // Admin: listar (por estado), aprobar/rechazar y borrar.
       if (path === "/api/admin/comments" && method === "GET") {
         const payload = await requireAuth(request, env);
@@ -5381,6 +5727,27 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true });
       }
 
+      // Segunda Federación: mismo cálculo automático de grupo que en el
+      // worker principal (ver worker/src/index.js,
+      // grupoAutomaticoSegundaFederacion) -- se mantiene aquí duplicado
+      // porque este worker-secondary es el backend de respaldo (Railway)
+      // y necesita el mismo comportamiento durante un failover.
+      const GRUPO_SEGUNDA_FEDERACION_POR_EQUIPO = {
+        "Linares Deportivo": "Grupo 4",
+        "Recreativo de Huelva": "Grupo 4",
+        "CD Badajoz": "Grupo 4",
+        "CD Numancia": "Grupo 5",
+        "CD Guadalajara": "Grupo 5",
+        "UB Conquense": "Grupo 5",
+        "CF Talavera de la Reina": "Grupo 5",
+      };
+      function grupoAutomaticoSegundaFederacion(competicion, equipoLocal, equipoVisitante) {
+        if (competicion !== "segunda_federacion") return null;
+        return GRUPO_SEGUNDA_FEDERACION_POR_EQUIPO[equipoLocal]
+          || GRUPO_SEGUNDA_FEDERACION_POR_EQUIPO[equipoVisitante]
+          || null;
+      }
+
       // Estados válidos de un partido. "retrasado" y "anulado" son
       // nuevos: un partido retrasado sigue "programado" a efectos de
       // cronómetro (no arranca hasta la nueva hora); uno anulado no
@@ -5518,11 +5885,17 @@ async function handlePrimary(request, env, ctx) {
           }
         }
         const flashscoreUrl = flashscoreUrlValido(body.competicion, body.estado, body.flashscore_url);
+        // El grupo de Segunda Federación se calcula solo (ver
+        // grupoAutomaticoSegundaFederacion arriba) y pisa lo que venga en
+        // body.grupo; en el resto de competiciones se respeta lo que
+        // mande el panel, igual que siempre.
+        const grupoCalculado = grupoAutomaticoSegundaFederacion(body.competicion, body.equipo_local, body.equipo_visitante);
+        const grupoAGuardar = body.competicion === "segunda_federacion" ? grupoCalculado : (body.grupo || null);
         const insertResult = await env.DB.prepare(
           `INSERT INTO results (competicion, grupo, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido, estado, ubicacion, flashscore_url, escudo_local_url, escudo_visitante_url, autor_id, autor_nombre, origin_write_id)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
-          body.competicion, body.grupo || null, body.jornada, body.equipo_local, body.equipo_visitante,
+          body.competicion, grupoAGuardar, body.jornada, body.equipo_local, body.equipo_visitante,
           body.goles_local ?? null, body.goles_visitante ?? null, body.fecha_partido || null, body.estado || "programado",
           body.ubicacion || null, flashscoreUrl,
           body.escudo_local_url || null, body.escudo_visitante_url || null,
@@ -5596,10 +5969,14 @@ async function handlePrimary(request, env, ctx) {
         // limpia siempre (evita que quede "colgado" de un retraso previo
         // si luego el partido se reprograma o se juega con normalidad).
         const fechaRetrasado = body.estado === "retrasado" ? (body.fecha_partido_retrasado || null) : null;
+        // Mismo cálculo automático del grupo que en la creación (POST) y
+        // que en el worker principal.
+        const grupoCalculadoEdicion = grupoAutomaticoSegundaFederacion(body.competicion, body.equipo_local, body.equipo_visitante);
+        const grupoAGuardarEdicion = body.competicion === "segunda_federacion" ? grupoCalculadoEdicion : (body.grupo || null);
         await env.DB.prepare(
           `UPDATE results SET competicion=?, grupo=?, jornada=?, equipo_local=?, equipo_visitante=?, goles_local=?, goles_visitante=?, penaltis_local=?, penaltis_visitante=?, fecha_partido=?, estado=?, ubicacion=?, flashscore_url=?, escudo_local_url=?, escudo_visitante_url=?, fecha_partido_retrasado=? WHERE id=?`
         ).bind(
-          body.competicion, body.grupo || null, body.jornada, body.equipo_local, body.equipo_visitante,
+          body.competicion, grupoAGuardarEdicion, body.jornada, body.equipo_local, body.equipo_visitante,
           body.goles_local ?? null, body.goles_visitante ?? null,
           body.penaltis_local ?? null, body.penaltis_visitante ?? null,
           body.fecha_partido || null, body.estado || "programado",

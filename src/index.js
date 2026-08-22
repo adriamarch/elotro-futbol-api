@@ -1762,6 +1762,16 @@ const FAILOVER_TEST_HEADER = "X-Failover-Test";
 const FAILOVER_REASON_HEADER = "X-Failover-Reason";
 
 export default {
+  // Expuestas también como propiedades del handler (no solo usadas
+  // dentro de "scheduled" más abajo) para que server-railway.js pueda
+  // dispararlas bajo demanda desde /api/internal/cron-respaldo, sin
+  // depender de que Railway tenga soporte nativo de "cron trigger" como
+  // Cloudflare Workers -- ver ese endpoint para el porqué completo.
+  publicarArticulosProgramados,
+  iniciarPartidosProgramadosCuyaHoraHaLlegado,
+  revisarPartidosDesatendidos,
+  enviarBoletinSemanalSiToca,
+
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;

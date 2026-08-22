@@ -109,6 +109,71 @@ app.get("/api/health", async (c) => {
   }
 });
 
+// POST /api/internal/cron-respaldo
+//
+// Dispara en la secundaria (Postgres/Railway) las MISMAS tareas
+// periódicas que el Worker principal ejecuta cada minuto vía su cron
+// trigger de Cloudflare (ver "async scheduled" al final de este mismo
+// archivo index.js, y worker/wrangler.toml -> [triggers]):
+//   - publicarArticulosProgramados
+//   - iniciarPartidosProgramadosCuyaHoraHaLlegado (arranca el
+//     cronómetro de partidos programados cuya hora ya llegó, la pieza
+//     que hace que la clasificación se vea "en directo")
+//   - revisarPartidosDesatendidos
+//   - enviarBoletinSemanalSiToca
+//
+// A propósito, esta ruta NO comprueba si el primario está vivo o
+// caído antes de actuar: se ejecuta SIEMPRE que el cron de Railway la
+// llama (cada 5 minutos, ver scripts/cron-respaldo.mjs). Así ambos
+// backends quedan sincronizados en todo momento y ninguno depende de
+// la salud del otro para que lo "en vivo" funcione -- ya sea que el
+// tráfico esté sirviéndose desde el primario o desde el secundario en
+// ese instante. Duplicar la ejecución de estas tareas es seguro: cada
+// una es idempotente sobre su propia base de datos (una actualiza
+// D1, la otra Postgres; nunca la misma fila dos veces con el mismo
+// efecto -- iniciarPartidosProgramadosCuyaHoraHaLlegado solo actúa
+// sobre partidos que siguen en estado "programado", por ejemplo).
+app.post("/api/internal/cron-respaldo", async (c) => {
+  const secretoEsperado = env.INTERNAL_CRON_SECRET;
+  if (!secretoEsperado) {
+    return c.json({ ok: false, error: "INTERNAL_CRON_SECRET no configurado en este servicio" }, 503);
+  }
+  const secretoRecibido = c.req.header("X-Internal-Cron-Secret");
+  if (!secretoRecibido || secretoRecibido !== secretoEsperado) {
+    return c.json({ ok: false, error: "No autorizado" }, 401);
+  }
+
+  const ctx = { waitUntil(promise) { return promise; } };
+  const tareas = {
+    publicarArticulosProgramados: null,
+    iniciarPartidosProgramadosCuyaHoraHaLlegado: null,
+    revisarPartidosDesatendidos: null,
+    enviarBoletinSemanalSiToca: null,
+  };
+  const errores = {};
+
+  // Se ejecutan en secuencia (no en paralelo) y cada una se envuelve en
+  // su propio try/catch: un fallo en una tarea no debe impedir que las
+  // demás corran, igual que en el "scheduled" del Worker principal
+  // (donde cada ctx.waitUntil(...) es independiente).
+  for (const nombre of Object.keys(tareas)) {
+    try {
+      await handler[nombre](env, ctx);
+      tareas[nombre] = "ok";
+    } catch (error) {
+      tareas[nombre] = "error";
+      errores[nombre] = error.message;
+      console.error(`[cron-respaldo] fallo en ${nombre}:`, error);
+    }
+  }
+
+  const huboErrores = Object.keys(errores).length > 0;
+  return c.json(
+    { ok: !huboErrores, ejecutado_en: new Date().toISOString(), tareas, errores: huboErrores ? errores : undefined },
+    huboErrores ? 207 : 200
+  );
+});
+
 app.all("*", async (c) => {
   if (c.req.path === "/api/health") return c.notFound();
   if (c.req.path === "/api/internal/pending-writes-count") {

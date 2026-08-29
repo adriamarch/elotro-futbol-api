@@ -1220,6 +1220,59 @@ async function obtenerAlineaciones(env, columna, id) {
   });
 }
 
+// Últimas alineaciones guardadas de un equipo (mirando sus partidos más
+// recientes, jugara como local o visitante), para poder copiarlas al
+// editar la alineación de un partido nuevo -botón "Copiar de un partido
+// anterior" en el panel-. Solo mira alineaciones colgadas de result_id
+// (partidos), no las sueltas de una noticia sin partido vinculado.
+async function obtenerUltimasAlineacionesEquipo(env, equipo, excluirResultId, limite = 3) {
+  if (!equipo) return [];
+  const { results: partidos } = await env.DB.prepare(
+    `SELECT id, competicion, jornada, fecha_partido, equipo_local, equipo_visitante
+     FROM results
+     WHERE (equipo_local = ? OR equipo_visitante = ?)
+       AND estado = 'finalizado'
+       AND id != ?
+     ORDER BY fecha_partido DESC
+     LIMIT 20`
+  ).bind(equipo, equipo, excluirResultId || 0).all();
+  if (!partidos.length) return [];
+
+  const idsPartidos = partidos.map((p) => p.id);
+  const placeholders = idsPartidos.map(() => "?").join(",");
+  const { results: alineaciones } = await env.DB.prepare(
+    `SELECT * FROM alineaciones WHERE result_id IN (${placeholders}) AND equipo = ?`
+  ).bind(...idsPartidos, equipo).all();
+
+  const mapaPorPartido = {};
+  alineaciones.forEach((a) => { mapaPorPartido[a.result_id] = a; });
+
+  const salida = [];
+  for (const partido of partidos) {
+    const alineacion = mapaPorPartido[partido.id];
+    if (!alineacion) continue;
+    let jugadores = [];
+    try {
+      jugadores = JSON.parse(alineacion.jugadores || "[]");
+    } catch {
+      jugadores = [];
+    }
+    const rival = partido.equipo_local === equipo ? partido.equipo_visitante : partido.equipo_local;
+    salida.push({
+      alineacion_id: alineacion.id,
+      result_id: partido.id,
+      rival,
+      jornada: partido.jornada,
+      fecha_partido: partido.fecha_partido,
+      formacion: alineacion.formacion,
+      escudo_url: alineacion.escudo_url,
+      jugadores,
+    });
+    if (salida.length >= limite) break;
+  }
+  return salida;
+}
+
 // Valida y normaliza el array de jugadores que manda el editor visual
 // del panel: descarta entradas sin nombre, recorta dorsales/coordenadas
 // a rangos razonables y no deja pasar campos inesperados.
@@ -1482,18 +1535,18 @@ async function tienePermisoTemporal(env, payload, tipoEntidad, entidadId) {
   return Boolean(permiso);
 }
 
-// Combina las tres comprobaciones: autoría directa (o coautoría, si se
-// pasa), nivel 4 (revisa/corrige contenido de cualquiera sin tener que
-// pedir permiso, ver documento de niveles), o permiso temporal
-// concedido por una solicitud aprobada.
-// El atajo de Nivel 4 solo aplica a "articulo" (noticias, crónicas,
-// opinión, entrevistas), que es lo que dice el documento de niveles.
-// Para "resultado" (marcadores, minuto a minuto, cronómetro en vivo)
-// se deja fuera a propósito: es contenido operativo, no editorial, y
-// tocar el minuto a minuto de un partido que otra persona está
-// gestionando en directo tiene mucho más riesgo que corregir un texto.
+// Combina las comprobaciones: autoría directa (o coautoría, si se
+// pasa), atajo general para "resultado" (cualquier redactor puede
+// editar/borrar el resultado de cualquier otro, incluido su minuto a
+// minuto/cronómetro en directo -decisión explícita: los partidos son
+// contenido compartido del equipo, no propiedad exclusiva de quien lo
+// creó, y cualquier redactor puede necesitar tomar el relevo de un
+// partido en directo-), nivel 4 para "articulo" (revisa/corrige
+// contenido de cualquiera sin tener que pedir permiso, ver documento
+// de niveles), o permiso temporal concedido por una solicitud aprobada.
 async function puedeEditar(env, payload, tipoEntidad, entidadId, autorId, coautorId) {
   if (payload.rol === "admin") return true;
+  if (tipoEntidad === "resultado") return true;
   if (autorId && autorId === payload.uid) return true;
   if (coautorId && coautorId === payload.uid) return true;
   if (tipoEntidad === "articulo") {
@@ -1593,6 +1646,84 @@ const UMBRAL_PRIMERA_PARTE_SIN_DESCANSO = 55; // minutos
 const UMBRAL_SEGUNDA_PARTE_SIN_FINAL = 100; // minutos (aprox. 2ª parte + prórroga larga)
 const UMBRAL_DESCANSO_SIN_REANUDAR = 25; // minutos parado en el descanso
 
+// Umbral de partido "colgado": el cronómetro lleva corriendo días sin que
+// nadie lo haya cerrado (bug, redactor que se fue de vacaciones, servidor
+// que se cayó a mitad, etc.). 2000' son >33h de partido en juego, algo
+// que nunca pasa en un partido real. A diferencia del aviso "desatendido"
+// de arriba (que solo avisa), este caso ADEMÁS cambia el estado a
+// 'colgado': como el frontend público filtra explícitamente por
+// estado === "en_juego" en calendario.html, clasificacion.html y
+// minuto-a-minuto.html, cambiar el estado basta para que el partido deje
+// de aparecer como "en directo" en la web sin tocar nada del frontend.
+// Sigue siendo consultable desde el panel de admin (que si no filtra por
+// estado, lo trae igual) para que un admin lo revise y lo corrija a mano.
+const UMBRAL_PARTIDO_COLGADO = 2000; // minutos
+
+async function marcarPartidosColgados(env, ctx) {
+  const { results: partidos } = await env.DB.prepare(
+    `SELECT id, competicion, jornada, equipo_local, equipo_visitante, autor_id, autor_nombre,
+            inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos
+     FROM results WHERE estado = 'en_juego'`
+  ).all();
+  if (!partidos.length) return [];
+
+  const idsColgados = [];
+  for (const partido of partidos) {
+    const minuto = minutoEnVivoServidor(partido);
+    if (minuto < UMBRAL_PARTIDO_COLGADO) continue;
+
+    await env.DB.prepare("UPDATE results SET estado = 'colgado' WHERE id = ?").bind(partido.id).run();
+    idsColgados.push(partido.id);
+
+    const nombrePartido = `${partido.equipo_local} - ${partido.equipo_visitante}`;
+    const enlacePanel = `${SITIO_URL}/admin/minuto-a-minuto.html?id=${partido.id}`;
+    const motivo = `El cronómetro lleva corriendo sin parar desde hace más de ${Math.floor(minuto / 60 / 24)} días (minuto ${minuto}) sin que se haya registrado el final del partido. Se ha ocultado automáticamente de la web mientras se revisa.`;
+
+    let destinatario = EMAIL_NOTIFICACIONES;
+    if (partido.autor_id) {
+      const autor = await env.DB.prepare("SELECT email FROM users WHERE id = ?").bind(partido.autor_id).first();
+      if (autor?.email) destinatario = autor.email;
+    }
+
+    // Aviso deliberadamente distinto y más grave que el de "desatendido":
+    // no es un despiste de unos minutos, es un partido que lleva DÍAS
+    // colgado y ya se ha ocultado solo de la web -requiere intervención
+    // manual sí o sí, no basta con seguir cubriéndolo-.
+    const enviar = enviarEmailNotificacion(env, {
+      asunto: `🚨 URGENTE: partido colgado y ocultado automáticamente: ${nombrePartido}`,
+      texto: `${motivo}\n\nPartido: ${nombrePartido} (jornada ${partido.jornada})\nRedactor asignado: ${partido.autor_nombre || "sin asignar"}\n\nEntra al panel para corregir el estado del partido: ${enlacePanel}`,
+      html: plantillaEmail({
+        etiqueta: "🚨 Aviso urgente",
+        titulo: "Partido colgado: ocultado automáticamente",
+        parrafo: motivo,
+        filas: [
+          { etiqueta: "Partido", valor: nombrePartido },
+          { etiqueta: "Jornada", valor: String(partido.jornada) },
+          { etiqueta: "Redactor", valor: partido.autor_nombre || "Sin asignar" },
+          { etiqueta: "Minutos corriendo", valor: String(minuto) },
+        ],
+        boton: { texto: "Revisar en el panel", url: enlacePanel },
+      }),
+    }, { destinatario });
+
+    if (destinatario !== EMAIL_NOTIFICACIONES) {
+      ctx.waitUntil(enviar);
+      ctx.waitUntil(enviarEmailNotificacion(env, {
+        asunto: `🚨 URGENTE: partido colgado y ocultado automáticamente: ${nombrePartido}`,
+        texto: `${motivo}\n\nPartido: ${nombrePartido} (jornada ${partido.jornada})\nRedactor asignado: ${partido.autor_nombre || "sin asignar"}\n\nEntra al panel para corregir el estado del partido: ${enlacePanel}`,
+      }, { destinatario: EMAIL_NOTIFICACIONES }));
+    } else {
+      ctx.waitUntil(enviar);
+    }
+
+    await registrarActividad(env, null, { uid: null, nombre: "Vigilancia de partidos", rol: "sistema" }, {
+      accion: "partido_colgado_ocultado", entidad: "resultado", entidad_id: partido.id,
+      descripcion: `Aviso urgente: ${nombrePartido} — ${motivo}`,
+    });
+  }
+  return idsColgados;
+}
+
 function minutoEnVivoServidor(resultado) {
   if (resultado.cronometro_pausado_en !== null && resultado.cronometro_pausado_en !== undefined) {
     return resultado.cronometro_pausado_en;
@@ -1605,6 +1736,10 @@ function minutoEnVivoServidor(resultado) {
 }
 
 async function revisarPartidosDesatendidos(env, ctx) {
+  // Los partidos ya marcados como 'colgado' (ver marcarPartidosColgados,
+  // que corre justo antes en el cron) se excluyen aquí para no duplicar
+  // avisos: ese caso ya manda su propio email, más urgente, y ya no
+  // está en estado 'en_juego' de todas formas.
   const { results: partidos } = await env.DB.prepare(
     `SELECT id, competicion, jornada, equipo_local, equipo_visitante, autor_id, autor_nombre,
             inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos,
@@ -1769,6 +1904,7 @@ export default {
   // Cloudflare Workers -- ver ese endpoint para el porqué completo.
   publicarArticulosProgramados,
   iniciarPartidosProgramadosCuyaHoraHaLlegado,
+  marcarPartidosColgados,
   revisarPartidosDesatendidos,
   enviarBoletinSemanalSiToca,
 
@@ -2335,7 +2471,11 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
   async scheduled(event, env, ctx) {
     ctx.waitUntil(publicarArticulosProgramados(env));
     ctx.waitUntil(iniciarPartidosProgramadosCuyaHoraHaLlegado(env));
-    ctx.waitUntil(revisarPartidosDesatendidos(env, ctx));
+    // marcarPartidosColgados va ANTES de revisarPartidosDesatendidos:
+    // pasa a 'colgado' los partidos con más de 2000' corriendo, para que
+    // ya no aparezcan como 'en_juego' cuando se ejecute la revisión de
+    // "desatendido" justo después y no se dupliquen los avisos.
+    ctx.waitUntil(marcarPartidosColgados(env, ctx).then(() => revisarPartidosDesatendidos(env, ctx)));
     ctx.waitUntil(enviarBoletinSemanalSiToca(env));
   },
 };
@@ -6159,6 +6299,21 @@ async function handlePrimary(request, env, ctx) {
       // articles/results) porque una noticia o un partido pueden llevar
       // dos alineaciones (local y visitante) y porque así el mismo panel
       // de edición sirve para ambos contextos sin duplicar código.
+      // Últimas alineaciones guardadas de un equipo, para el botón
+      // "Copiar de un partido anterior" del editor de alineaciones (ver
+      // obtenerUltimasAlineacionesEquipo). ?equipo= es obligatorio;
+      // ?excluir_result_id= evita traer la alineación del propio
+      // partido que se está editando si ya se hubiera guardado antes.
+      if (path === "/api/alineaciones/ultimas" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const equipo = url.searchParams.get("equipo");
+        if (!equipo || !equipo.trim()) return json({ error: "Falta el equipo" }, 400);
+        const excluirResultId = parseInt(url.searchParams.get("excluir_result_id"), 10) || 0;
+        const ultimas = await obtenerUltimasAlineacionesEquipo(env, equipo.trim(), excluirResultId, 3);
+        return json({ alineaciones: ultimas });
+      }
+
       if (path === "/api/alineaciones" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);

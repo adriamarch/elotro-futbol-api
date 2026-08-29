@@ -151,6 +151,12 @@ app.post("/api/internal/cron-respaldo", async (c) => {
   const tareas = {
     publicarArticulosProgramados: null,
     iniciarPartidosProgramadosCuyaHoraHaLlegado: null,
+    // Debe ir ANTES de revisarPartidosDesatendidos: marca como 'colgado'
+    // los partidos con más de 2000' corriendo para que la revisión de
+    // "desatendido" (que solo mira estado = 'en_juego') ya no los vea y
+    // no se manden avisos duplicados. Object.keys conserva el orden de
+    // inserción, así que basta con declararlo en este orden.
+    marcarPartidosColgados: null,
     revisarPartidosDesatendidos: null,
     enviarBoletinSemanalSiToca: null,
   };

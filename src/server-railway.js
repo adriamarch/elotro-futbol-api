@@ -15,7 +15,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import crypto from "node:crypto";
 import handler from "./index.js";
-import { createD1CompatDb, checkPostgres, checkSyncFreshness } from "./postgres-db.js";
+import { createD1CompatDb, checkPostgres, checkSyncFreshness, pool } from "./postgres-db.js";
 import { debeEncolarse, encolarEscritura, contarPendientes } from "./pending-writes.js";
 
 const app = new Hono();
@@ -30,6 +30,10 @@ app.use(
 
 const env = {
   DB: createD1CompatDb(),
+  // Solo para el endpoint temporal /api/debug/migrar-jornadas-calendario
+  // (ver src/index.js): permite ejecutar SQL multi-statement directo.
+  // BORRAR esta línea junto con ese endpoint una vez usado.
+  PGPOOL: pool,
   JWT_SECRET: process.env.JWT_SECRET,
   RESEND_API_KEY: process.env.RESEND_API_KEY,
   RESEND_FROM: process.env.RESEND_FROM,

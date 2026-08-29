@@ -141,3 +141,5 @@ export async function checkSyncFreshness() {
 }
 
 export async function closePostgres() { await pool.end(); }
+
+export { pool };

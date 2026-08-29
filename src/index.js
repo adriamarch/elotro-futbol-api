@@ -3110,6 +3110,33 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true, eliminados: duplicados.length, detalle: duplicados });
       }
 
+      // Endpoint temporal: aplica el SQL de
+      // worker/migracion_jornadas_calendario_datos.sql directamente contra
+      // Postgres (por eso usa env.PGPOOL, no env.DB: necesita ejecutar el
+      // archivo entero de un tirón, con sus múltiples INSERT, en vez de
+      // sentencia a sentencia). Solo tiene sentido en Railway/Postgres,
+      // donde este archivo sí existe en disco (../worker/... relativo a
+      // worker-secondary). BORRAR esta ruta, la línea PGPOOL en
+      // server-railway.js y el export de pool en postgres-db.js una vez
+      // aplicada la migración.
+      if (path === "/api/debug/migrar-jornadas-calendario" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!env.PGPOOL) return json({ error: "PGPOOL no disponible en este entorno" }, 400);
+        try {
+          const fs = await import("node:fs");
+          const path2 = await import("node:path");
+          const { fileURLToPath } = await import("node:url");
+          const __dirname2 = path2.dirname(fileURLToPath(import.meta.url));
+          const sqlPath = path2.join(__dirname2, "..", "..", "worker", "migracion_jornadas_calendario_datos.sql");
+          const sql = fs.readFileSync(sqlPath, "utf8");
+          await env.PGPOOL.query(sql);
+          return json({ ok: true, mensaje: "Migración de jornadas_calendario aplicada." });
+        } catch (error) {
+          return json({ error: "Fallo al aplicar la migración", detalle: error.message }, 500);
+        }
+      }
+
       // ---------- ME ----------
       if (path === "/api/me" && method === "GET") {
         const payload = await requireAuth(request, env);

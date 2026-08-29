@@ -116,6 +116,9 @@ CREATE TABLE articles (
   -- retirado); se mantiene sin usar para no forzar una migración
   -- destructiva sobre datos existentes.
   imagen_post_url TEXT,
+  -- Ficha técnica editable a mano por el redactor, solo para crónicas.
+  -- Guardada como JSON (mismo formato que en worker/schema.sql D1).
+  ficha_tecnica TEXT,
   FOREIGN KEY (autor_id) REFERENCES users(id),
   FOREIGN KEY (coautor_id) REFERENCES users(id),
   FOREIGN KEY (resultado_id) REFERENCES results(id)

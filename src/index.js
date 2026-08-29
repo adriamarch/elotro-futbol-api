@@ -6553,6 +6553,102 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true });
       }
 
+      // Calendario de jornadas (sobre-escritura manual del intRound que
+      // da TheSportsDB). Mismos endpoints que en worker/src/index.js
+      // (worker principal) — ver ese archivo para el detalle del porqué;
+      // aquí se replican para que el panel admin funcione igual si el
+      // failover atiende la petición.
+      if (path === "/api/jornadas-calendario" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver el calendario de jornadas" }, 403);
+        const { results } = await env.DB.prepare(
+          "SELECT id, competicion, grupo, jornada, fecha_inicio, fecha_fin FROM jornadas_calendario ORDER BY competicion, grupo IS NOT NULL, grupo, fecha_inicio"
+        ).all();
+        return json({ jornadas: results });
+      }
+
+      if (path === "/api/jornadas-calendario" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede editar el calendario de jornadas" }, 403);
+        const body = await request.json();
+        const competicionesValidas = ["hypermotion", "primera_federacion", "segunda_federacion"];
+        if (!competicionesValidas.includes(body.competicion)) return json({ error: "Competición no válida" }, 400);
+        const grupo = body.grupo || null;
+        const jornada = parseInt(body.jornada, 10);
+        if (!Number.isInteger(jornada) || jornada < 1) return json({ error: "Jornada no válida" }, 400);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(body.fecha_inicio || "") || !/^\d{4}-\d{2}-\d{2}$/.test(body.fecha_fin || "")) {
+          return json({ error: "Fechas no válidas (formato YYYY-MM-DD)" }, 400);
+        }
+        if (body.fecha_fin < body.fecha_inicio) return json({ error: "La fecha fin no puede ser anterior a la fecha inicio" }, 400);
+        const { meta } = await env.DB.prepare(
+          `INSERT INTO jornadas_calendario (competicion, grupo, jornada, fecha_inicio, fecha_fin)
+           VALUES (?, ?, ?, ?, ?)`
+        ).bind(body.competicion, grupo, jornada, body.fecha_inicio, body.fecha_fin).run();
+        return json({ ok: true, id: meta.last_row_id });
+      }
+
+      const jornadaCalendarioMatch = path.match(/^\/api\/jornadas-calendario\/(\d+)$/);
+      if (jornadaCalendarioMatch && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede editar el calendario de jornadas" }, 403);
+        const id = parseInt(jornadaCalendarioMatch[1], 10);
+        const body = await request.json();
+        const competicionesValidas = ["hypermotion", "primera_federacion", "segunda_federacion"];
+        if (!competicionesValidas.includes(body.competicion)) return json({ error: "Competición no válida" }, 400);
+        const grupo = body.grupo || null;
+        const jornada = parseInt(body.jornada, 10);
+        if (!Number.isInteger(jornada) || jornada < 1) return json({ error: "Jornada no válida" }, 400);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(body.fecha_inicio || "") || !/^\d{4}-\d{2}-\d{2}$/.test(body.fecha_fin || "")) {
+          return json({ error: "Fechas no válidas (formato YYYY-MM-DD)" }, 400);
+        }
+        if (body.fecha_fin < body.fecha_inicio) return json({ error: "La fecha fin no puede ser anterior a la fecha inicio" }, 400);
+        await env.DB.prepare(
+          `UPDATE jornadas_calendario SET competicion=?, grupo=?, jornada=?, fecha_inicio=?, fecha_fin=? WHERE id=?`
+        ).bind(body.competicion, grupo, jornada, body.fecha_inicio, body.fecha_fin, id).run();
+        return json({ ok: true });
+      }
+
+      if (jornadaCalendarioMatch && method === "DELETE") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede editar el calendario de jornadas" }, 403);
+        const id = parseInt(jornadaCalendarioMatch[1], 10);
+        await env.DB.prepare("DELETE FROM jornadas_calendario WHERE id = ?").bind(id).run();
+        return json({ ok: true });
+      }
+
+      if (path === "/api/jornadas-calendario/recalcular" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede recalcular jornadas" }, 403);
+
+        const { results: partidos } = await env.DB.prepare(
+          `SELECT id, competicion, grupo, fecha_partido, jornada FROM results WHERE fuente = 'auto_api_football'`
+        ).all();
+
+        let actualizados = 0;
+        for (const partido of partidos) {
+          const fecha = (partido.fecha_partido || "").slice(0, 10);
+          if (!fecha) continue;
+          const fila = await env.DB.prepare(
+            `SELECT jornada FROM jornadas_calendario
+             WHERE competicion = ? AND (grupo IS ? OR grupo = ?)
+               AND fecha_inicio <= ? AND fecha_fin >= ?
+             ORDER BY fecha_inicio DESC LIMIT 1`
+          ).bind(partido.competicion, partido.grupo, partido.grupo, fecha, fecha).first();
+          const jornadaCorrecta = fila ? fila.jornada : null;
+          if (jornadaCorrecta !== null && jornadaCorrecta !== partido.jornada) {
+            await env.DB.prepare("UPDATE results SET jornada = ? WHERE id = ?")
+              .bind(jornadaCorrecta, partido.id).run();
+            actualizados++;
+          }
+        }
+        return json({ ok: true, revisados: partidos.length, actualizados });
+      }
+
       return json({ error: "Ruta no encontrada" }, 404);
     } catch (err) {
       return json({ error: "Error del servidor", detail: err.message }, 500);

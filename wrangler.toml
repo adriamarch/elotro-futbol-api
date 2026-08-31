@@ -1,0 +1,60 @@
+# ============================================================
+# ATENCIÓN — Fase 4: este archivo NO se usa para desplegar la API
+# secundaria. Railway ejecuta `npm start` (src/server-railway.js),
+# que no lee wrangler.toml ni invoca a Wrangler en ningún momento
+# (ver server-railway.js, cabecera). Este wrangler.toml es una
+# copia heredada del worker/wrangler.toml original y se ha
+# encontrado aquí sin usar.
+#
+# Se ha desactivado explícitamente el bloque [triggers] de abajo
+# porque, si alguna vez se ejecutara `wrangler deploy` por error
+# desde este directorio, el cron de tareas de negocio (publicación
+# programada, avisos, etc.) se dispararía DOS VECES -una desde el
+# Worker principal (worker/wrangler.toml) y otra desde este-, que
+# es exactamente el riesgo de doble ejecución que ya detectó la
+# Fase 3. La Fase 4 (sección 11) prohíbe explícitamente introducir
+# un segundo disparador de tareas de negocio.
+#
+# No se ha borrado el archivo por prudencia (podría haber algún uso
+# externo no visible en este repositorio); si se confirma que no
+# hace falta, puede eliminarse sin más.
+# ============================================================
+
+name = "elotrofutbol-api"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "elotrofutbol"
+database_id = "76e6a888-9c42-42e7-a95a-46674dc502f6"
+
+# DESACTIVADO en Fase 4 — ver aviso arriba. No descomentar sin
+# confirmar antes que este wrangler.toml no coexiste con un
+# despliegue activo del worker/wrangler.toml principal.
+# [triggers]
+# crons = ["* * * * *"]
+
+# Cloudflare Workers permite subir archivos grandes, pero por defecto el
+# límite de tamaño de request en el plan gratuito es 100 MB. Si subís vídeos
+# más pesados que eso, necesitaréis el plan de pago de Workers (o subir en
+# trozos). Ver README para más detalle.
+
+# Cuenta de Cloudinary donde se guardan las fotos y vídeos que suben los
+# redactores desde "Subir contenido" (el cloud name no es un dato sensible,
+# por eso va como variable normal y no como secreto).
+[vars]
+CLOUDINARY_CLOUD_NAME = "vovompqx"
+# Remitente que verás en los avisos por email (opcional; requiere que el
+# dominio esté verificado en Resend). Si no lo pones, se usa uno genérico.
+# RESEND_FROM = "El Otro Fútbol <notificaciones@tudominio.com>"
+
+# Define los secretos con (ver README, sección "Cloudinary"):
+# wrangler secret put JWT_SECRET
+# wrangler secret put CLOUDINARY_API_KEY
+# wrangler secret put CLOUDINARY_API_SECRET
+#
+# Aviso por email a elotrofutbolmedio@gmail.com cada vez que se sube una
+# foto/vídeo o se publica una crónica/noticia. Usa Resend (resend.com,
+# tiene plan gratuito). Crea una cuenta, saca tu API key y ejecuta:
+# wrangler secret put RESEND_API_KEY

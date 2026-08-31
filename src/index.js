@@ -1278,16 +1278,20 @@ async function obtenerUltimasAlineacionesEquipo(env, equipo, excluirResultId, li
 // a rangos razonables y no deja pasar campos inesperados.
 function normalizarJugadoresAlineacion(raw) {
   if (!Array.isArray(raw)) return [];
+  let capitanAsignado = false;
   return raw
     .map((j) => {
       if (!j || typeof j !== "object") return null;
       const nombre = typeof j.nombre === "string" ? j.nombre.trim() : "";
       if (!nombre) return null;
       const titular = j.titular !== false;
+      const esCapitan = j.capitan === true && !capitanAsignado;
+      if (esCapitan) capitanAsignado = true;
       const jugador = {
         nombre,
         dorsal: Number.isFinite(parseInt(j.dorsal, 10)) ? parseInt(j.dorsal, 10) : null,
         titular,
+        capitan: esCapitan,
       };
       if (titular) {
         jugador.x = Math.max(0, Math.min(100, Number.isFinite(+j.x) ? +j.x : 50));
@@ -5580,7 +5584,7 @@ async function handlePrimary(request, env, ctx) {
         const payload = await requireAuth(request, env, url);
         if (!payload || payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las analíticas" }, 403);
 
-        const diasPermitidos = [7, 28, 90, 365];
+        const diasPermitidos = [1, 7, 28, 90, 365];
         let dias = parseInt(url.searchParams.get("dias") || "28", 10);
         if (!diasPermitidos.includes(dias)) dias = 28;
         const desde = `datetime('now', '-${dias} days')`;

@@ -71,6 +71,45 @@ if (!process.env.JWT_SECRET) {
   process.exit(1);
 }
 
+// ================================================================
+// PREVENCIÓN: no servir datos viejos en silencio durante un failover
+// ================================================================
+// checkSyncFreshness() ya existía para /api/health, pero nadie lo veía
+// mientras el failover estaba en marcha de verdad -- solo se consultaba
+// a mano. Esto lo expone en TODA respuesta servida durante un failover
+// real (X-Failover-Origin: worker-primary), como cabecera
+// X-Data-Staleness-Ms, para que el frontend (o el propio admin mirando
+// las devtools) pueda ver "estos datos llevan X tiempo sin
+// sincronizarse" en vez de asumir que son actuales en silencio.
+//
+// Se cachea en memoria (proceso de Railway) unos segundos: consultar
+// sync_cursor es una lectura a Postgres, que es justo la base de datos
+// que ya está bajo más carga durante un failover, así que no conviene
+// hacerlo en cada petición.
+let cacheFrescura = { valor: null, comprobadoEn: 0 };
+const TTL_CACHE_FRESCURA_MS = 15_000;
+
+async function frescuraConCache() {
+  const ahora = Date.now();
+  if (cacheFrescura.valor && ahora - cacheFrescura.comprobadoEn < TTL_CACHE_FRESCURA_MS) {
+    // Se ajusta staleForMs con el tiempo transcurrido desde que se
+    // cacheó, para que no se quede "congelado" en un valor viejo dentro
+    // de la propia ventana de caché.
+    const transcurrido = ahora - cacheFrescura.comprobadoEn;
+    return { ...cacheFrescura.valor, staleForMs: (cacheFrescura.valor.staleForMs ?? 0) + transcurrido };
+  }
+  const valor = await checkSyncFreshness();
+  cacheFrescura = { valor, comprobadoEn: ahora };
+  return valor;
+}
+
+// Umbral a partir del cual se considera que el failover lleva "demasiado"
+// sirviendo datos desfasados como para avisar de forma más visible (no
+// solo la cabecera pasiva): 30 minutos. Con el mecanismo de reset de D1 a
+// las 00:00 UTC, un failover normal por cuota agotada no debería superar
+// esto salvo que algo más haya ido mal (sincronizador caído, etc.).
+const UMBRAL_AVISO_STALENESS_MS = 30 * 60 * 1000;
+
 app.get("/api/health", async (c) => {
   try {
     const database = await checkPostgres();
@@ -234,6 +273,32 @@ app.all("*", async (c) => {
 
   const response = await handler.fetch(requestConWriteId, env, ctx);
 
+  // Solo en failover real (no en tráfico de prueba/curl directo a
+  // Railway) se añade la cabecera de frescura de datos: es la
+  // información que un usuario/frontend necesita para saber si lo que
+  // está viendo puede estar desactualizado mientras D1 no responde.
+  let respuestaFinal = response;
+  if (esFailoverReal) {
+    try {
+      const frescura = await frescuraConCache();
+      const headers = new Headers(response.headers);
+      headers.set("X-Data-Staleness-Ms", String(frescura.staleForMs ?? ""));
+      headers.set("X-Data-Staleness-Stale", frescura.stale ? "true" : "false");
+      if (frescura.staleForMs != null && frescura.staleForMs > UMBRAL_AVISO_STALENESS_MS) {
+        headers.set("X-Data-Staleness-Warning", "true");
+      }
+      respuestaFinal = new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    } catch (error) {
+      // No dejar que un fallo comprobando frescura tumbe la respuesta
+      // real del failover -- es información adicional, no crítica.
+      console.error("[staleness] no se pudo anotar la respuesta:", error.message);
+    }
+  }
+
   if (candidataAEncolar && response.status < 500) {
     // Solo se encola si Postgres/Railway la atendió con éxito (< 500): si
     // Railway también la rechazó (validación, permisos, etc.), no hay nada
@@ -270,7 +335,7 @@ app.all("*", async (c) => {
     );
   }
 
-  return response;
+  return respuestaFinal;
 });
 
 const port = Number(process.env.PORT) || 8080;

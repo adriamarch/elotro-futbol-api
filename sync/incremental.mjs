@@ -81,7 +81,7 @@ async function hayEjecucionEnCurso(client) {
     await client.query(
       `UPDATE sync_state
        SET status = 'abandoned', finished_at = CURRENT_TIMESTAMP,
-           detail = COALESCE(detail, '{}'::jsonb) || jsonb_build_object('reason', 'stale_lock_auto_released')
+           detail = COALESCE(detail::jsonb, '{}'::jsonb) || jsonb_build_object('reason', 'stale_lock_auto_released')
        WHERE run_id = $1 AND status = 'running';`,
       [ultima.run_id]
     );

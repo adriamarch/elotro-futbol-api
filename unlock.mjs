@@ -11,7 +11,7 @@ try {
   const r = await client.query(`
     UPDATE sync_state
     SET status = 'abandoned', finished_at = CURRENT_TIMESTAMP,
-        detail = COALESCE(detail, '{}'::jsonb) || jsonb_build_object('reason', 'manual_unlock')
+        detail = COALESCE(detail::jsonb, '{}'::jsonb) || jsonb_build_object('reason', 'manual_unlock')
     WHERE status = 'running'
     RETURNING run_id, started_at;
   `);

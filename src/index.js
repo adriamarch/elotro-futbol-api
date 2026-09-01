@@ -283,9 +283,10 @@ function focoDePortada(article) {
     portada = imagenes.find((img) => img && normalizarUrlImagen(img.url) === objetivo);
   }
 
-  // 3) Si sigue sin encontrarse, se usa la primera foto del array, que
-  // es la portada por defecto según el diseño original de la tabla.
-  if (!portada) portada = imagenes[0];
+  // 3) Si sigue sin encontrarse, se usa la primera foto (no tweet) del
+  // array, que es la portada por defecto según el diseño original de la
+  // tabla.
+  if (!portada) portada = imagenes.find((img) => img && img.tipo !== "tweet");
 
   return (portada && portada.foco) || "50% 50%";
 }
@@ -298,6 +299,14 @@ function focoDePortada(article) {
 // registra el error en los logs del Worker.
 const EMAIL_NOTIFICACIONES = "elotrofutbolmedio@gmail.com";
 const SITIO_URL = "https://elotrofutbol.media";
+// Dominio de este mismo Worker (la API), distinto del sitio web
+// (SITIO_URL). Cualquier enlace que apunte a una ruta /api/... del
+// propio Worker (como la baja del boletín) tiene que usar API_URL, no
+// SITIO_URL: ese dominio sirve el frontend estático y nunca llega a
+// procesar rutas /api/..., así que un enlace construido con SITIO_URL
+// ahí simplemente no funciona (ver public/js/config.js, que es donde el
+// frontend usa este mismo dominio como API_URL).
+const API_URL = "https://api.elotrofutbol.media";
 
 function escapeHtmlEmail(str) {
   return String(str ?? "")
@@ -396,68 +405,320 @@ function emailValido(email) {
   return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
 }
 
+// Etiqueta legible de cada competición para los encabezados de sección
+// de clasificación dentro del boletín.
+function competicionLabelEmail(comp) {
+  const NOMBRES = {
+    hypermotion: "LaLiga Hypermotion",
+    primera_federacion: "Primera Federación (RFEF)",
+    segunda_federacion: "Segunda Federación (RFEF)",
+  };
+  return NOMBRES[comp] || comp;
+}
+
+// Tabla de clasificación en HTML compatible con clientes de correo
+// (nada de flexbox/grid: todo con <table> y estilos inline). Se recorta
+// a "limite" filas (el boletín es un resumen, no la clasificación
+// completa) y añade una fila indicando cuántos equipos quedan fuera.
+//
+// Los estilos inline son el fallback para clientes que ignoran
+// <style>/media queries (Outlook, Gmail app antigua...); las clases
+// (eof-*) son las que el bloque <style> de plantillaNewsletter
+// sobreescribe con prefers-color-scheme para los clientes que sí lo
+// soportan (Apple Mail, iOS/macOS Mail, Gmail en la mayoría de casos).
+function tablaClasificacionEmail(tabla, limite = 10) {
+  const visibles = tabla.slice(0, limite);
+  const filas = visibles
+    .map((f, i) => {
+      const pos = i + 1;
+      const dg = f.gf - f.gc;
+      const destacada = pos <= 3;
+      return `
+        <tr>
+          <td class="${destacada ? "eof-pos-top" : "eof-texto-suave"}" style="padding:7px 6px;font-size:12.5px;color:${destacada ? "#d1132e" : "#5a6270"};font-weight:${destacada ? "700" : "400"};border-bottom:1px solid #eef1f5;text-align:center;">${pos}</td>
+          <td class="eof-texto" style="padding:7px 6px;font-size:12.5px;color:#0c1b2e;font-weight:${destacada ? "700" : "500"};border-bottom:1px solid #eef1f5;">${escapeHtmlEmail(f.equipo)}</td>
+          <td class="eof-texto-suave" style="padding:7px 6px;font-size:12px;color:#5a6270;border-bottom:1px solid #eef1f5;text-align:center;">${f.pj}</td>
+          <td class="eof-texto-suave" style="padding:7px 6px;font-size:12px;color:#5a6270;border-bottom:1px solid #eef1f5;text-align:center;">${dg > 0 ? "+" + dg : dg}</td>
+          <td class="eof-texto" style="padding:7px 6px;font-size:13px;color:#0c1b2e;font-weight:700;border-bottom:1px solid #eef1f5;text-align:center;">${f.pts}</td>
+        </tr>`;
+    })
+    .join("");
+
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;">
+      <thead>
+        <tr>
+          <th class="eof-etiqueta" style="padding:0 6px 6px;font-size:10px;color:#9aa0ab;text-transform:uppercase;letter-spacing:.4px;text-align:center;">#</th>
+          <th class="eof-etiqueta" style="padding:0 6px 6px;font-size:10px;color:#9aa0ab;text-transform:uppercase;letter-spacing:.4px;text-align:left;">Equipo</th>
+          <th class="eof-etiqueta" style="padding:0 6px 6px;font-size:10px;color:#9aa0ab;text-transform:uppercase;letter-spacing:.4px;text-align:center;">PJ</th>
+          <th class="eof-etiqueta" style="padding:0 6px 6px;font-size:10px;color:#9aa0ab;text-transform:uppercase;letter-spacing:.4px;text-align:center;">DG</th>
+          <th class="eof-etiqueta" style="padding:0 6px 6px;font-size:10px;color:#9aa0ab;text-transform:uppercase;letter-spacing:.4px;text-align:center;">Pts</th>
+        </tr>
+      </thead>
+      <tbody>${filas}</tbody>
+    </table>
+    ${tabla.length > limite ? `<p class="eof-etiqueta" style="margin:8px 2px 0;font-size:11px;color:#9aa0ab;">+ ${tabla.length - limite} equipos más · clasificación completa en la web</p>` : ""}`;
+}
+
+// Bloque de una sección de clasificación completa (competición, con una
+// sub-tarjeta por grupo si los tiene) dentro del boletín.
+function seccionClasificacionEmail(competicion, grupos) {
+  if (!grupos.length) return "";
+  const bloquesGrupo = grupos
+    .map(({ grupo, tabla }) => `
+      <div class="eof-bloque-alt" style="background:#f7f8fa;border-radius:10px;padding:14px 14px 6px;margin-bottom:${grupo ? "12px" : "0"};">
+        ${grupo ? `<p class="eof-texto" style="margin:0 0 8px;font-size:12.5px;font-weight:700;color:#0c1b2e;">${escapeHtmlEmail(grupo)}</p>` : ""}
+        ${tablaClasificacionEmail(tabla)}
+      </div>`)
+    .join("");
+
+  return `
+    <tr>
+      <td style="padding:6px 28px 0;">
+        <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:10px;">
+          <tr><td style="width:4px;background:#d1132e;border-radius:2px;">&nbsp;</td>
+          <td style="padding-left:10px;">
+            <h3 class="eof-texto" style="margin:0;font-size:15px;color:#0c1b2e;">${escapeHtmlEmail(competicionLabelEmail(competicion))}</h3>
+          </td></tr>
+        </table>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:0 28px 26px;">
+        ${bloquesGrupo}
+      </td>
+    </tr>`;
+}
+
+// Tarjeta compacta de un resultado destacado (marcador ya finalizado).
+function resultadoDestacadoEmail(r) {
+  return `
+    <tr>
+      <td style="padding:0 0 8px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="eof-bloque-alt" style="background:#f7f8fa;border-radius:8px;">
+          <tr>
+            <td style="padding:11px 14px;">
+              <span class="eof-etiqueta" style="display:block;font-size:9.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:#9aa0ab;margin-bottom:5px;">${escapeHtmlEmail(competicionLabelEmail(r.competicion))}${r.grupo ? " · " + escapeHtmlEmail(r.grupo) : ""}</span>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td class="eof-texto" style="font-size:13.5px;color:#0c1b2e;font-weight:600;text-align:left;">${escapeHtmlEmail(r.equipo_local)}</td>
+                  <td style="font-size:15px;color:#d1132e;font-weight:800;text-align:center;white-space:nowrap;padding:0 8px;">${r.goles_local} – ${r.goles_visitante}</td>
+                  <td class="eof-texto" style="font-size:13.5px;color:#0c1b2e;font-weight:600;text-align:right;">${escapeHtmlEmail(r.equipo_visitante)}</td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>`;
+}
+
+// Tarjeta de invitación a votar una encuesta: nunca se puede votar desde
+// el propio correo (los clientes de email no admiten esa interactividad
+// de forma fiable ni segura), así que el botón siempre lleva a la web,
+// donde ya se exige sesión de lector verificada para registrar el voto.
+function encuestaEmail(p) {
+  return `
+    <tr>
+      <td style="padding:0 0 10px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="eof-bloque-encuesta" style="background:#fff7f2;border:1px solid #f7d9d9;border-radius:8px;">
+          <tr>
+            <td style="padding:14px 16px;">
+              <p class="eof-texto" style="margin:0 0 10px;font-size:13.5px;line-height:1.4;color:#0c1b2e;font-weight:600;">🗳️ ${escapeHtmlEmail(p.pregunta)}</p>
+              <a href="${SITIO_URL}/index.html#encuestas" style="display:inline-block;padding:8px 16px;border-radius:20px;background:#d1132e;color:#ffffff;text-decoration:none;font-size:11.5px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;">Votar en la web</a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>`;
+}
+
 // Plantilla propia del boletín (distinta de plantillaEmail: aquí hace
-// falta listar varias noticias con foto, no una única tarjeta de aviso).
-function plantillaNewsletter({ articulos, bajaUrl }) {
+// falta listar varias noticias con foto y varios bloques de datos —
+// clasificaciones, resultados y encuestas —, no una única tarjeta de
+// aviso).
+//
+// ---------- Modo oscuro ----------
+// El Worker no puede saber si un suscriptor concreto tiene activado el
+// modo oscuro EN LA WEB (esa elección vive en el localStorage de su
+// navegador y nunca llega al servidor), así que el correo no puede
+// replicar exactamente esa preferencia. Lo que sí es fiable y es el
+// estándar en newsletters es adaptarse al modo oscuro/claro del CLIENTE
+// DE CORREO (Apple Mail, iOS Mail, Outlook, Gmail...), que normalmente
+// seguirá el modo del sistema operativo del destinatario: se declara
+// soporte con <meta name="color-scheme"> y se sobreescriben los colores
+// con una media query "prefers-color-scheme: dark" en un <style> del
+// <head>, usando la misma paleta oscura que ya tiene la web (ver
+// [data-theme="dark"] en public/css/style.css) para que el correo y el
+// sitio se sientan coherentes. Los estilos inline se mantienen como
+// fallback para clientes que ignoran <style>/media queries (Outlook de
+// escritorio, versiones antiguas de Gmail): esos siempre verán el modo
+// claro, que es un resultado seguro y legible en cualquier caso.
+function plantillaNewsletter({ articulos, bajaUrl, clasificaciones = [], resultadosDestacados = [], encuestas = [] }) {
   const tarjetas = articulos
     .map((a) => {
       const url = urlNoticia(a.categoria, a.slug);
       const foto = a.imagen_url
-        ? `<img src="${escapeHtmlEmail(a.imagen_url)}" alt="" width="504" style="display:block;width:100%;max-width:504px;border-radius:8px 8px 0 0;">`
+        ? `<img src="${escapeHtmlEmail(a.imagen_url)}" alt="" width="504" style="display:block;width:100%;max-width:504px;border-radius:10px 10px 0 0;">`
         : "";
       return `
         <tr>
-          <td style="padding:0 0 22px;">
+          <td style="padding:0 0 20px;">
             <a href="${url}" style="text-decoration:none;">
-              ${foto}
-              <div style="padding:${foto ? "14px" : "0"} 2px 0;">
-                <span style="display:inline-block;background:#eef1f5;color:#d1132e;font-size:10.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;padding:3px 9px;border-radius:10px;margin-bottom:8px;">${escapeHtmlEmail(categoriaLabelEmail(a.categoria))}</span>
-                <h2 style="margin:0 0 4px;font-size:17px;line-height:1.35;color:#0c1b2e;font-family:Georgia,serif;">${escapeHtmlEmail(a.titulo)}</h2>
-              </div>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="eof-tarjeta" style="background:#ffffff;border:1px solid #eef1f5;border-radius:10px;overflow:hidden;">
+                ${foto ? `<tr><td>${foto}</td></tr>` : ""}
+                <tr>
+                  <td style="padding:14px 16px;">
+                    <span class="eof-etiqueta-cat" style="display:inline-block;background:#eef1f5;color:#d1132e;font-size:10.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;padding:3px 9px;border-radius:10px;margin-bottom:8px;">${escapeHtmlEmail(categoriaLabelEmail(a.categoria))}</span>
+                    <h2 class="eof-texto" style="margin:0;font-size:16.5px;line-height:1.35;color:#0c1b2e;font-family:Georgia,serif;">${escapeHtmlEmail(a.titulo)}</h2>
+                  </td>
+                </tr>
+              </table>
             </a>
           </td>
         </tr>`;
     })
     .join("");
 
+  const seccionResultados = resultadosDestacados.length
+    ? `
+    <tr>
+      <td style="padding:6px 28px 0;">
+        <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:10px;">
+          <tr><td style="width:4px;background:#d1132e;border-radius:2px;">&nbsp;</td>
+          <td style="padding-left:10px;"><h3 class="eof-texto" style="margin:0;font-size:15px;color:#0c1b2e;">Resultados destacados</h3></td></tr>
+        </table>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:0 28px 26px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${resultadosDestacados.map(resultadoDestacadoEmail).join("")}</table>
+      </td>
+    </tr>`
+    : "";
+
+  const seccionesClasificacion = clasificaciones
+    .map(({ competicion, grupos }) => seccionClasificacionEmail(competicion, grupos))
+    .join("");
+
+  const seccionEncuestas = encuestas.length
+    ? `
+    <tr>
+      <td style="padding:6px 28px 0;">
+        <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:10px;">
+          <tr><td style="width:4px;background:#d1132e;border-radius:2px;">&nbsp;</td>
+          <td style="padding-left:10px;"><h3 class="eof-texto" style="margin:0;font-size:15px;color:#0c1b2e;">Encuestas abiertas</h3></td></tr>
+        </table>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:0 28px 26px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${encuestas.map(encuestaEmail).join("")}</table>
+      </td>
+    </tr>`
+    : "";
+
   return `<!DOCTYPE html>
 <html lang="es">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#eef1f5;font-family:Arial,Helvetica,sans-serif;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f5;padding:32px 16px;">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+<style>
+  /* Fallback para clientes que sí soportan <style> pero no la media
+     query (poco frecuente, pero por si acaso): se queda en claro. */
+  .eof-fondo-pagina{background:#eef1f5;}
+  .eof-tarjeta-principal{background:#ffffff;box-shadow:0 8px 28px rgba(12,27,46,.14);}
+
+  @media (prefers-color-scheme: dark) {
+    /* Misma paleta que [data-theme="dark"] en public/css/style.css,
+       para que el correo se sienta como una extensión de la web. */
+    body, .eof-fondo-pagina{background:#11161f !important;}
+    .eof-tarjeta-principal{background:#1a2130 !important;box-shadow:0 8px 28px rgba(0,0,0,.45) !important;}
+    .eof-tarjeta{background:#1a2130 !important;border-color:#2a3242 !important;}
+    .eof-bloque-alt{background:#171d29 !important;}
+    .eof-bloque-encuesta{background:#241a1c !important;border-color:#40262b !important;}
+    .eof-texto, .eof-texto h1, .eof-texto h2, .eof-texto h3, .eof-texto p{color:#e7eaf0 !important;}
+    h1.eof-texto, h2.eof-texto, h3.eof-texto{color:#e7eaf0 !important;}
+    .eof-texto-suave{color:#9aa4b8 !important;}
+    .eof-etiqueta{color:#9aa4b8 !important;}
+    .eof-etiqueta-cat{background:#241a1c !important;}
+    .eof-pos-top{color:#ff5b73 !important;}
+    .eof-pie{background:#171d29 !important;border-top-color:#2a3242 !important;}
+    .eof-pie p, .eof-pie a{color:#7e879b !important;}
+    .eof-divisor{border-top-color:#2a3242 !important;}
+    .eof-subrayado{color:#e7eaf0 !important;}
+    /* El rojo, celeste y demás colores de marca se mantienen iguales en
+       ambos modos (igual que en la web): no se tocan aquí. */
+  }
+</style>
+</head>
+<body class="eof-fondo-pagina" style="margin:0;padding:0;background:#eef1f5;font-family:Arial,Helvetica,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="eof-fondo-pagina" style="background:#eef1f5;padding:32px 12px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 4px 18px rgba(12,27,46,.12);">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="eof-tarjeta-principal" style="max-width:560px;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 8px 28px rgba(12,27,46,.14);">
+
+          <!-- Cabecera (se mantiene igual en los dos modos: es --marino,
+               igual que la cabecera de la propia web) -->
           <tr>
-            <td style="background:#0c1b2e;padding:22px 28px;">
-              <img src="${SITIO_URL}/img/logo.png" alt="ELOTROFÚTBOLTV" height="34" style="display:block;">
+            <td style="background:linear-gradient(135deg,#0c1b2e,#132840);padding:26px 28px;">
+              <img src="${SITIO_URL}/img/logo.png" alt="ELOTROFÚTBOLTV" height="32" style="display:block;">
             </td>
           </tr>
           <tr><td style="height:4px;background:#d1132e;line-height:0;font-size:0;">&nbsp;</td></tr>
+
+          <!-- Titular -->
           <tr>
-            <td style="padding:28px 28px 6px;">
-              <h1 style="margin:0 0 4px;font-size:19px;color:#0c1b2e;">Tu resumen semanal</h1>
-              <p style="margin:0;font-size:13px;color:#5a6270;">Lo más destacado de esta semana en ELOTROFÚTBOLTV.</p>
+            <td style="padding:30px 28px 8px;">
+              <span class="eof-etiqueta-cat" style="display:inline-block;background:#fff0f0;color:#d1132e;font-size:10.5px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;padding:4px 11px;border-radius:12px;">Boletín semanal</span>
+              <h1 class="eof-texto" style="margin:14px 0 6px;font-size:22px;line-height:1.3;color:#0c1b2e;font-family:Georgia,serif;">Tu resumen de la semana</h1>
+              <p class="eof-texto-suave" style="margin:0;font-size:13.5px;color:#5a6270;">Noticias, resultados y clasificaciones de LaLiga Hypermotion, Primera y Segunda Federación.</p>
             </td>
           </tr>
+
+          <!-- Noticias -->
           <tr>
-            <td style="padding:20px 28px 0;">
+            <td style="padding:20px 28px 4px;">
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${tarjetas}</table>
             </td>
           </tr>
+
+          <tr><td style="padding:6px 28px;"><div class="eof-divisor" style="border-top:1px solid #eef1f5;">&nbsp;</div></td></tr>
+
+          <!-- Resultados destacados -->
+          ${seccionResultados}
+
+          <tr><td style="padding:0 28px;"><div class="eof-divisor" style="border-top:1px solid #eef1f5;">&nbsp;</div></td></tr>
+
+          <!-- Clasificaciones -->
           <tr>
-            <td style="padding:18px 28px 34px;">
+            <td style="padding:20px 28px 2px;">
+              <h2 class="eof-etiqueta" style="margin:0 0 2px;font-size:12px;color:#9aa0ab;text-transform:uppercase;letter-spacing:.6px;">Clasificaciones</h2>
+            </td>
+          </tr>
+          ${seccionesClasificacion}
+
+          <!-- Encuestas -->
+          ${seccionEncuestas}
+
+          <!-- CTA (el botón rojo se mantiene igual en los dos modos) -->
+          <tr>
+            <td style="padding:4px 28px 34px;">
               <table role="presentation" cellpadding="0" cellspacing="0">
                 <tr>
                   <td style="border-radius:24px;background:#d1132e;">
-                    <a href="${SITIO_URL}" style="display:inline-block;padding:12px 26px;font-family:Arial,sans-serif;font-size:13px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:#ffffff;text-decoration:none;">Ver más noticias</a>
+                    <a href="${SITIO_URL}" style="display:inline-block;padding:13px 28px;font-family:Arial,sans-serif;font-size:13px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:#ffffff;text-decoration:none;">Ver más en ELOTROFÚTBOLTV</a>
                   </td>
                 </tr>
               </table>
             </td>
           </tr>
+
+          <!-- Pie -->
           <tr>
-            <td style="padding:18px 28px;background:#f7f8fa;border-top:1px solid #eee;">
+            <td class="eof-pie" style="padding:18px 28px;background:#f7f8fa;border-top:1px solid #eee;">
               <p style="margin:0 0 6px;font-size:11.5px;color:#9aa0ab;">Recibes este correo porque te suscribiste al boletín de ELOTROFÚTBOLTV.</p>
               <p style="margin:0;font-size:11.5px;color:#9aa0ab;"><a href="${bajaUrl}" style="color:#9aa0ab;">Darme de baja</a></p>
             </td>
@@ -468,6 +729,97 @@ function plantillaNewsletter({ articulos, bajaUrl }) {
   </table>
 </body>
 </html>`;
+}
+
+// ---------- Clasificación para el boletín ----------
+// Mismo cálculo que hace el frontend en clasificacion.html (3 puntos por
+// victoria, 1 por empate, solo partidos "finalizado"; aquí no hace falta
+// contar los "en_juego" como provisionales porque el boletín es semanal,
+// no en vivo), reimplementado en el worker para poder incrustarlo como
+// tabla HTML dentro del email.
+function calcularClasificacionBoletin(partidos) {
+  const tabla = {};
+  function fila(equipo) {
+    if (!tabla[equipo]) {
+      tabla[equipo] = { equipo, pj: 0, pg: 0, pe: 0, pp: 0, gf: 0, gc: 0, pts: 0 };
+    }
+    return tabla[equipo];
+  }
+  partidos.forEach((p) => {
+    if (p.estado !== "finalizado") return;
+    if (p.goles_local === null || p.goles_local === undefined || p.goles_visitante === null || p.goles_visitante === undefined) return;
+    const local = fila(p.equipo_local);
+    const visitante = fila(p.equipo_visitante);
+    local.pj++; visitante.pj++;
+    local.gf += p.goles_local; local.gc += p.goles_visitante;
+    visitante.gf += p.goles_visitante; visitante.gc += p.goles_local;
+    if (p.goles_local > p.goles_visitante) {
+      local.pg++; local.pts += 3; visitante.pp++;
+    } else if (p.goles_local < p.goles_visitante) {
+      visitante.pg++; visitante.pts += 3; local.pp++;
+    } else {
+      local.pe++; visitante.pe++; local.pts++; visitante.pts++;
+    }
+  });
+  return Object.values(tabla).sort((a, b) => {
+    if (b.pts !== a.pts) return b.pts - a.pts;
+    const dgA = a.gf - a.gc, dgB = b.gf - b.gc;
+    if (dgB !== dgA) return dgB - dgA;
+    if (b.gf !== a.gf) return b.gf - a.gf;
+    return a.equipo.localeCompare(b.equipo, "es");
+  });
+}
+
+// Recupera, para una competición dada, la clasificación de cada grupo (o
+// una única clasificación si la competición no tiene grupos, como
+// LaLiga Hypermotion). Devuelve un array de { grupo, tabla } — "grupo"
+// es null cuando la competición es de grupo único.
+async function obtenerClasificacionesPorGrupo(env, competicion) {
+  const { results: partidos } = await env.DB.prepare(
+    "SELECT grupo, equipo_local, equipo_visitante, goles_local, goles_visitante, estado FROM results WHERE competicion = ?"
+  ).bind(competicion).all();
+
+  const gruposPresentes = [...new Set(partidos.map((p) => p.grupo).filter(Boolean))].sort((a, b) =>
+    a.localeCompare(b, "es")
+  );
+
+  if (!gruposPresentes.length) {
+    const tabla = calcularClasificacionBoletin(partidos);
+    return tabla.length ? [{ grupo: null, tabla }] : [];
+  }
+
+  return gruposPresentes
+    .map((grupo) => ({
+      grupo,
+      tabla: calcularClasificacionBoletin(partidos.filter((p) => p.grupo === grupo)),
+    }))
+    .filter((g) => g.tabla.length);
+}
+
+// Un puñado de resultados destacados de la última semana para el
+// boletín: los últimos partidos finalizados (con marcador), más
+// recientes primero, de las tres competiciones que sigue el sitio.
+async function obtenerResultadosDestacadosBoletin(env, desde) {
+  const { results } = await env.DB.prepare(
+    `SELECT competicion, grupo, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido
+     FROM results
+     WHERE estado = 'finalizado' AND fecha_partido >= ?
+       AND goles_local IS NOT NULL AND goles_visitante IS NOT NULL
+     ORDER BY fecha_partido DESC LIMIT 6`
+  ).bind(desde).all();
+  return results;
+}
+
+// Encuestas actualmente abiertas y visibles en portada, para invitar a
+// votar desde el boletín (el voto en sí exige entrar en la web con
+// sesión de lector verificada, así que aquí solo se enlaza, nunca se
+// permite votar desde el propio correo).
+async function obtenerEncuestasAbiertasBoletin(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT id, pregunta FROM polls WHERE estado = 'abierta' AND en_portada = 1
+     ORDER BY orden_portada ASC, id DESC LIMIT 3`
+  ).all();
+  return results;
 }
 
 function categoriaLabelEmail(cat) {
@@ -505,7 +857,7 @@ function urlNoticia(categoria, slug) {
 // lotes (la API de Resend admite varios destinatarios por llamada, pero
 // se agrupan en lotes moderados para no depender de un límite exacto
 // que pueda cambiar). Un fallo enviando un lote no interrumpe el resto.
-async function enviarBoletinALista(env, { destinatarios, articulos }) {
+async function enviarBoletinALista(env, { destinatarios, articulos, clasificaciones = [], resultadosDestacados = [], encuestas = [] }) {
   if (!env.RESEND_API_KEY) {
     console.log("RESEND_API_KEY no configurado: boletín semanal omitido");
     return;
@@ -519,7 +871,7 @@ async function enviarBoletinALista(env, { destinatarios, articulos }) {
     // destinatarios de una misma llamada).
     await Promise.all(
       lote.map(async (s) => {
-        const bajaUrl = `${SITIO_URL}/api/newsletter/baja?token=${encodeURIComponent(s.baja_token)}`;
+        const bajaUrl = `${API_URL}/api/newsletter/baja?token=${encodeURIComponent(s.baja_token)}`;
         try {
           const resp = await fetch("https://api.resend.com/emails", {
             method: "POST",
@@ -531,7 +883,7 @@ async function enviarBoletinALista(env, { destinatarios, articulos }) {
               from: env.RESEND_FROM || "ELOTROFÚTBOLTV <notificaciones@elotrofutbol.media>",
               to: [s.email],
               subject: "Tu resumen semanal de ELOTROFÚTBOLTV",
-              html: plantillaNewsletter({ articulos, bajaUrl }),
+              html: plantillaNewsletter({ articulos, bajaUrl, clasificaciones, resultadosDestacados, encuestas }),
             }),
           });
           if (!resp.ok) {
@@ -589,7 +941,20 @@ async function enviarBoletinSemanalSiToca(env) {
       return;
     }
 
-    await enviarBoletinALista(env, { destinatarios, articulos });
+    // Clasificación completa (por grupo cuando aplica) de las tres
+    // competiciones que sigue el sitio, resultados destacados de la
+    // semana y encuestas abiertas en portada, todo para incrustar en el
+    // boletín junto con las noticias.
+    const COMPETICIONES_BOLETIN = ["hypermotion", "primera_federacion", "segunda_federacion"];
+    const clasificaciones = [];
+    for (const competicion of COMPETICIONES_BOLETIN) {
+      const grupos = await obtenerClasificacionesPorGrupo(env, competicion);
+      if (grupos.length) clasificaciones.push({ competicion, grupos });
+    }
+    const resultadosDestacados = await obtenerResultadosDestacadosBoletin(env, desde);
+    const encuestas = await obtenerEncuestasAbiertasBoletin(env);
+
+    await enviarBoletinALista(env, { destinatarios, articulos, clasificaciones, resultadosDestacados, encuestas });
     await env.DB.prepare(
       "UPDATE newsletter_envios SET ultimo_envio_at = datetime('now') WHERE id = 1"
     ).run();
@@ -1141,6 +1506,14 @@ async function borrarDeCloudinary(env, publicId, resourceType) {
 // fotos comparten el mismo "grupo" (id de collage) y "plantilla" (2, 3 o
 // 4 fotos, con la disposición concreta dentro de esa plantilla).
 const POSICIONES_IMAGEN_VALIDAS = ["inicio", "personalizada", "medio", "final", "galeria", "collage"];
+// Los tweets incrustados en el cuerpo de la noticia usan el mismo sistema
+// de posición que las fotos ("inicio"/"personalizada"/"galeria" ya
+// definidas arriba), pero no tienen sentido en "galería final" (no son
+// una foto que mostrar en el carrusel) ni en "collage". Se guardan
+// dentro del mismo array "imagenes" (ver normalizarImagenes) marcados con
+// tipo:"tweet" para reutilizar toda la lógica de posición/párrafo ya
+// existente en vez de duplicar un sistema aparte.
+const POSICIONES_TWEET_VALIDAS = ["inicio", "personalizada", "galeria"];
 // Plantillas de collage admitidas: cuántas fotos lleva cada una. La
 // disposición visual concreta de cada plantilla la decide el CSS
 // (public/css/style.css, .collage-<plantilla>), no el backend.
@@ -1164,6 +1537,31 @@ function flashscoreUrlValido(competicion, estado, url) {
   return limpia || null;
 }
 
+// ID numérico de un tweet a partir de cualquier URL habitual de X/Twitter
+// (espejo de idTweetDesdeUrl en admin.js, para validar en el servidor
+// igual que se valida en el editor).
+function idTweetDesdeUrlServidor(url) {
+  const match = String(url || "").match(/(?:twitter\.com|x\.com)\/[^/]+\/status(?:es)?\/(\d+)/i);
+  return match ? match[1] : null;
+}
+
+// Código corto de un post/reel de Instagram a partir de su URL (espejo
+// de idInstagramDesdeUrl en admin.js).
+function idInstagramDesdeUrlServidor(url) {
+  const match = String(url || "").match(/instagram\.com\/(?:p|reel|tv)\/([^/?#]+)/i);
+  return match ? match[1] : null;
+}
+
+// Espejo de plataformaEmbedDesdeUrl en admin.js: "twitter", "instagram"
+// o null si la URL no tiene pinta de ser ninguna de las dos cosas. El
+// botón "Añadir tweet o post" del panel es único para ambas redes, así
+// que aquí también hay que aceptar y distinguir las dos igual.
+function plataformaEmbedDesdeUrlServidor(url) {
+  if (idTweetDesdeUrlServidor(url)) return "twitter";
+  if (idInstagramDesdeUrlServidor(url)) return "instagram";
+  return null;
+}
+
 function normalizarImagenes(raw) {
   if (!Array.isArray(raw)) return [];
   return raw
@@ -1171,6 +1569,18 @@ function normalizarImagenes(raw) {
       if (typeof item === "string") {
         const url = item.trim();
         return url ? { url, posicion: "galeria", foco: "50% 50%" } : null;
+      }
+      if (item && typeof item === "object" && item.tipo === "tweet" && typeof item.url === "string") {
+        const url = item.url.trim();
+        const plataforma = plataformaEmbedDesdeUrlServidor(url);
+        if (!url || !plataforma) return null;
+        const posicion = POSICIONES_TWEET_VALIDAS.includes(item.posicion) ? item.posicion : "galeria";
+        const resultado = { tipo: "tweet", url, plataforma, posicion };
+        if (posicion === "personalizada") {
+          const n = parseInt(item.trasParrafo, 10);
+          resultado.trasParrafo = Number.isFinite(n) && n > 0 ? n : 1;
+        }
+        return resultado;
       }
       if (item && typeof item === "object" && typeof item.url === "string") {
         const url = item.url.trim();
@@ -1574,9 +1984,18 @@ async function puedeEditar(env, payload, tipoEntidad, entidadId, autorId, coauto
 //   normalmente; >0 cuando se arranca tarde, ver más abajo).
 async function iniciarCronometroPartido(env, resultadoId, minutoInicial = 0) {
   const minutos = Number.isFinite(minutoInicial) && minutoInicial > 0 ? Math.floor(minutoInicial) : 0;
+  // Se limpia aviso_desatendido_mitad al (re)arrancar el partido, sea la
+  // primera vez o tras reabrirlo (estaba finalizado/retrasado/anulado y
+  // un admin lo vuelve a poner en juego). Sin este reset, un partido que
+  // ya había avisado por, digamos, la 2ª parte se quedaba con esa mitad
+  // "gastada" para siempre: si se reabría y volvía a quedarse sin cubrir
+  // en la misma mitad, revisarPartidosDesatendidos() ya no mandaba el
+  // correo (bug: "no llega el correo aunque no se esté cubriendo"). Es
+  // un partido distinto desde cero en la práctica, así que el contador
+  // de avisos también debe arrancar de cero.
   await env.DB.prepare(
     `UPDATE results SET inicio_cronometro_at = datetime('now', ?), cronometro_pausado_en = NULL,
-       ajuste_cronometro_minutos = 0, estado = 'en_juego' WHERE id = ?`
+       ajuste_cronometro_minutos = 0, estado = 'en_juego', aviso_desatendido_mitad = NULL WHERE id = ?`
   ).bind(`-${minutos} minutes`, resultadoId).run();
 }
 
@@ -1966,7 +2385,10 @@ export default {
           let listaImagenes = [];
           try {
             const adicionales = articulo.imagenes ? JSON.parse(articulo.imagenes) : [];
-            listaImagenes = [articulo.imagen_url, ...(Array.isArray(adicionales) ? adicionales : [])]
+            // Los tweets incrustados (tipo:"tweet") no son fotos: se
+            // excluyen para no meter la URL de un tweet como si fuera una
+            // imagen en el sitemap.
+            listaImagenes = [articulo.imagen_url, ...(Array.isArray(adicionales) ? adicionales.filter((v) => !(v && v.tipo === "tweet")) : [])]
               .filter(Boolean);
           } catch {
             listaImagenes = articulo.imagen_url ? [articulo.imagen_url] : [];
@@ -3678,7 +4100,34 @@ async function handlePrimary(request, env, ctx) {
         const { results } = await env.DB.prepare(
           "SELECT id, email, activo, created_at, baja_at FROM newsletter_suscriptores ORDER BY created_at DESC"
         ).all();
-        return json({ suscriptores: results });
+        // Se adjunta aquí también cuándo fue el último envío automático y
+        // cuándo tocaría el próximo (mismo criterio de "7 días desde el
+        // último" que usa enviarBoletinSemanalSiToca), para que el panel
+        // pueda mostrarlo sin necesitar un endpoint aparte. Un envío
+        // manual (POST /api/newsletter/enviar) no toca newsletter_envios
+        // a propósito, así que esta fecha es siempre la del ciclo
+        // automático semanal, no la del último envío puntual que haya
+        // hecho un admin.
+        const filaEnvio = await env.DB.prepare(
+          "SELECT ultimo_envio_at FROM newsletter_envios WHERE id = 1"
+        ).first();
+        const ultimoEnvioAt = filaEnvio && filaEnvio.ultimo_envio_at ? filaEnvio.ultimo_envio_at : null;
+        const SIETE_DIAS_MS = 7 * 24 * 60 * 60 * 1000;
+        let proximoEnvioAt = null;
+        if (ultimoEnvioAt) {
+          const ultimoMs = new Date(ultimoEnvioAt + "Z").getTime();
+          if (!isNaN(ultimoMs)) {
+            proximoEnvioAt = new Date(ultimoMs + SIETE_DIAS_MS).toISOString();
+          }
+        }
+        // Si nunca se ha registrado un envío automático, enviarBoletinSemanalSiToca()
+        // lo dispara en el siguiente pase del cron (no espera 7 días la
+        // primera vez): se refleja aquí como "ahora mismo" en vez de null.
+        return json({
+          suscriptores: results,
+          ultimo_envio_at: ultimoEnvioAt,
+          proximo_envio_at: proximoEnvioAt || (ultimoEnvioAt ? null : new Date().toISOString()),
+        });
       }
 
       if (path.match(/^\/api\/newsletter\/suscriptores\/\d+$/) && method === "DELETE") {
@@ -3688,6 +4137,81 @@ async function handlePrimary(request, env, ctx) {
         const id = Number(path.split("/").pop());
         await env.DB.prepare("DELETE FROM newsletter_suscriptores WHERE id = ?").bind(id).run();
         return json({ ok: true });
+      }
+
+      // ---------- NEWSLETTER: envío manual (solo admins) ----------
+      // Complementa el envío automático semanal (enviarBoletinSemanalSiToca,
+      // disparado desde el cron): permite a un admin forzar un envío puntual
+      // -por ejemplo tras una noticia importante, sin esperar al día que
+      // toque- y elegir a quién exactamente se le manda, en vez de siempre
+      // "a todos los activos". No toca newsletter_envios (esa tabla es solo
+      // para el cálculo de "cuándo toca" del envío automático semanal), así
+      // que un envío manual no adelanta ni retrasa el próximo boletín
+      // automático.
+      if (path === "/api/newsletter/enviar" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede enviar el boletín" }, 403);
+        const body = await request.json().catch(() => ({}));
+
+        // "suscriptor_ids" es opcional: si no se manda (o se manda vacío
+        // con "todos: true"), se envía a todos los suscriptores activos,
+        // igual que el envío automático. Si se manda una lista de ids, se
+        // envía solo a esos (deben seguir activos: no tiene sentido
+        // reactivar a alguien que se dio de baja solo por seleccionarlo).
+        let destinatarios;
+        if (Array.isArray(body.suscriptor_ids) && body.suscriptor_ids.length) {
+          const ids = body.suscriptor_ids.map((n) => parseInt(n, 10)).filter((n) => Number.isInteger(n));
+          if (!ids.length) return json({ error: "Selección de destinatarios no válida" }, 400);
+          const placeholders = ids.map(() => "?").join(",");
+          const { results } = await env.DB.prepare(
+            `SELECT email, baja_token FROM newsletter_suscriptores WHERE activo = 1 AND id IN (${placeholders})`
+          ).bind(...ids).all();
+          destinatarios = results;
+        } else {
+          const { results } = await env.DB.prepare(
+            "SELECT email, baja_token FROM newsletter_suscriptores WHERE activo = 1"
+          ).all();
+          destinatarios = results;
+        }
+        if (!destinatarios.length) {
+          return json({ error: "No hay ningún destinatario activo para esa selección" }, 400);
+        }
+
+        // Mismo criterio de contenido que el envío automático: las últimas
+        // noticias publicadas (hasta 8). Un admin que quiera mandar un
+        // boletín puntual normalmente lo hace precisamente para difundir
+        // lo último publicado, así que no hace falta un formulario aparte
+        // para elegir artículos.
+        const { results: articulos } = await env.DB.prepare(
+          `SELECT slug, titulo, categoria, imagen_url FROM articles
+           WHERE publicado = 1 ORDER BY fecha_publicacion DESC LIMIT 8`
+        ).all();
+        if (!articulos.length) {
+          return json({ error: "No hay noticias publicadas para incluir en el boletín" }, 400);
+        }
+
+        // Mismos bloques que el envío automático semanal: clasificación
+        // por competición/grupo, resultados destacados recientes (última
+        // semana) y encuestas abiertas en portada.
+        const COMPETICIONES_BOLETIN = ["hypermotion", "primera_federacion", "segunda_federacion"];
+        const clasificaciones = [];
+        for (const competicion of COMPETICIONES_BOLETIN) {
+          const grupos = await obtenerClasificacionesPorGrupo(env, competicion);
+          if (grupos.length) clasificaciones.push({ competicion, grupos });
+        }
+        const hace7dias = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().replace("T", " ").slice(0, 19);
+        const resultadosDestacados = await obtenerResultadosDestacadosBoletin(env, hace7dias);
+        const encuestas = await obtenerEncuestasAbiertasBoletin(env);
+
+        await enviarBoletinALista(env, { destinatarios, articulos, clasificaciones, resultadosDestacados, encuestas });
+
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "newsletter_envio_manual", entidad: "newsletter", entidad_id: null,
+          descripcion: `Ha enviado el boletín manualmente a ${destinatarios.length} suscriptor(es)`,
+        }));
+
+        return json({ ok: true, enviados: destinatarios.length });
       }
 
       // ---------- LECTORES (cuentas públicas, solo lectura para admins) ----------
@@ -4298,7 +4822,7 @@ async function handlePrimary(request, env, ctx) {
         // texto y su foco de recorte); la marcada como portada hace además
         // de "imagen_url", que es la que usan las tarjetas y el hero.
         const imagenes = normalizarImagenes(body.imagenes);
-        const imagenPortada = body.imagen_url || (imagenes[0] && imagenes[0].url) || null;
+        const imagenPortada = body.imagen_url || (imagenes.find((i) => i.tipo !== "tweet") || {}).url || null;
         const resultadoId = body.resultado_id ? parseInt(body.resultado_id, 10) : null;
 
         // Autor de la noticia: por defecto quien la está subiendo, pero se
@@ -4680,7 +5204,7 @@ async function handlePrimary(request, env, ctx) {
         }
 
         const imagenes = normalizarImagenes(body.imagenes);
-        const imagenPortada = body.imagen_url || (imagenes[0] && imagenes[0].url) || null;
+        const imagenPortada = body.imagen_url || (imagenes.find((i) => i.tipo !== "tweet") || {}).url || null;
         const resultadoId = body.resultado_id ? parseInt(body.resultado_id, 10) : null;
 
         // Si se ha elegido un autor en el formulario, se actualiza; si no
@@ -6032,7 +6556,11 @@ async function handlePrimary(request, env, ctx) {
         // (sin inicio_cronometro_at), así que el cronómetro no arrancaba
         // nunca aunque el backend sí lo hubiera guardado bien.
         const limitParam = parseInt(url.searchParams.get("limit"), 10);
-        const limit = Number.isInteger(limitParam) && limitParam > 0 && limitParam <= 500 ? limitParam : 100;
+        // Ver el comentario equivalente en worker/src/index.js: se sube el
+        // tope de "limit" y se ordena por fecha_partido (no por jornada)
+        // para que jornadas bajas de una competición no queden fuera del
+        // LIMIT al mezclarse con jornadas más altas de otras competiciones.
+        const limit = Number.isInteger(limitParam) && limitParam > 0 && limitParam <= 2000 ? limitParam : 100;
         let query = "SELECT * FROM results WHERE 1=1";
         const binds = [];
         if (competicion) { query += " AND competicion = ?"; binds.push(competicion); }
@@ -6042,7 +6570,7 @@ async function handlePrimary(request, env, ctx) {
           query += " AND (equipo_local = ? OR equipo_visitante = ?)";
           binds.push(club, club);
         }
-        query += ` ORDER BY jornada DESC, fecha_partido DESC LIMIT ${limit}`;
+        query += ` ORDER BY fecha_partido DESC LIMIT ${limit}`;
         const { results } = await env.DB.prepare(query).bind(...binds).all();
         // Se añade el instante del último evento (gol, tarjeta, cambio...)
         // registrado en el minuto a minuto de cada partido, para que el
@@ -6235,6 +6763,16 @@ async function handlePrimary(request, env, ctx) {
         // cronómetro arranca ya en el minuto 15.
         if (body.estado === "en_juego" && estadoAnterior?.estado !== "en_juego" && !estadoAnterior?.inicio_cronometro_at) {
           await iniciarCronometroPartido(env, id, minutosDesdeHoraProgramada(body.fecha_partido || estadoAnterior?.fecha_partido));
+        } else if (body.estado === "en_juego" && estadoAnterior?.estado !== "en_juego") {
+          // El partido ya tenía un cronómetro arrancado de una vida
+          // anterior (p. ej. estaba "colgado" o se anuló/finalizó y ahora
+          // se reabre a mano sin pasar por "Iniciar partido" de nuevo) y
+          // por eso no entra en la rama de arriba. No se toca el
+          // cronómetro en sí, pero si no se limpia aviso_desatendido_mitad
+          // aquí, el partido reabierto puede arrastrar mitades ya
+          // "gastadas" de antes y revisarPartidosDesatendidos() se queda
+          // callado aunque este nuevo tramo sí esté desatendido.
+          await env.DB.prepare("UPDATE results SET aviso_desatendido_mitad = NULL WHERE id = ?").bind(id).run();
         }
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "editar_resultado", entidad: "resultado", entidad_id: id,
@@ -6672,7 +7210,11 @@ async function handlePrimary(request, env, ctx) {
         if (body.tipo === "gol" || body.tipo === "gol_var" || body.tipo === "gol_pp") await recalcularMarcadorDesdeEventos(env, resultadoId);
         if (body.tipo === "penalti_marcado" || body.tipo === "penalti_fallado_tanda") await recalcularPenaltisDesdeEventos(env, resultadoId);
         if (body.tipo === "fin_partido") {
-          await env.DB.prepare("UPDATE results SET estado = 'finalizado' WHERE id = ?").bind(resultadoId).run();
+          // Se limpia también aquí aviso_desatendido_mitad: si este mismo
+          // partido se reabre más adelante por otra vía que no pase por
+          // iniciarCronometroPartido(), no debe arrastrar avisos de una
+          // "vida" anterior del partido.
+          await env.DB.prepare("UPDATE results SET estado = 'finalizado', aviso_desatendido_mitad = NULL WHERE id = ?").bind(resultadoId).run();
         }
         if (body.tipo === "partido_retrasado") {
           await env.DB.prepare("UPDATE results SET estado = 'retrasado' WHERE id = ?").bind(resultadoId).run();

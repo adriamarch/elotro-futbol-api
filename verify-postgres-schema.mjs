@@ -12,7 +12,8 @@ const expected = {
  alineaciones:["id","article_id","result_id","equipo","escudo_url","formacion","jugadores","autor_id","autor_nombre","created_at","updated_at"],
  comments:["id","article_id","nombre","email","texto","estado","ip","created_at","moderado_por_id","moderado_at"], club_info:["club","entrenador","estadio","fundacion","ciudad","autor_id","autor_nombre","created_at","updated_at"],
  club_info_solicitudes:["id","club","entrenador","estadio","fundacion","ciudad","solicitante_id","solicitante_nombre","estado","resuelta_por_id","resuelta_por_nombre","resuelta_at","created_at"],
- activity_log:["id","usuario_id","usuario_nombre","usuario_rol","accion","entidad","entidad_id","descripcion","detalle","ip","created_at"], nivel_historial:["id","usuario_id","usuario_nombre","nivel_anterior","nivel_nuevo","motivo","cambiado_por_id","cambiado_por_nombre","created_at"]
+ activity_log:["id","usuario_id","usuario_nombre","usuario_rol","accion","entidad","entidad_id","descripcion","detalle","ip","created_at"], nivel_historial:["id","usuario_id","usuario_nombre","nivel_anterior","nivel_nuevo","motivo","cambiado_por_id","cambiado_por_nombre","created_at"],
+newsletter_suscriptores:["id","email","baja_token","activo","created_at","baja_at"], newsletter_envios:["id","ultimo_envio_at"]
 };
 const client = new Client({connectionString: process.env.DATABASE_URL});
 await client.connect();

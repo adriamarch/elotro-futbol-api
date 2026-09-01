@@ -157,9 +157,27 @@ export const TABLES = [
     deleteDetection: false,
   },
   {
-    name: "sessions",
+    name: "newsletter_suscriptores",
     pk: ["id"],
     order: 16,
+    // No tiene updated_at. Con syncMode "authoritative" (igual que users,
+    // settings, results, comments, club_info_solicitudes, edit_requests y
+    // sessions) cada pasada relee toda la tabla de D1 y reconcilia PG por
+    // PK -altas, cambios (p.ej. activo/baja_at por una baja pública) y
+    // borrados (el botón "Eliminar" del panel, ver worker/src/index.js)
+    // quedan cubiertos sin depender de un cursor incremental real.
+    // changeStrategy/cursorColumn solo se usan aquí para registrar el
+    // cursor informativo tras cada pasada (ver sync/incremental.mjs); con
+    // created_at basta al no tener updated_at.
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true, // el panel de Newsletter permite eliminar suscriptores
+    syncMode: "authoritative", // D1 es la autoridad; el panel de admin vive en el primario
+  },
+  {
+    name: "sessions",
+    pk: ["id"],
+    order: 17,
     changeStrategy: "updated_at",
     cursorColumn: "updated_at",
     deleteDetection: true, // sesiones antiguas se podrían limpiar en el futuro

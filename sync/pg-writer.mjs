@@ -259,18 +259,20 @@ export async function reconciliarFilasPorOriginWriteId(client, table, filas, pri
 
 /**
  * Réplica exacta del desacople que hace worker/src/index.js (D1) antes de
- * borrar un usuario, más las FKs adicionales que solo existen en el schema
- * de Postgres (comments.moderado_por_id, club_info.autor_id,
- * club_info_solicitudes.*), que D1 no necesita tocar porque esas tablas no
- * son autoritativas ahí pero sí referencian users(id) en Postgres.
+ * borrar un usuario, más las FKs adicionales que existen en Postgres.
+ *
+ * IMPORTANTE: schema.sql NO refleja el esquema real de Postgres en
+ * producción. La fuente de verdad es db/migrations/001_initial_schema.sql,
+ * que añade (entre otras) las FKs activity_log.usuario_id y
+ * nivel_historial.usuario_id/cambiado_por_id — ambas tablas SÍ existen en
+ * Postgres aunque no aparezcan en schema.sql. Esto se confirmó con el error
+ * real de producción: "violates foreign key constraint
+ * fk_activity_log_usuario on table activity_log".
  *
  * Columnas nullable -> SET NULL. Columnas NOT NULL en el schema
  * (sessions.user_id, edit_requests.solicitante_id,
- * club_info_solicitudes.solicitante_id) -> DELETE de la fila, igual que D1.
- *
- * nivel_historial y activity_log no existen en el schema de Postgres
- * (existeTablaPostgres las salta en la sincronización), así que no se tocan
- * aquí: no hay FK real que romper en Postgres para esas dos.
+ * club_info_solicitudes.solicitante_id, nivel_historial.usuario_id)
+ * -> DELETE de la fila, igual que D1.
  */
 async function desacoplarUsuarioHuerfano(client, userId) {
   // SET NULL: mismas columnas que D1, más las exclusivas de Postgres.
@@ -285,12 +287,15 @@ async function desacoplarUsuarioHuerfano(client, userId) {
   await client.query('UPDATE comments SET moderado_por_id = NULL WHERE moderado_por_id = $1', [userId]);
   await client.query('UPDATE club_info SET autor_id = NULL WHERE autor_id = $1', [userId]);
   await client.query('UPDATE club_info_solicitudes SET resuelta_por_id = NULL WHERE resuelta_por_id = $1', [userId]);
+  await client.query('UPDATE activity_log SET usuario_id = NULL WHERE usuario_id = $1', [userId]);
+  await client.query('UPDATE nivel_historial SET cambiado_por_id = NULL WHERE cambiado_por_id = $1', [userId]);
 
   // DELETE: columnas NOT NULL, no se pueden dejar a NULL (igual que D1 con
   // sessions y nivel_historial).
   await client.query('DELETE FROM sessions WHERE user_id = $1', [userId]);
   await client.query('DELETE FROM edit_requests WHERE solicitante_id = $1', [userId]);
   await client.query('DELETE FROM club_info_solicitudes WHERE solicitante_id = $1', [userId]);
+  await client.query('DELETE FROM nivel_historial WHERE usuario_id = $1', [userId]);
 }
 
 /**

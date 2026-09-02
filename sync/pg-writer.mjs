@@ -258,6 +258,42 @@ export async function reconciliarFilasPorOriginWriteId(client, table, filas, pri
 }
 
 /**
+ * Réplica exacta del desacople que hace worker/src/index.js (D1) antes de
+ * borrar un usuario, más las FKs adicionales que solo existen en el schema
+ * de Postgres (comments.moderado_por_id, club_info.autor_id,
+ * club_info_solicitudes.*), que D1 no necesita tocar porque esas tablas no
+ * son autoritativas ahí pero sí referencian users(id) en Postgres.
+ *
+ * Columnas nullable -> SET NULL. Columnas NOT NULL en el schema
+ * (sessions.user_id, edit_requests.solicitante_id,
+ * club_info_solicitudes.solicitante_id) -> DELETE de la fila, igual que D1.
+ *
+ * nivel_historial y activity_log no existen en el schema de Postgres
+ * (existeTablaPostgres las salta en la sincronización), así que no se tocan
+ * aquí: no hay FK real que romper en Postgres para esas dos.
+ */
+async function desacoplarUsuarioHuerfano(client, userId) {
+  // SET NULL: mismas columnas que D1, más las exclusivas de Postgres.
+  await client.query('UPDATE articles SET autor_id = NULL WHERE autor_id = $1', [userId]);
+  await client.query('UPDATE articles SET coautor_id = NULL WHERE coautor_id = $1', [userId]);
+  await client.query('UPDATE media SET autor_id = NULL WHERE autor_id = $1', [userId]);
+  await client.query('UPDATE results SET autor_id = NULL WHERE autor_id = $1', [userId]);
+  await client.query('UPDATE custom_clubs SET autor_id = NULL WHERE autor_id = $1', [userId]);
+  await client.query('UPDATE edit_requests SET autor_id = NULL WHERE autor_id = $1', [userId]);
+  await client.query('UPDATE edit_requests SET resuelta_por_id = NULL WHERE resuelta_por_id = $1', [userId]);
+  await client.query('UPDATE alineaciones SET autor_id = NULL WHERE autor_id = $1', [userId]);
+  await client.query('UPDATE comments SET moderado_por_id = NULL WHERE moderado_por_id = $1', [userId]);
+  await client.query('UPDATE club_info SET autor_id = NULL WHERE autor_id = $1', [userId]);
+  await client.query('UPDATE club_info_solicitudes SET resuelta_por_id = NULL WHERE resuelta_por_id = $1', [userId]);
+
+  // DELETE: columnas NOT NULL, no se pueden dejar a NULL (igual que D1 con
+  // sessions y nivel_historial).
+  await client.query('DELETE FROM sessions WHERE user_id = $1', [userId]);
+  await client.query('DELETE FROM edit_requests WHERE solicitante_id = $1', [userId]);
+  await client.query('DELETE FROM club_info_solicitudes WHERE solicitante_id = $1', [userId]);
+}
+
+/**
  * Reconciliación autoritativa D1 -> PostgreSQL.
  *
  * Se usa en tablas pequeñas/sensibles donde PostgreSQL debe quedar como una
@@ -295,6 +331,14 @@ export async function reconciliarTablaAutoritativa(client, table, filasD1, colum
     for (const rowPG of filasPG) {
       const key = primaryKeys.map((c) => String(rowPG[c])).join("\u0000");
       if (!mapaD1.has(key)) {
+        // Antes de borrar un usuario huérfano hay que desacoplar todas las
+        // FKs que apuntan a users(id) en Postgres, si no el DELETE falla
+        // por violación de clave foránea y toda la reconciliación hace
+        // rollback (el bug reportado: un usuario huérfano bloqueaba el
+        // borrado de TODOS los huérfanos de ese lote).
+        if (table === "users") {
+          await desacoplarUsuarioHuerfano(client, rowPG.id);
+        }
         const values = primaryKeys.map((c) => rowPG[c]);
         const eliminado = await eliminarFila(client, table, primaryKeys, values);
         if (eliminado) deleted++;

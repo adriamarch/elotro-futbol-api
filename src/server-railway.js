@@ -17,6 +17,7 @@ import crypto from "node:crypto";
 import handler from "./index.js";
 import { createD1CompatDb, checkPostgres, checkSyncFreshness, pool } from "./postgres-db.js";
 import { debeEncolarse, encolarEscritura, contarPendientes } from "./pending-writes.js";
+import { ejecutarMigraciones } from "../scripts/migrate.mjs";
 
 const app = new Hono();
 app.use(
@@ -344,6 +345,26 @@ const port = Number(process.env.PORT) || 8080;
 // 0.0.0.0. Si se escucha en localhost/127.0.0.1 (comportamiento por
 // defecto de @hono/node-server), el proceso arranca y pasa el healthcheck
 // interno, pero el dominio público nunca llega a conectar.
+//
+// Antes de abrir el puerto, aplicamos las migraciones pendientes de
+// db/migrations/ (ver scripts/migrate.mjs). Es idempotente -- lleva un
+// registro en schema_migrations y salta las ya aplicadas -- así que es
+// seguro que corra en cada arranque/deploy. Esto evita el bug de
+// 2026-09 en el que faltaba newsletter_envios en Postgres porque nadie
+// había ejecutado `npm run db:migrate` manualmente tras crear la
+// migración 009.
+try {
+  await ejecutarMigraciones();
+} catch (error) {
+  console.error(
+    "[worker-secondary] ERROR aplicando migraciones al arrancar:",
+    error.message
+  );
+  // No frenamos el arranque: preferimos servir con el esquema que haya
+  // (y que el resto de endpoints sigan funcionando) antes que dejar el
+  // servicio completamente caído por un problema de migraciones.
+}
+
 serve({
   fetch: app.fetch,
   port,

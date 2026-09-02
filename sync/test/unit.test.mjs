@@ -5,7 +5,7 @@ import { conReintentos } from "../retry.mjs";
 import { escaparValorD1 } from "../d1-client.mjs";
 import { CAMPOS_VOLATILES_COMPARADOR } from "../comparator-config.mjs";
 
-test("las 16 tablas del documento de Fase 4 están configuradas", () => {
+test("las 17 tablas del documento de Fase 4 están configuradas", () => {
   const nombres = TABLES.map((t) => t.name).sort();
   const esperadas = [
     "activity_log",
@@ -19,6 +19,7 @@ test("las 16 tablas del documento de Fase 4 están configuradas", () => {
     "edit_requests",
     "match_events",
     "media",
+    "newsletter_suscriptores",
     "nivel_historial",
     "results",
     "sessions",

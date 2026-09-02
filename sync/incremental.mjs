@@ -158,13 +158,32 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
         detalle.errors.push(`${reconciliacionWriteId.conflictos.length} conflicto(s) de origin_write_id sin resolver, ver sync_write_id_conflicts.`);
       }
 
-      const resultado = await conReintentos(
-        () => reconciliarTablaAutoritativa(client, name, filasD1, columnasUtilizables, pk),
-        {
-          onRetry: ({ intento, error }) =>
-            console.warn(`[${name}] reintento reconciliación autoritativa (${intento}): ${error.message}`),
-        }
-      );
+      // Nota: sin conReintentos aquí a propósito. reconciliarTablaAutoritativa
+      // ya no es una única transacción (ver pg-writer.mjs): hace commit por
+      // lote/fila conforme avanza, así que si lanza un error las filas
+      // buenas YA quedaron persistidas. Reintentar la llamada completa
+      // volvería a procesar de cero todas las filas (inofensivo por ser
+      // upsert idempotente, pero redundante); en vez de eso se deja que
+      // sean las filas realmente problemáticas -reportadas en el error- las
+      // que se reintenten solas en la siguiente pasada del scheduler.
+      let resultado;
+      try {
+        resultado = await reconciliarTablaAutoritativa(client, name, filasD1, columnasUtilizables, pk);
+      } catch (error) {
+        // Progreso parcial: las filas sin error ya se confirmaron en PG
+        // (commits por lote/fila), así que sí se reportan aquí -a
+        // diferencia de antes, cuando toda la transacción hacía ROLLBACK y
+        // el resumen se ponía a 0 aunque el trabajo se hubiera hecho.
+        const parcial = error.parcial || { inserted: 0, updated: 0, deleted: 0 };
+        detalle.inserted += parcial.inserted;
+        detalle.updated += parcial.updated;
+        detalle.deleted += parcial.deleted;
+        detalle.errors.push(`Reconciliación autoritativa: ${error.message}`);
+        console.error(`[${name}] ERROR en reconciliación autoritativa (progreso parcial insertados=${parcial.inserted} actualizados=${parcial.updated} borrados=${parcial.deleted}): ${error.message}`);
+        console.log(`[${name}] fin: insertados=${detalle.inserted} actualizados=${detalle.updated} borrados=${detalle.deleted} errores=${detalle.errors.length}`);
+        return detalle;
+      }
+
       detalle.inserted += resultado.inserted;
       detalle.updated += resultado.updated;
       detalle.deleted += resultado.deleted;
@@ -179,16 +198,9 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
 
       return detalle;
     } catch (error) {
-      // La transacción de reconciliarTablaAutoritativa hace ROLLBACK ante
-      // cualquier error (ver pg-writer.mjs), así que inserted/updated/deleted
-      // acumulados hasta ese punto no llegaron a persistirse: se reportan en
-      // 0 aquí para no mostrar en el resumen cifras que nunca se guardaron.
-      detalle.inserted = 0;
-      detalle.updated = 0;
-      detalle.deleted = 0;
       detalle.errors.push(`Reconciliación autoritativa: ${error.message}`);
       console.error(`[${name}] ERROR en reconciliación autoritativa: ${error.message}`);
-      console.log(`[${name}] fin: insertados=${detalle.inserted} actualizados=${detalle.updated} borrados=${detalle.deleted}`);
+      console.log(`[${name}] fin: insertados=${detalle.inserted} actualizados=${detalle.updated} borrados=${detalle.deleted} errores=${detalle.errors.length}`);
       return detalle;
     }
   }

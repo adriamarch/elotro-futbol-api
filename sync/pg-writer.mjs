@@ -341,26 +341,60 @@ export async function reconciliarTablaAutoritativa(client, table, filasD1, colum
   let inserted = 0;
   let updated = 0;
   let deleted = 0;
+  const errores = [];
 
-  await client.query("BEGIN");
-  try {
-    const TAMANO_LOTE = 250;
-    for (let i = 0; i < filasD1.length; i += TAMANO_LOTE) {
-      const lote = filasD1.slice(i, i + TAMANO_LOTE);
+  // FASE: upsert de todas las filas de D1. Se hace en su propia transacción
+  // por lotes: si un lote entero falla (p.ej. un valor inválido en una fila),
+  // se reintenta fila a fila para no perder las 249 filas buenas del lote por
+  // culpa de una sola -mismo patrón que ya usa el modo incremental en
+  // sincronizarTabla/upsertFilasLote más abajo en incremental.mjs-.
+  const TAMANO_LOTE = 250;
+  for (let i = 0; i < filasD1.length; i += TAMANO_LOTE) {
+    const lote = filasD1.slice(i, i + TAMANO_LOTE);
+    await client.query("BEGIN");
+    try {
       const resultado = await upsertFilasLote(client, table, lote, columnas, primaryKeys);
+      await client.query("COMMIT");
       inserted += resultado.inserted;
       updated += resultado.updated;
+    } catch (loteError) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.warn(`[${table}] lote autoritativo ${i + 1}-${i + lote.length} falló; reintentando fila a fila: ${loteError.message}`);
+      for (const row of lote) {
+        await client.query("BEGIN");
+        try {
+          const resultado = await upsertFila(client, table, row, columnas, primaryKeys, { onConflictAction: "update" });
+          await client.query("COMMIT");
+          if (resultado === "inserted") inserted++;
+          else if (resultado === "updated") updated++;
+        } catch (filaError) {
+          await client.query("ROLLBACK").catch(() => {});
+          const key = primaryKeys.map((c) => String(row[c])).join("\u0000");
+          errores.push(`Fila ${key}: ${filaError.message}`);
+          console.error(`[${table}] error definitivo en fila autoritativa ${key}:`, filaError.message);
+        }
+      }
     }
+  }
 
-    const filasPG = await obtenerIdsPostgres(client, table, primaryKeys);
-    for (const rowPG of filasPG) {
-      const key = primaryKeys.map((c) => String(rowPG[c])).join("\u0000");
-      if (!mapaD1.has(key)) {
-        // Antes de borrar un usuario huérfano hay que desacoplar todas las
-        // FKs que apuntan a users(id) en Postgres, si no el DELETE falla
-        // por violación de clave foránea y toda la reconciliación hace
-        // rollback (el bug reportado: un usuario huérfano bloqueaba el
-        // borrado de TODOS los huérfanos de ese lote).
+  // FASE: borrado de huérfanos (existen en Postgres pero ya no en D1). Cada
+  // borrado va en su propia transacción para que un huérfano problemático
+  // (una FK no contemplada por desacoplarUsuarioHuerfano/
+  // desacoplarResultadoHuerfano, o cualquier otro error inesperado) se
+  // registre y se salte, en vez de hacer ROLLBACK de todos los borrados ya
+  // resueltos en la misma pasada -era exactamente el bug reportado con
+  // "results": un huérfano bloqueaba la reconciliación entera, arrastrando
+  // en cascada a articles/comments/match_events/alineaciones vía
+  // DEPENDENCIAS_FK, pasada tras pasada, indefinidamente.
+  const filasPG = await obtenerIdsPostgres(client, table, primaryKeys);
+  for (const rowPG of filasPG) {
+    const key = primaryKeys.map((c) => String(rowPG[c])).join("\u0000");
+    if (!mapaD1.has(key)) {
+      await client.query("BEGIN");
+      try {
+        // Antes de borrar una fila huérfana hay que desacoplar todas las FKs
+        // que apuntan a ella en Postgres, si no el DELETE falla por
+        // violación de clave foránea.
         if (table === "users") {
           await desacoplarUsuarioHuerfano(client, rowPG.id);
         } else if (table === "results") {
@@ -368,14 +402,22 @@ export async function reconciliarTablaAutoritativa(client, table, filasD1, colum
         }
         const values = primaryKeys.map((c) => rowPG[c]);
         const eliminado = await eliminarFila(client, table, primaryKeys, values);
+        await client.query("COMMIT");
         if (eliminado) deleted++;
+      } catch (deleteError) {
+        await client.query("ROLLBACK").catch(() => {});
+        errores.push(`Borrado huérfano ${key}: ${deleteError.message}`);
+        console.error(`[${table}] no se pudo borrar el huérfano ${key}:`, deleteError.message);
       }
     }
+  }
 
-    await client.query("COMMIT");
-    return { inserted, updated, deleted };
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
+  if (errores.length > 0) {
+    const error = new Error(`${errores.length} fila(s) con error en reconciliación autoritativa: ${errores.slice(0, 5).join(" | ")}${errores.length > 5 ? " | ..." : ""}`);
+    error.filasConError = errores;
+    error.parcial = { inserted, updated, deleted };
     throw error;
   }
+
+  return { inserted, updated, deleted };
 }

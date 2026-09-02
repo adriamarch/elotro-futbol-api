@@ -274,6 +274,26 @@ export async function reconciliarFilasPorOriginWriteId(client, table, filas, pri
  * club_info_solicitudes.solicitante_id, nivel_historial.usuario_id)
  * -> DELETE de la fila, igual que D1.
  */
+/**
+ * Desacopla las FKs que apuntan a results(id) antes de borrar un resultado
+ * huérfano (existe en Postgres pero ya no en D1).
+ *
+ * match_events.resultado_id y alineaciones.result_id son ON DELETE CASCADE
+ * (001_initial_schema.sql), así que esas dos se borran solas sin ayuda.
+ * Pero articles.resultado_id es una FK simple, SIN ON DELETE CASCADE/SET
+ * NULL -es un enlace opcional "crónica -> marcador", no una relación de
+ * propiedad-, así que el DELETE de results falla con
+ * "articles_resultado_id_fk" en cuanto hay un artículo enlazado a un
+ * resultado que D1 ya borró. Al fallar dentro de la transacción de
+ * reconciliarTablaAutoritativa, TODA la pasada de "results" hace ROLLBACK
+ * -no solo esa fila-, lo que además bloquea articles/match_events/
+ * alineaciones/comments en cascada por DEPENDENCIAS_FK (tables.mjs) en
+ * todas las pasadas siguientes, indefinidamente.
+ */
+async function desacoplarResultadoHuerfano(client, resultId) {
+  await client.query('UPDATE articles SET resultado_id = NULL WHERE resultado_id = $1', [resultId]);
+}
+
 async function desacoplarUsuarioHuerfano(client, userId) {
   // SET NULL: mismas columnas que D1, más las exclusivas de Postgres.
   await client.query('UPDATE articles SET autor_id = NULL WHERE autor_id = $1', [userId]);
@@ -343,6 +363,8 @@ export async function reconciliarTablaAutoritativa(client, table, filasD1, colum
         // borrado de TODOS los huérfanos de ese lote).
         if (table === "users") {
           await desacoplarUsuarioHuerfano(client, rowPG.id);
+        } else if (table === "results") {
+          await desacoplarResultadoHuerfano(client, rowPG.id);
         }
         const values = primaryKeys.map((c) => rowPG[c]);
         const eliminado = await eliminarFila(client, table, primaryKeys, values);

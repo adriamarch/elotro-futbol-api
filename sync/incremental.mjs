@@ -35,7 +35,7 @@
 import { pathToFileURL } from "node:url";
 import pg from "pg";
 import { ejecutarD1, escaparValorD1 } from "./d1-client.mjs";
-import { TABLES_IN_ORDER } from "./tables.mjs";
+import { TABLES_IN_ORDER, DEPENDENCIAS_FK } from "./tables.mjs";
 import {
   obtenerColumnasPostgres,
   existeTablaPostgres,
@@ -316,11 +316,37 @@ export async function ejecutarSincronizacionIncremental() {
 
     const detallesPorTabla = [];
     const resumen = { processed: 0, inserted: 0, updated: 0, deleted: 0, errors: 0 };
+    // Nombres de tabla que fallaron en esta pasada (para poder saltar a sus
+    // tablas hijas, ver DEPENDENCIAS_FK en tables.mjs).
+    const tablasConError = new Set();
 
     for (let indice = 0; indice < TABLES_IN_ORDER.length; indice++) {
       const tableConfig = TABLES_IN_ORDER[indice];
       console.log(`\n===== TABLA ${indice + 1}/${TABLES_IN_ORDER.length}: ${tableConfig.name} =====`);
-      const detalle = await sincronizarTabla(client, tableConfig, { runId });
+
+      const padresConError = (DEPENDENCIAS_FK[tableConfig.name] || []).filter((p) =>
+        tablasConError.has(p)
+      );
+
+      let detalle;
+      if (padresConError.length > 0) {
+        // No intentamos sincronizar esta tabla: su(s) tabla(s) padre
+        // fallaron en esta misma pasada, así que Postgres puede no tener
+        // todavía los IDs que esta tabla referencia por FK. Mejor
+        // posponerla a la siguiente pasada (sus cursores no avanzan, así
+        // que no se pierde nada) que dejarla romperse fila a fila contra
+        // la constraint.
+        const motivo = `Omitida en esta pasada: depende de ${padresConError.join(", ")}, que falló al sincronizar.`;
+        console.warn(`[${tableConfig.name}] ${motivo}`);
+        detalle = { table: tableConfig.name, inserted: 0, updated: 0, deleted: 0, errors: [motivo], skipped: true };
+      } else {
+        detalle = await sincronizarTabla(client, tableConfig, { runId });
+      }
+
+      if (detalle.errors.length > 0) {
+        tablasConError.add(tableConfig.name);
+      }
+
       detallesPorTabla.push(detalle);
       resumen.processed += detalle.inserted + detalle.updated + detalle.deleted;
       resumen.inserted += detalle.inserted;

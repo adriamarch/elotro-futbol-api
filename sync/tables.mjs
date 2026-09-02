@@ -192,3 +192,19 @@ export function getTable(name) {
 }
 
 export const TABLES_IN_ORDER = [...TABLES].sort((a, b) => a.order - b.order);
+
+// Dependencias de FK relevantes para la sincronización: si la tabla padre
+// falla al leer/reconciliar D1 en una pasada, la tabla hija NO debe
+// intentarse en esa misma pasada, porque podría insertar filas que
+// referencian IDs que Postgres todavía no tiene (viola la FK) — es lo que
+// causó los errores de "match_events_resultado_id_fkey" cuando "results"
+// falló por un problema de autenticación de Wrangler/D1 y el bucle
+// principal siguió adelante igualmente.
+// Formato: nombre de tabla hija -> lista de tablas padre de las que depende.
+export const DEPENDENCIAS_FK = {
+  articles: ["users", "results"],
+  match_events: ["results"],
+  alineaciones: ["results"],
+  article_slug_redirects: ["articles"],
+  comments: ["articles", "users"],
+};

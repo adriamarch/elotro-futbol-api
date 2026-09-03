@@ -154,6 +154,12 @@ CREATE TABLE results (
   -- se le apruebe una solicitud de edición (ver tabla edit_requests).
   autor_id INTEGER,
   autor_nombre TEXT,
+  -- 'redaccion' (creado por un redactor) o 'auto_api_football' (relleno
+  -- automático de un partido que nadie cubre; ver
+  -- worker/migracion_relleno_automatico.sql y db/migrations/010_relleno_automatico.sql).
+  -- external_id es el id del partido en la API externa.
+  fuente TEXT NOT NULL DEFAULT 'redaccion',
+  external_id TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   -- Instante (UTC) en que se pulsó "Iniciar partido" en el panel de
   -- Minuto a Minuto; sirve para calcular el cronómetro en vivo. NULL si
@@ -312,6 +318,14 @@ CREATE INDEX idx_reader_sessions_reader ON reader_sessions(reader_id);
 
 CREATE INDEX idx_articles_categoria ON articles(categoria);
 CREATE INDEX idx_articles_publicado ON articles(publicado, fecha_publicacion);
+CREATE INDEX idx_articles_autor_publicado ON articles(autor_id, publicado);
+CREATE INDEX idx_articles_coautor_publicado ON articles(coautor_id, publicado);
+CREATE INDEX idx_articles_fecha_publicacion ON articles(fecha_publicacion DESC);
+CREATE INDEX idx_articles_categoria_fecha ON articles(categoria, fecha_publicacion DESC);
+CREATE INDEX idx_articles_club_fecha ON articles(club, fecha_publicacion DESC);
+CREATE INDEX idx_articles_tipo_fecha ON articles(tipo, fecha_publicacion DESC);
+CREATE INDEX idx_articles_autor_fecha ON articles(autor_id, fecha_publicacion DESC);
+CREATE INDEX idx_articles_autor_nombre ON articles(autor_nombre);
 CREATE INDEX idx_results_competicion ON results(competicion, jornada);
 
 -- Clubes "personalizados": equipos añadidos a mano desde "Otro equipo

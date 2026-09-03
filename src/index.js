@@ -1866,6 +1866,36 @@ async function contarPublicacionesPorTipo(env, autorId) {
   return conteo;
 }
 
+// Igual que contarPublicacionesPorTipo, pero para VARIOS autores a la
+// vez con una sola consulta (en vez de una por usuario). La usa
+// GET /api/users para no lanzar una query por cada fila de la tabla de
+// usuarios del panel.
+//
+// UNION ALL en vez de "WHERE autor_id IN (...) OR coautor_id IN (...)":
+// así cada mitad puede usar su propio índice (idx_articles_autor_publicado
+// / idx_articles_coautor_publicado) en vez de forzar un escaneo completo
+// por culpa del OR.
+async function contarPublicacionesPorTipoDeVarios(env, autorIds) {
+  const idsUnicos = [...new Set(autorIds.filter((id) => id != null))];
+  const conteos = new Map(idsUnicos.map((id) => [id, { noticia: 0, cronica: 0, opinion: 0, entrevista: 0 }]));
+  if (idsUnicos.length === 0) return conteos;
+  const placeholders = idsUnicos.map(() => "?").join(",");
+  const { results } = await env.DB.prepare(
+    `SELECT autor_id AS id, tipo, COUNT(*) AS total FROM articles
+     WHERE autor_id IN (${placeholders}) AND publicado = 1
+     GROUP BY autor_id, tipo
+     UNION ALL
+     SELECT coautor_id AS id, tipo, COUNT(*) AS total FROM articles
+     WHERE coautor_id IN (${placeholders}) AND publicado = 1
+     GROUP BY coautor_id, tipo`
+  ).bind(...idsUnicos, ...idsUnicos).all();
+  for (const fila of results) {
+    const conteo = conteos.get(fila.id);
+    if (conteo && conteo[fila.tipo] !== undefined) conteo[fila.tipo] += fila.total;
+  }
+  return conteos;
+}
+
 // Dado el conteo actual de publicaciones, calcula el detalle de
 // progreso hacia un nivel concreto (cuánto lleva y cuánto le falta de
 // cada tipo) y si ya cumple todas las cifras mínimas.
@@ -1886,7 +1916,7 @@ function calcularProgresoNivel(conteo, requisitos) {
 // condiciones de que un admin lo evalúe para el ascenso.
 const NIVEL_MAXIMO = 4;
 
-async function construirProgresoNivel(env, usuario) {
+async function construirProgresoNivel(env, usuario, conteoPrecalculado) {
   // Los admins publican directamente, revisan todo y no tienen que
   // demostrar nada con cifras: a efectos de "Mi progreso" y de la
   // tabla de Usuarios se muestran siempre en el nivel máximo, aunque
@@ -1896,7 +1926,11 @@ async function construirProgresoNivel(env, usuario) {
   // nivel": no hay ninguno por encima.
   const esAdmin = usuario.rol === "admin";
   const nivelActual = esAdmin ? NIVEL_MAXIMO : (usuario.nivel || 1);
-  const conteo = await contarPublicacionesPorTipo(env, usuario.id);
+  // Si quien llama ya calculó el conteo de varios usuarios a la vez
+  // (ver contarPublicacionesPorTipoDeVarios, usado por GET /api/users
+  // para no lanzar una query por usuario), se reutiliza en vez de
+  // volver a consultar la base de datos.
+  const conteo = conteoPrecalculado || await contarPublicacionesPorTipo(env, usuario.id);
   const siguienteNivel = !esAdmin && nivelActual < NIVEL_MAXIMO ? nivelActual + 1 : null;
   const progresoSiguiente = siguienteNivel
     ? calcularProgresoNivel(conteo, NIVELES_REQUISITOS[siguienteNivel])
@@ -4238,13 +4272,18 @@ async function handlePrimary(request, env, ctx) {
         const { results } = await env.DB.prepare(
           "SELECT id, username, nombre, rol, activo, email, equipo, avatar_url, nivel, nivel_nota, created_at FROM users ORDER BY nombre"
         ).all();
-        // El progreso de nivel se calcula por usuario (cuenta sus
-        // artículos publicados), así que se resuelve en paralelo para
-        // no encadenar N consultas una detrás de otra.
+        // El progreso de nivel de TODOS los usuarios se calcula con una
+        // sola consulta agregada (antes: una consulta por usuario,
+        // repitiendo un escaneo completo de "articles" tantas veces como
+        // usuarios hubiera listados; ver contarPublicacionesPorTipoDeVarios).
+        // Al pasarle el conteo ya calculado, construirProgresoNivel no
+        // vuelve a tocar la base de datos, así que resolver todo en
+        // paralelo aquí ya no dispara ninguna consulta extra.
+        const conteos = await contarPublicacionesPorTipoDeVarios(env, results.map((u) => u.id));
         const users = await Promise.all(results.map(async (u) => ({
           ...u,
           equipo: parsearEquipos(u.equipo),
-          progreso_nivel: await construirProgresoNivel(env, u),
+          progreso_nivel: await construirProgresoNivel(env, u, conteos.get(u.id)),
         })));
         return json({ users });
       }
@@ -4722,7 +4761,11 @@ async function handlePrimary(request, env, ctx) {
         // (noticia.html?slug=...), a qué categoría pertenece y así poder
         // hacer el 301 a la URL bonita /futbol/{categoria}/{slug}.
         const slugExacto = url.searchParams.get("slug");
-        const limit = parseInt(url.searchParams.get("limit") || "30", 10);
+        // Tope máximo de 100: sin este cap, cualquiera podía pedir
+        // ?limit=100000 y forzar un escaneo/orden gigante sobre articles
+        // (mismo criterio que el Worker principal, ver worker/src/index.js).
+        const limitPedido = parseInt(url.searchParams.get("limit") || "30", 10);
+        const limit = Number.isInteger(limitPedido) && limitPedido > 0 ? Math.min(limitPedido, 100) : 30;
         let admin = url.searchParams.get("admin") === "1";
         if (admin) {
           // La vista "admin" incluye borradores no publicados, así que
@@ -4731,7 +4774,23 @@ async function handlePrimary(request, env, ctx) {
           if (!payload) admin = false;
         }
 
-        let query = "SELECT * FROM articles WHERE 1=1";
+        // Columnas necesarias para tarjetas/listados. Se mantiene
+        // "contenido" (el resumen de portada lo usa como fallback cuando
+        // no hay subtítulo, ver public/js/main.js), pero se excluyen las
+        // 4 variantes traducidas del cuerpo completo (contenido_eu/ca/gl/
+        // en): son columnas grandes de HTML que los listados nunca
+        // muestran. Para saber qué idiomas están completos
+        // (conIdiomasDisponibles exige título Y contenido no vacíos) basta
+        // con la LONGITUD del contenido traducido, no su texto.
+        let query = `SELECT id, slug, titulo, subtitulo, contenido, tipo, categoria, club, imagen_url, imagenes,
+            resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado,
+            estado_borrador, programado_para, slug_congelado, fecha_publicacion, created_at, updated_at,
+            titulo_eu, LENGTH(contenido_eu) AS contenido_eu_len,
+            titulo_ca, LENGTH(contenido_ca) AS contenido_ca_len,
+            titulo_gl, LENGTH(contenido_gl) AS contenido_gl_len,
+            titulo_en, LENGTH(contenido_en) AS contenido_en_len,
+            ficha_tecnica
+          FROM articles WHERE 1=1`;
         const binds = [];
         if (!admin) {
           query += " AND publicado = 1";
@@ -4743,12 +4802,30 @@ async function handlePrimary(request, env, ctx) {
         if (autorId) { query += " AND autor_id = ?"; binds.push(parseInt(autorId, 10)); }
         if (destacado === "1") { query += " AND destacado = 1"; }
         if (destacado === "0") { query += " AND destacado = 0"; }
-        if (busqueda) { query += " AND (titulo LIKE ? OR contenido LIKE ?)"; binds.push(`%${busqueda}%`, `%${busqueda}%`); }
+        // Solo se busca en el título, no en "contenido" (el cuerpo entero
+        // del artículo): un LIKE '%x%' sobre una columna de texto largo no
+        // puede usar índice por el comodín inicial y provoca un full table
+        // scan leyendo el contenido completo de cada artículo. Si hace
+        // falta buscar también en el cuerpo, la solución correcta es una
+        // tabla FTS5/tsvector, no este LIKE (igual que el Worker principal).
+        if (busqueda) { query += " AND titulo LIKE ?"; binds.push(`%${busqueda}%`); }
         query += " ORDER BY fecha_publicacion DESC LIMIT ?";
         binds.push(limit);
 
         const { results } = await env.DB.prepare(query).bind(...binds).all();
-        return json({ articles: results.map(conIdiomasDisponibles) });
+        const articulosParaIdiomas = results.map((a) => ({
+          ...a,
+          contenido_eu: a.contenido_eu_len ? "x" : null,
+          contenido_ca: a.contenido_ca_len ? "x" : null,
+          contenido_gl: a.contenido_gl_len ? "x" : null,
+          contenido_en: a.contenido_en_len ? "x" : null,
+        }));
+        return json({
+          articles: articulosParaIdiomas.map((a) => {
+            const { contenido_eu_len, contenido_ca_len, contenido_gl_len, contenido_en_len, ...resto } = conIdiomasDisponibles(a);
+            return resto;
+          }),
+        });
       }
 
       if (path === "/api/articles" && method === "POST") {

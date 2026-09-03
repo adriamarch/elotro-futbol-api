@@ -115,6 +115,54 @@ export const TABLES = [
     syncMode: "authoritative", // D1 es la autoridad; evita depender de updated_at en D1 remoto
   },
   {
+    // Cuentas de lectores (login/registro público, distinto de "users").
+    // No tiene updated_at en D1: solo se modifica en sitios acotados
+    // (verificación de email, reset de contraseña, activo), así que se
+    // trata como authoritative igual que comments/club_info_solicitudes
+    // en vez de intentar un cursor con created_at, que no detectaría
+    // esos cambios.
+    name: "readers",
+    pk: ["id"],
+    order: 10.1,
+    changeStrategy: "updated_at",
+    cursorColumn: "created_at",
+    deleteDetection: true,
+    syncMode: "authoritative",
+  },
+  {
+    // Sesiones de lectores (mismo patrón que "sessions" para redactores).
+    name: "reader_sessions",
+    pk: ["id"],
+    order: 10.2,
+    changeStrategy: "updated_at",
+    cursorColumn: "last_seen_at",
+    deleteDetection: true,
+    syncMode: "authoritative",
+  },
+  {
+    // Votos (like/dislike) de comentarios. Solo-inserción en D1 (un voto
+    // se borra y reinserta, nunca se actualiza in place, según
+    // worker/src/index.js), así que "immutable" con created_at basta.
+    name: "comment_votes",
+    pk: ["id"],
+    order: 10.3,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true,
+  },
+  {
+    // Denuncias de comentarios. Igual que comment_votes salvo por
+    // "revisado", que sí se actualiza tras la creación -> authoritative
+    // para no perder esos cambios con un cursor de solo-inserción.
+    name: "comment_reports",
+    pk: ["id"],
+    order: 10.4,
+    changeStrategy: "updated_at",
+    cursorColumn: "created_at",
+    deleteDetection: true,
+    syncMode: "authoritative",
+  },
+  {
     name: "club_info",
     pk: ["club"],
     order: 11,
@@ -206,5 +254,8 @@ export const DEPENDENCIAS_FK = {
   match_events: ["results"],
   alineaciones: ["results"],
   article_slug_redirects: ["articles"],
-  comments: ["articles", "users"],
+  comments: ["articles", "users", "readers"],
+  reader_sessions: ["readers"],
+  comment_votes: ["comments"],
+  comment_reports: ["comments"],
 };

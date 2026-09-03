@@ -4823,6 +4823,13 @@ async function handlePrimary(request, env, ctx) {
         // de "imagen_url", que es la que usan las tarjetas y el hero.
         const imagenes = normalizarImagenes(body.imagenes);
         const imagenPortada = body.imagen_url || (imagenes.find((i) => i.tipo !== "tweet") || {}).url || null;
+        // Es obligatorio poner al menos una imagen de portada por noticia.
+        // Un borrador "en proceso" (todavía se está escribiendo) puede no
+        // tenerla todavía; para cualquier otro caso (publicada, programada
+        // o borrador "terminado") es obligatoria.
+        if (!imagenPortada && estadoBorrador !== "en_proceso") {
+          return json({ error: "Debes añadir al menos una imagen de portada a la noticia." }, 400);
+        }
         const resultadoId = body.resultado_id ? parseInt(body.resultado_id, 10) : null;
 
         // Autor de la noticia: por defecto quien la está subiendo, pero se
@@ -4861,10 +4868,17 @@ async function handlePrimary(request, env, ctx) {
         // publicarArticulosProgramados).
         const slugCongelado = body.publicado !== false ? 1 : 0;
 
+        // Ficha técnica del partido (solo tiene sentido para crónicas). Se
+        // manda ya normalizada desde el panel; aquí solo se guarda tal
+        // cual como JSON, o NULL si no se manda o viene vacía.
+        const fichaTecnica = (body.tipo === "cronica" && body.ficha_tecnica && Object.keys(body.ficha_tecnica).length)
+          ? JSON.stringify(body.ficha_tecnica)
+          : null;
+
         await env.DB.prepare(
           `INSERT INTO articles (slug, titulo, subtitulo, contenido, tipo, categoria, club, imagen_url, imagenes, resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado, estado_borrador, programado_para, slug_congelado, fecha_publicacion, updated_at,
-            titulo_eu, subtitulo_eu, contenido_eu, titulo_ca, subtitulo_ca, contenido_ca, titulo_gl, subtitulo_gl, contenido_gl, titulo_en, subtitulo_en, contenido_en, origin_write_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            titulo_eu, subtitulo_eu, contenido_eu, titulo_ca, subtitulo_ca, contenido_ca, titulo_gl, subtitulo_gl, contenido_gl, titulo_en, subtitulo_en, contenido_en, origin_write_id, ficha_tecnica)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           slug, body.titulo, body.subtitulo || null, body.contenido,
           body.tipo || "noticia", body.categoria || "hypermotion", body.club || null,
@@ -4876,7 +4890,7 @@ async function handlePrimary(request, env, ctx) {
           traducciones.titulo_ca, traducciones.subtitulo_ca, traducciones.contenido_ca,
           traducciones.titulo_gl, traducciones.subtitulo_gl, traducciones.contenido_gl,
           traducciones.titulo_en, traducciones.subtitulo_en, traducciones.contenido_en,
-          origenWriteId
+          origenWriteId, fichaTecnica
         ).run();
 
         const publicado = body.publicado !== false;
@@ -5122,7 +5136,7 @@ async function handlePrimary(request, env, ctx) {
         // Solo el autor (o coautor, o un admin, o alguien con una
         // solicitud de edición aprobada y vigente para esta noticia)
         // puede editarla.
-        const articuloParaPermiso = await env.DB.prepare("SELECT slug, autor_id, coautor_id, publicado, estado_borrador, fecha_publicacion, slug_congelado, resultado_id FROM articles WHERE id = ?").bind(id).first();
+        const articuloParaPermiso = await env.DB.prepare("SELECT slug, autor_id, coautor_id, publicado, estado_borrador, fecha_publicacion, slug_congelado, resultado_id, tipo, ficha_tecnica FROM articles WHERE id = ?").bind(id).first();
         if (!articuloParaPermiso) return json({ error: "Noticia no encontrada" }, 404);
         if (!(await puedeEditar(env, payload, "articulo", id, articuloParaPermiso.autor_id, articuloParaPermiso.coautor_id))) {
           return json({ error: "No puedes editar esta noticia porque no es tuya. Solicita permiso al autor o a un administrador." }, 403);
@@ -5205,6 +5219,12 @@ async function handlePrimary(request, env, ctx) {
 
         const imagenes = normalizarImagenes(body.imagenes);
         const imagenPortada = body.imagen_url || (imagenes.find((i) => i.tipo !== "tweet") || {}).url || null;
+        // Es obligatorio poner al menos una imagen de portada por noticia,
+        // igual que al crear. Un borrador "en proceso" puede seguir sin
+        // ella; para publicar, programar o marcar como "terminado" hace falta.
+        if (!imagenPortada && estadoBorrador !== "en_proceso") {
+          return json({ error: "Debes añadir al menos una imagen de portada a la noticia." }, 400);
+        }
         const resultadoId = body.resultado_id ? parseInt(body.resultado_id, 10) : null;
 
         // Si se ha elegido un autor en el formulario, se actualiza; si no
@@ -5270,9 +5290,23 @@ async function handlePrimary(request, env, ctx) {
             ? articuloParaPermiso.fecha_publicacion
             : (body.fecha_publicacion || new Date().toISOString());
 
+        // Ficha técnica del partido (solo crónicas). Igual que al crear:
+        // si se manda el campo, se guarda tal cual (o se borra si llega
+        // vacío/null); si no se manda en absoluto, se conserva la que ya
+        // hubiera.
+        const tipoFinal = body.tipo || articuloParaPermiso.tipo || "noticia";
+        let fichaTecnica = articuloParaPermiso.ficha_tecnica || null;
+        if (Object.prototype.hasOwnProperty.call(body, "ficha_tecnica")) {
+          fichaTecnica = (tipoFinal === "cronica" && body.ficha_tecnica && Object.keys(body.ficha_tecnica).length)
+            ? JSON.stringify(body.ficha_tecnica)
+            : null;
+        } else if (tipoFinal !== "cronica") {
+          fichaTecnica = null;
+        }
+
         await env.DB.prepare(
           `UPDATE articles SET slug=?, titulo=?, subtitulo=?, contenido=?, tipo=?, categoria=?, club=?, imagen_url=?, imagenes=?, resultado_id=?, autor_id=?, autor_nombre=?, coautor_id=?, coautor_nombre=?, destacado=?, publicado=?, estado_borrador=?, programado_para=?, slug_congelado=?, fecha_publicacion=?, updated_at=datetime('now'),
-            titulo_eu=?, subtitulo_eu=?, contenido_eu=?, titulo_ca=?, subtitulo_ca=?, contenido_ca=?, titulo_gl=?, subtitulo_gl=?, contenido_gl=?, titulo_en=?, subtitulo_en=?, contenido_en=?
+            titulo_eu=?, subtitulo_eu=?, contenido_eu=?, titulo_ca=?, subtitulo_ca=?, contenido_ca=?, titulo_gl=?, subtitulo_gl=?, contenido_gl=?, titulo_en=?, subtitulo_en=?, contenido_en=?, ficha_tecnica=?
            WHERE id=?`
         ).bind(
           slug, body.titulo, body.subtitulo || null, body.contenido, body.tipo || "noticia",
@@ -5285,7 +5319,7 @@ async function handlePrimary(request, env, ctx) {
           traducciones.titulo_ca, traducciones.subtitulo_ca, traducciones.contenido_ca,
           traducciones.titulo_gl, traducciones.subtitulo_gl, traducciones.contenido_gl,
           traducciones.titulo_en, traducciones.subtitulo_en, traducciones.contenido_en,
-          id
+          fichaTecnica, id
         ).run();
         await registrarRedirectSiCambia(env, id, articuloParaPermiso.slug, slug);
 

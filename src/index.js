@@ -4791,11 +4791,11 @@ async function handlePrimary(request, env, ctx) {
         // (noticia.html?slug=...), a qué categoría pertenece y así poder
         // hacer el 301 a la URL bonita /futbol/{categoria}/{slug}.
         const slugExacto = url.searchParams.get("slug");
-        // Tope máximo de 100: sin este cap, cualquiera podía pedir
+        // Tope máximo de 2000: sin este cap, cualquiera podía pedir
         // ?limit=100000 y forzar un escaneo/orden gigante sobre articles
         // (mismo criterio que el Worker principal, ver worker/src/index.js).
         const limitPedido = parseInt(url.searchParams.get("limit") || "30", 10);
-        const limit = Number.isInteger(limitPedido) && limitPedido > 0 ? Math.min(limitPedido, 100) : 30;
+        const limit = Number.isInteger(limitPedido) && limitPedido > 0 ? Math.min(limitPedido, 2000) : 30;
         let admin = url.searchParams.get("admin") === "1";
         if (admin) {
           // La vista "admin" incluye borradores no publicados, así que

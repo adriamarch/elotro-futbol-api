@@ -3444,6 +3444,36 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true });
       }
 
+      // ---------- Editar perfil propio (lector logueado): nombre + avatar ----------
+      // Falta también aquí bajo este path exacto (existía como
+      // /api/me/perfil, otra ruta): public/cuenta.html llama a
+      // /api/readers/me/perfil, y si algún día esta API atiende ese
+      // tráfico durante un failover, necesita responder igual que el
+      // Worker primario para que el drain no vuelva a fallar con 404.
+      if (path === "/api/readers/me/perfil" && method === "PUT") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const body = await request.json();
+        const nombre = normalizarTexto(body.nombre)?.trim() || "";
+        if (!nombre) return json({ error: "El nombre no puede estar vacío" }, 400);
+        const avatarUrl = typeof body.avatar_url === "string" ? body.avatar_url.trim() || null : null;
+
+        const lector = await env.DB.prepare("SELECT * FROM readers WHERE id = ? AND activo = 1").bind(payload.rid).first();
+        if (!lector) return json({ error: "Cuenta no encontrada" }, 404);
+
+        await env.DB.prepare("UPDATE readers SET nombre = ?, avatar_url = ? WHERE id = ?")
+          .bind(nombre, avatarUrl, lector.id).run();
+
+        const token = await createJWT(
+          { rid: lector.id, nombre, email: lector.email, sid: payload.sid },
+          env.JWT_SECRET
+        );
+        return json({
+          token,
+          reader: { id: lector.id, nombre, email: lector.email, email_verificado: !!lector.email_verificado, avatar_url: avatarUrl },
+        });
+      }
+
       // ---------- Recuperar contraseña de lector: paso 1 ----------
       if (path === "/api/readers/forgot-password" && method === "POST") {
         const { email } = await request.json();

@@ -12,6 +12,7 @@
     "test:railway": "node scripts/validate-railway.mjs",
     "db:sync-sequences": "node scripts/sync-identity-sequences.mjs",
     "db:migrate": "node scripts/migrate.mjs",
+    "db:backfill-usa-url-bonita": "node scripts/backfill-usa-url-bonita.mjs",
     "sync:initial": "node sync/initial-migration.mjs",
     "sync:incremental": "node sync/incremental.mjs",
     "sync:compare": "node sync/comparator.mjs",

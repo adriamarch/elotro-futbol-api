@@ -119,6 +119,41 @@ export async function contarD1(table) {
 }
 
 /**
+ * Lee SOLO una columna (normalmente la(s) del PK) de una tabla D1 completa,
+ * página a página por cursor de esa misma columna, en vez de un único
+ * "SELECT pk FROM tabla;" que trae todos los IDs de golpe.
+ *
+ * Se usa para la detección de borrados (comparar IDs D1 vs IDs Postgres):
+ * ahí no hacen falta las filas completas, solo la(s) columna(s) de PK, así
+ * que además de paginar, esto evita traer columnas de contenido (texto
+ * largo, etc.) que "SELECT pk" ya no traería, pero cuyo coste por fila en
+ * memoria de Node/JSON.parse seguía sumando en tablas con muchas filas.
+ *
+ * onPagina recibe un array de PKs (string u objeto, según pkColumns.length)
+ * de esa página; se llama antes de pedir la siguiente, así que en memoria
+ * solo hay como mucho una página de PKs.
+ */
+export async function ejecutarD1PaginadoSoloIds(table, pkColumns, onPagina, { tamanoPagina = 2000 } = {}) {
+  const cols = Array.isArray(pkColumns) ? pkColumns : [pkColumns];
+  const colOrden = cols[0]; // orden estable por la primera columna del PK
+  let ultimoValor = null;
+  let totalFilas = 0;
+  for (;;) {
+    const where = ultimoValor === null ? "" : `WHERE ${colOrden} > ${escaparValorD1(ultimoValor)} `;
+    const sql = `SELECT ${cols.join(", ")} FROM ${table} ${where}ORDER BY ${colOrden} ASC LIMIT ${tamanoPagina};`;
+    const pagina = await ejecutarD1(sql);
+    if (pagina.length === 0) break;
+
+    await onPagina(pagina);
+    totalFilas += pagina.length;
+    ultimoValor = pagina[pagina.length - 1][colOrden];
+
+    if (pagina.length < tamanoPagina) break; // última página
+  }
+  return totalFilas;
+}
+
+/**
  * Lee una tabla D1 completa página a página por cursor de PK, en vez de
  * un único "SELECT * FROM tabla;" que trae toda la tabla de golpe.
  *

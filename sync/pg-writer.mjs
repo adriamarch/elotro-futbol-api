@@ -162,6 +162,49 @@ export async function obtenerIdsPostgres(client, table, primaryKeys) {
   return result.rows;
 }
 
+/**
+ * Igual que obtenerIdsPostgres, pero entrega los IDs por páginas (cursor
+ * server-side, con FETCH) en vez de materializar el resultado entero de
+ * golpe en memoria del proceso Node. pg no soporta streaming nativo sin
+ * una librería aparte (pg-cursor/pg-query-stream), así que se usa un
+ * cursor SQL explícito (DECLARE ... CURSOR + FETCH) dentro de una
+ * transacción de solo lectura: el propio Postgres retiene el resultado
+ * completo en su lado y solo transmite una página cada vez.
+ *
+ * Necesario para tablas con muchas filas (activity_log, comments, etc.):
+ * sin esto, una tabla de varios cientos de miles de IDs se cargaba entera
+ * en el array `result.rows` -aun tratándose solo de PKs- antes de poder
+ * comparar nada, lo que en el plan free de Railway (RAM limitada) podía
+ * sumarse al resto de estructuras en memoria de esa misma pasada
+ * (idsD1/idsVistosEnD1, filasD1 de la tabla que sigue en la cola, etc.) y
+ * disparar el pico. Igual que ejecutarD1Paginado, se prefiere entregar
+ * "una página como mucho" a la vez que dejar que el llamador reduzca cada
+ * página inmediatamente (comparación contra un Set) antes de pedir la
+ * siguiente, en vez de acumular result.rows completo primero.
+ */
+export async function obtenerIdsPostgresPaginado(client, table, primaryKeys, onPagina, { tamanoPagina = 2000 } = {}) {
+  const cols = primaryKeys.map(escaparIdentificador).join(", ");
+  const nombreCursor = `cur_ids_${table}_${Math.random().toString(36).slice(2, 8)}`;
+  let totalFilas = 0;
+  await client.query("BEGIN");
+  try {
+    await client.query(`DECLARE ${nombreCursor} NO SCROLL CURSOR FOR SELECT ${cols} FROM ${escaparIdentificador(table)};`);
+    for (;;) {
+      const pagina = await client.query(`FETCH ${tamanoPagina} FROM ${nombreCursor};`);
+      if (pagina.rows.length === 0) break;
+      await onPagina(pagina.rows);
+      totalFilas += pagina.rows.length;
+      if (pagina.rows.length < tamanoPagina) break;
+    }
+    await client.query(`CLOSE ${nombreCursor};`);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  }
+  return totalFilas;
+}
+
 export { escaparIdentificador };
 
 /**

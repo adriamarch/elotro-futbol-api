@@ -34,7 +34,7 @@
 
 import { pathToFileURL } from "node:url";
 import pg from "pg";
-import { ejecutarD1, ejecutarD1Paginado, escaparValorD1 } from "./d1-client.mjs";
+import { ejecutarD1, ejecutarD1Paginado, ejecutarD1PaginadoSoloIds, escaparValorD1 } from "./d1-client.mjs";
 import { TABLES_IN_ORDER, DEPENDENCIAS_FK } from "./tables.mjs";
 import {
   obtenerColumnasPostgres,
@@ -42,7 +42,7 @@ import {
   upsertFila,
   upsertFilasLote,
   eliminarFila,
-  obtenerIdsPostgres,
+  obtenerIdsPostgresPaginado,
   reconciliarFilasPorOriginWriteId,
 } from "./pg-writer.mjs";
 import { conReintentos } from "./retry.mjs";
@@ -62,6 +62,67 @@ function pkValuesFromRow(row, pk) {
 }
 function pkKey(row, pk) {
   return pk.map((c) => String(row[c])).join("\u0000");
+}
+
+// Límite de filas por lote (ya existía: 250) MÁS un límite de bytes
+// estimados por lote. El límite por filas por sí solo no protege contra
+// tablas con columnas de texto largo (articles.contenido, un artículo con
+// HTML/imágenes embebidas puede pesar cientos de KB por fila): 250 filas
+// de ese tipo podrían seguir siendo varios MB en un único array de
+// `valores` + el string SQL con todos los placeholders, antes de llegar
+// siquiera a Postgres. Con este segundo límite, un lote se corta antes de
+// las 250 filas si el contenido ya pesa demasiado, y se corta después si
+// las filas son ligeras (no penaliza tablas normales con más round-trips
+// de los necesarios).
+const LOTE_MAX_FILAS = 250;
+const LOTE_MAX_BYTES = 4 * 1024 * 1024; // 4MB estimados por lote
+
+// Umbral de aviso de memoria del proceso (RSS), configurable por env var
+// para adaptarlo al plan/contenedor real sin tocar código (p.ej. Railway
+// free vs un plan con más RAM). Por defecto 400MB: generoso respecto a lo
+// que debería consumir este proceso con la lectura paginada, pero por
+// debajo del límite típico de un plan pequeño, para avisar con margen.
+const UMBRAL_AVISO_RSS_MB = Number(process.env.SYNC_RSS_WARN_MB || 400);
+
+function tamanoAproximadoFila(row) {
+  // Estimación barata (no un stringify exacto de todo el objeto en cada
+  // fila, que sería el propio coste que queremos evitar): suma la
+  // longitud de los valores tipo string/Buffer, que es donde vive
+  // prácticamente todo el peso real (contenido HTML, JSON en texto,
+  // imágenes en base64 si las hubiera, etc.). Números/booleans/null se
+  // cuentan con un coste fijo pequeño.
+  let total = 0;
+  for (const key in row) {
+    const value = row[key];
+    if (typeof value === "string") total += value.length;
+    else if (Buffer.isBuffer(value)) total += value.length;
+    else total += 16;
+  }
+  return total;
+}
+
+/**
+ * Trocea un array de filas en sub-lotes respetando DOS límites a la vez:
+ * como máximo LOTE_MAX_FILAS filas, y como máximo ~LOTE_MAX_BYTES
+ * estimados de contenido. El primer límite que se alcance cierra el lote.
+ * Una fila individual que ya supere LOTE_MAX_BYTES por sí sola no se
+ * descarta ni se trunca -eso rompería la sincronización de esa fila-,
+ * simplemente forma un lote de tamaño 1.
+ */
+function* trocearEnLotes(filas, { maxFilas = LOTE_MAX_FILAS, maxBytes = LOTE_MAX_BYTES } = {}) {
+  let lote = [];
+  let bytesLote = 0;
+  for (const row of filas) {
+    const bytesFila = tamanoAproximadoFila(row);
+    if (lote.length > 0 && (lote.length >= maxFilas || bytesLote + bytesFila > maxBytes)) {
+      yield lote;
+      lote = [];
+      bytesLote = 0;
+    }
+    lote.push(row);
+    bytesLote += bytesFila;
+  }
+  if (lote.length > 0) yield lote;
 }
 
 async function hayEjecucionEnCurso(client) {
@@ -167,15 +228,21 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
           }
 
           try {
-            const resultado = await conReintentos(
-              () => upsertFilasLote(client, name, pagina, columnasUtilizables, pk),
-              {
-                onRetry: ({ intento, error }) =>
-                  console.warn(`[${name}] reintento página que termina en ${pagina[pagina.length - 1][pk[0]]} (${intento}): ${error.message}`),
-              }
-            );
-            detalle.inserted += resultado.inserted;
-            detalle.updated += resultado.updated;
+            let insertedPagina = 0;
+            let updatedPagina = 0;
+            for (const subLote of trocearEnLotes(pagina)) {
+              const resultado = await conReintentos(
+                () => upsertFilasLote(client, name, subLote, columnasUtilizables, pk),
+                {
+                  onRetry: ({ intento, error }) =>
+                    console.warn(`[${name}] reintento sub-lote (${subLote.length} filas) de página que termina en ${pagina[pagina.length - 1][pk[0]]} (${intento}): ${error.message}`),
+                }
+              );
+              insertedPagina += resultado.inserted;
+              updatedPagina += resultado.updated;
+            }
+            detalle.inserted += insertedPagina;
+            detalle.updated += updatedPagina;
           } catch (paginaError) {
             console.warn(`[${name}] página falló; reintentando fila a fila: ${paginaError.message}`);
             for (const row of pagina) {
@@ -215,18 +282,23 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
     // no las filas completas, así que sigue siendo barato incluso en tablas
     // con miles de filas.
     try {
-      const idsPGRows = await obtenerIdsPostgres(client, name, pk);
-      for (const row of idsPGRows) {
-        const key = String(row[pk[0]]);
-        if (!idsVistosEnD1.has(key)) {
-          try {
-            await conReintentos(() => eliminarFila(client, name, pk, [row[pk[0]]]));
-            detalle.deleted++;
-          } catch (error) {
-            detalle.errors.push(`Borrado ${key}: ${error.message}`);
+      // Paginado por cursor server-side (obtenerIdsPostgresPaginado): en
+      // tablas grandes (p.ej. comments, readers) evita traer TODOS los IDs
+      // de Postgres de golpe a memoria del proceso Node solo para
+      // compararlos contra idsVistosEnD1; se compara página a página.
+      await obtenerIdsPostgresPaginado(client, name, pk, async (paginaPG) => {
+        for (const row of paginaPG) {
+          const key = String(row[pk[0]]);
+          if (!idsVistosEnD1.has(key)) {
+            try {
+              await conReintentos(() => eliminarFila(client, name, pk, [row[pk[0]]]));
+              detalle.deleted++;
+            } catch (error) {
+              detalle.errors.push(`Borrado ${key}: ${error.message}`);
+            }
           }
         }
-      }
+      });
     } catch (error) {
       detalle.errors.push(`Detección de borrados (autoritativa): ${error.message}`);
     }
@@ -240,32 +312,51 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
   }
 
   // 1) Leer de D1 solo las filas cambiadas desde el cursor.
-  let sql;
-  if (cursor?.last_synced_at) {
-    sql = `SELECT * FROM ${name} WHERE ${cursorColumn} > ${escaparValorD1(cursor.last_synced_at)} ORDER BY ${cursorColumn} ASC;`;
-  } else {
-    // Sin cursor todavía = primera pasada incremental tras la migración
-    // inicial: traemos todo para poder fijar el cursor a partir de ahí.
-    sql = `SELECT * FROM ${name} ORDER BY ${cursorColumn} ASC;`;
+  //
+  // IMPORTANTE (mismo problema de pico de RAM que en la rama
+  // "authoritative", ver comentario más arriba): esto usaba un único
+  // "SELECT * FROM tabla WHERE cursorColumn > ...;" -o, peor aún, sin
+  // WHERE en absoluto la primera vez que corre (sin cursor todavía)- que
+  // trae de golpe TODAS las filas cambiadas a memoria de Node. En tablas
+  // no-authoritative con contenido largo (articles.contenido, etc.) o con
+  // muchas filas (match_events, activity_log tras una jornada con muchos
+  // partidos, o cualquier tabla en su primera pasada sin cursor) esto
+  // podía ser tan grande como el "SELECT * FROM tabla" que ya se arregló
+  // arriba. Se pagina igual, por el propio cursorColumn (que ya es la
+  // columna de orden natural aquí, no hace falta el PK): cada página se
+  // procesa (upsert en Postgres) antes de pedir la siguiente, así que en
+  // memoria solo hay como mucho una página (250 filas) de la tabla.
+  const TAMANO_PAGINA_INCREMENTAL = 500;
+  console.log(`[${name}] leyendo D1 (incremental, por páginas)...`);
+
+  let columnasUtilizables = null; // se fija con la primera página no vacía
+  let ultimoCursorValor = cursor?.last_synced_at ?? null;
+  let totalFilasLeidas = 0;
+
+  async function procesarPaginaIncremental(pagina) {
+    totalFilasLeidas += pagina.length;
+    // Diagnóstico: si una sola página (500 filas como máximo) ya pesa
+    // varios MB estimados, es una señal de que esta tabla tiene filas
+    // mucho más pesadas de lo normal (p.ej. articles.contenido con mucho
+    // HTML/base64) y merece bajar TAMANO_PAGINA_INCREMENTAL para esa
+    // tabla en el futuro. No se aborta la sincronización por esto -los
+    // límites reales (D1_MAX_BUFFER, LOTE_MAX_BYTES) ya cortan por su
+    // cuenta-, es solo visibilidad para poder ajustar antes de que
+    // llegue a ser un problema.
+    const bytesPagina = pagina.reduce((acc, row) => acc + tamanoAproximadoFila(row), 0);
+    if (bytesPagina > LOTE_MAX_BYTES) {
+      console.warn(`[${name}] página de ${pagina.length} filas pesa ~${(bytesPagina / 1024 / 1024).toFixed(1)}MB estimados (por encima de ${(LOTE_MAX_BYTES / 1024 / 1024).toFixed(0)}MB) — considerar reducir TAMANO_PAGINA_INCREMENTAL para esta tabla.`);
+    }
+    if (columnasUtilizables === null) {
+      columnasUtilizables = Object.keys(pagina[0]).filter((c) => columnasPG.includes(c));
+    }
+
+    for (const lote of trocearEnLotes(pagina)) {
+      await procesarLoteIncremental(lote, `${lote.length} filas`);
+    }
   }
 
-  console.log(`[${name}] leyendo D1 (incremental)...`);
-  const filas = await conReintentos(() => ejecutarD1(sql), {
-    onRetry: ({ intento, error }) =>
-      console.warn(`[${name}] reintento lectura D1 (${intento}): ${error.message}`),
-  });
-
-  console.log(`[${name}] D1: ${filas.length} registros a procesar`);
-
-  const columnasUtilizables = filas.length
-    ? Object.keys(filas[0]).filter((c) => columnasPG.includes(c))
-    : [];
-
-  let ultimoCursorValor = cursor?.last_synced_at ?? null;
-
-  const TAMANO_LOTE = 250;
-  for (let i = 0; i < filas.length; i += TAMANO_LOTE) {
-    const lote = filas.slice(i, i + TAMANO_LOTE);
+  async function procesarLoteIncremental(lote, etiquetaLote) {
     try {
       // Igual que en la rama autoritativa: resuelve primero cualquier fila
       // huérfana de un failover antes del upsert normal por PK, para que
@@ -274,18 +365,18 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
       // reconciliarFilasPorOriginWriteId en sync/pg-writer.mjs).
       const reconciliacionWriteId = await conReintentos(
         () => reconciliarFilasPorOriginWriteId(client, name, lote, pk),
-        { onRetry: ({ intento, error }) => console.warn(`[${name}] reintento reconciliación por origin_write_id, lote ${i + 1}-${i + lote.length} (${intento}): ${error.message}`) }
+        { onRetry: ({ intento, error }) => console.warn(`[${name}] reintento reconciliación por origin_write_id, lote ${etiquetaLote} (${intento}): ${error.message}`) }
       );
       if (reconciliacionWriteId.huerfanasEliminadas > 0) {
-        console.log(`[${name}] reconciliadas ${reconciliacionWriteId.huerfanasEliminadas} fila(s) huérfana(s) de failover por origin_write_id (lote ${i + 1}-${i + lote.length}).`);
+        console.log(`[${name}] reconciliadas ${reconciliacionWriteId.huerfanasEliminadas} fila(s) huérfana(s) de failover por origin_write_id (lote ${etiquetaLote}).`);
       }
       if (reconciliacionWriteId.conflictos.length > 0) {
-        detalle.errors.push(`${reconciliacionWriteId.conflictos.length} conflicto(s) de origin_write_id sin resolver en lote ${i + 1}-${i + lote.length}, ver sync_write_id_conflicts.`);
+        detalle.errors.push(`${reconciliacionWriteId.conflictos.length} conflicto(s) de origin_write_id sin resolver en lote ${etiquetaLote}, ver sync_write_id_conflicts.`);
       }
 
       const resultado = await conReintentos(
         () => upsertFilasLote(client, name, lote, columnasUtilizables, pk),
-        { onRetry: ({ intento, error }) => console.warn(`[${name}] reintento lote ${i + 1}-${i + lote.length} (${intento}): ${error.message}`) }
+        { onRetry: ({ intento, error }) => console.warn(`[${name}] reintento lote ${etiquetaLote} (${intento}): ${error.message}`) }
       );
       detalle.inserted += resultado.inserted;
       detalle.updated += resultado.updated;
@@ -293,7 +384,7 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
         if (row[cursorColumn] && (!ultimoCursorValor || row[cursorColumn] > ultimoCursorValor)) ultimoCursorValor = row[cursorColumn];
       }
     } catch (batchError) {
-      console.warn(`[${name}] lote ${i + 1}-${i + lote.length} falló; reintentando fila a fila: ${batchError.message}`);
+      console.warn(`[${name}] lote ${etiquetaLote} falló; reintentando fila a fila: ${batchError.message}`);
       for (const row of lote) {
         try {
           const resultado = await conReintentos(() => upsertFila(client, name, row, columnasUtilizables, pk, { onConflictAction: "update" }));
@@ -306,37 +397,87 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
         }
       }
     }
-    console.log(`[${name}] progreso ${Math.min(i + lote.length, filas.length)}/${filas.length}`);
   }
+
+  try {
+    if (cursor?.last_synced_at) {
+      const cursorInicial = escaparValorD1(cursor.last_synced_at);
+      let ultimoValorPagina = null;
+      for (;;) {
+        const condicion = ultimoValorPagina === null
+          ? `${cursorColumn} > ${cursorInicial}`
+          : `${cursorColumn} > ${escaparValorD1(ultimoValorPagina)}`;
+        const sql = `SELECT * FROM ${name} WHERE ${condicion} ORDER BY ${cursorColumn} ASC LIMIT ${TAMANO_PAGINA_INCREMENTAL};`;
+        const pagina = await conReintentos(() => ejecutarD1(sql), {
+          onRetry: ({ intento, error }) => console.warn(`[${name}] reintento lectura D1 (${intento}): ${error.message}`),
+        });
+        if (pagina.length === 0) break;
+        await procesarPaginaIncremental(pagina);
+        ultimoValorPagina = pagina[pagina.length - 1][cursorColumn];
+        console.log(`[${name}] progreso ${totalFilasLeidas} leídos de D1`);
+        if (pagina.length < TAMANO_PAGINA_INCREMENTAL) break;
+      }
+    } else {
+      // Sin cursor todavía = primera pasada incremental tras la migración
+      // inicial: se pagina igual por cursorColumn desde el principio, en
+      // vez de "SELECT * FROM tabla ORDER BY cursorColumn ASC;" sin LIMIT.
+      let ultimoValorPagina = null;
+      for (;;) {
+        const where = ultimoValorPagina === null ? "" : `WHERE ${cursorColumn} > ${escaparValorD1(ultimoValorPagina)} `;
+        const sql = `SELECT * FROM ${name} ${where}ORDER BY ${cursorColumn} ASC LIMIT ${TAMANO_PAGINA_INCREMENTAL};`;
+        const pagina = await conReintentos(() => ejecutarD1(sql), {
+          onRetry: ({ intento, error }) => console.warn(`[${name}] reintento lectura D1 (${intento}): ${error.message}`),
+        });
+        if (pagina.length === 0) break;
+        await procesarPaginaIncremental(pagina);
+        ultimoValorPagina = pagina[pagina.length - 1][cursorColumn];
+        console.log(`[${name}] progreso ${totalFilasLeidas} leídos de D1`);
+        if (pagina.length < TAMANO_PAGINA_INCREMENTAL) break;
+      }
+    }
+  } catch (error) {
+    detalle.errors.push(`Lectura paginada de D1: ${error.message}`);
+    console.error(`[${name}] ERROR leyendo D1 por páginas (progreso parcial insertados=${detalle.inserted} actualizados=${detalle.updated}): ${error.message}`);
+  }
+
+  console.log(`[${name}] D1: ${totalFilasLeidas} registros a procesar`);
 
   if (ultimoCursorValor && ultimoCursorValor !== cursor?.last_synced_at) {
     await guardarCursor(client, name, { lastSyncedAt: ultimoCursorValor });
   }
 
   // 2) Detectar borrados (solo en tablas donde D1 permite DELETE).
+  //
+  // Igual que en la detección de borrados de la rama "authoritative": se
+  // pagina tanto la lectura de IDs en D1 (ejecutarD1PaginadoSoloIds, en vez
+  // de "SELECT pk FROM tabla;" completo) como la de Postgres
+  // (obtenerIdsPostgresPaginado, con cursor server-side). Solo se acumula
+  // en memoria el Set de PKs vistos en D1 (strings, ligero incluso en
+  // tablas grandes), nunca las filas completas de ninguno de los dos lados.
   if (deleteDetection) {
     try {
-      const idsD1Rows = await conReintentos(() =>
-        ejecutarD1(`SELECT ${pk.join(", ")} FROM ${name};`)
-      );
-      const idsD1 = new Set(idsD1Rows.map((r) => pkKey(r, pk)));
+      const idsD1 = new Set();
+      await ejecutarD1PaginadoSoloIds(name, pk, async (paginaIds) => {
+        for (const r of paginaIds) idsD1.add(pkKey(r, pk));
+      });
 
-      const idsPGRows = await obtenerIdsPostgres(client, name, pk);
-      for (const row of idsPGRows) {
-        const key = pkKey(row, pk);
-        if (!idsD1.has(key)) {
-          try {
-            await conReintentos(() => eliminarFila(client, name, pk, pkValuesFromRow(row, pk)));
-            detalle.deleted++;
-            await client.query(
-              `INSERT INTO sync_deletions (table_name, record_id, run_id) VALUES ($1, $2, $3);`,
-              [name, key, runId]
-            );
-          } catch (error) {
-            detalle.errors.push(`Borrado ${key}: ${error.message}`);
+      await obtenerIdsPostgresPaginado(client, name, pk, async (paginaPG) => {
+        for (const row of paginaPG) {
+          const key = pkKey(row, pk);
+          if (!idsD1.has(key)) {
+            try {
+              await conReintentos(() => eliminarFila(client, name, pk, pkValuesFromRow(row, pk)));
+              detalle.deleted++;
+              await client.query(
+                `INSERT INTO sync_deletions (table_name, record_id, run_id) VALUES ($1, $2, $3);`,
+                [name, key, runId]
+              );
+            } catch (error) {
+              detalle.errors.push(`Borrado ${key}: ${error.message}`);
+            }
           }
         }
-      }
+      });
     } catch (error) {
       detalle.errors.push(`Detección de borrados: ${error.message}`);
     }
@@ -407,6 +548,26 @@ export async function ejecutarSincronizacionIncremental() {
       resumen.updated += detalle.updated;
       resumen.deleted += detalle.deleted;
       resumen.errors += detalle.errors.length;
+
+      // Comprobación de memoria del proceso tras cada tabla: pura
+      // observabilidad, no cambia el comportamiento de la sincronización.
+      // El objetivo es que, si algún día vuelve a aparecer un pico de RAM
+      // (una tabla nueva sin configurar bien, un cambio futuro que
+      // reintroduzca una lectura sin paginar, etc.), quede una pista clara
+      // en los logs de qué tabla estaba procesándose cuando el RSS empezó
+      // a crecer de forma anómala, en vez de enterarse solo por el
+      // contenedor reiniciado sin más contexto. UMBRAL_AVISO_RSS_MB es
+      // deliberadamente generoso (por debajo del límite real del plan)
+      // para avisar con margen antes de que el proceso llegue a caerse.
+      const rssMB = process.memoryUsage().rss / 1024 / 1024;
+      if (rssMB > UMBRAL_AVISO_RSS_MB) {
+        console.warn(
+          `[memoria] RSS=${rssMB.toFixed(0)}MB tras sincronizar "${tableConfig.name}" ` +
+          `(umbral de aviso ${UMBRAL_AVISO_RSS_MB}MB). Puede ser normal en una pasada con ` +
+          `muchos cambios acumulados, pero si se repite en la misma tabla en pasadas ` +
+          `sucesivas conviene revisar si esa tabla necesita una página o lote más pequeños.`
+        );
+      }
     }
 
     const status = resumen.errors === 0 ? "ok" : "error";

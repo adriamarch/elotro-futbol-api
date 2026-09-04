@@ -31,6 +31,17 @@ app.use(
 
 const env = {
   DB: createD1CompatDb(),
+  // Señala a fetchRailway() (src/index.js) que este handler ya se está
+  // ejecutando dentro de Railway, para que no intente reenviarse a sí
+  // mismo si su propia consulta a Postgres falla (ver fetchRailway).
+  RUNNING_IN_RAILWAY: true,
+  // URL pública de este mismo servicio de Railway. Solo se usa desde el
+  // Worker de Cloudflare (worker/src/index.js) para hacer failover hacia
+  // aquí; se mantiene también aquí por si algún endpoint interno la
+  // necesita para construir enlaces absolutos.
+  RAILWAY_URL:
+    process.env.RAILWAY_URL ||
+    "https://elotro-futbol-api-production-e57c.up.railway.app",
   // Solo para el endpoint temporal /api/debug/migrar-jornadas-calendario
   // (ver src/index.js): permite ejecutar SQL multi-statement directo.
   // BORRAR esta línea junto con ese endpoint una vez usado.

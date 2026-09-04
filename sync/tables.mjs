@@ -231,6 +231,59 @@ export const TABLES = [
     deleteDetection: true, // sesiones antiguas se podrían limpiar en el futuro
     syncMode: "authoritative", // D1 es la autoridad también para sesiones
   },
+  {
+    name: "polls",
+    pk: ["id"],
+    order: 18,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true, // el panel permite eliminar encuestas
+    syncMode: "authoritative", // D1 es la autoridad; tabla pequeña
+  },
+  {
+    name: "poll_options",
+    pk: ["id"],
+    order: 19,
+    // No tiene updated_at; las opciones de una encuesta no se editan tras
+    // crearse desde el panel, solo se crean junto con la propia encuesta.
+    changeStrategy: "immutable",
+    cursorColumn: "id",
+    deleteDetection: true, // se borran en cascada junto a la encuesta
+    syncMode: "authoritative", // D1 es la autoridad; tabla pequeña, depende de polls
+  },
+  {
+    name: "poll_votes",
+    pk: ["id"],
+    order: 20,
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: false, // los votos no se borran individualmente
+  },
+  {
+    name: "tienda_productos",
+    pk: ["id"],
+    order: 21,
+    // Catálogo fijo, se edita a mano por INSERT/UPDATE directo (ver
+    // worker/migracion_tienda.sql); no tiene updated_at, así que se
+    // reconcilia entero cada pasada.
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: true, // un producto se puede desactivar/borrar a mano
+    syncMode: "authoritative", // D1 es la autoridad; catálogo pequeño
+  },
+  {
+    name: "tienda_pedidos",
+    pk: ["id"],
+    order: 22,
+    // Un pedido cambia de estado (pendiente_pago -> pagado -> enviado /
+    // cancelado) pero no tiene updated_at, solo created_at + gestionado_en.
+    // syncMode "authoritative" reconcilia también esos cambios de estado
+    // sin depender de un cursor incremental real.
+    changeStrategy: "immutable",
+    cursorColumn: "created_at",
+    deleteDetection: false, // los pedidos no se borran, se marcan "cancelado"
+    syncMode: "authoritative",
+  },
 ];
 
 export function getTable(name) {
@@ -258,4 +311,8 @@ export const DEPENDENCIAS_FK = {
   reader_sessions: ["readers"],
   comment_votes: ["comments"],
   comment_reports: ["comments"],
+  polls: ["articles", "users"],
+  poll_options: ["polls"],
+  poll_votes: ["polls", "poll_options", "readers"],
+  tienda_pedidos: ["users", "tienda_productos"],
 };

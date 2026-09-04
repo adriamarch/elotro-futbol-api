@@ -2178,9 +2178,23 @@ async function iniciarCronometroPartido(env, resultadoId, minutoInicial = 0) {
   // correo (bug: "no llega el correo aunque no se esté cubriendo"). Es
   // un partido distinto desde cero en la práctica, así que el contador
   // de avisos también debe arrancar de cero.
+  //
+  // COALESCE(goles_local, 0) / COALESCE(goles_visitante, 0): un partido
+  // "programado" tiene goles_local/goles_visitante a NULL hasta que
+  // alguien anota el primer gol o lo pone a mano a 0-0. Si este cronómetro
+  // se arranca desde el cron automático en vez de desde el formulario
+  // manual, esos campos se quedaban en NULL al pasar a "en_juego".
+  // calcularClasificacion() en clasificacion.html/calendario.html descarta
+  // cualquier partido "en_juego" con goles NULL, así que ese partido en
+  // vivo desaparecía de la clasificación en vivo -- explicando por qué
+  // "a veces va y a veces no" según qué camino había arrancado cada
+  // partido. Con COALESCE, cualquier partido que llegue aquí sin
+  // marcador queda a 0-0 en vez de NULL.
   await env.DB.prepare(
     `UPDATE results SET inicio_cronometro_at = datetime('now', ?), cronometro_pausado_en = NULL,
-       ajuste_cronometro_minutos = 0, estado = 'en_juego', aviso_desatendido_mitad = NULL WHERE id = ?`
+       ajuste_cronometro_minutos = 0, estado = 'en_juego', aviso_desatendido_mitad = NULL,
+       goles_local = COALESCE(goles_local, 0), goles_visitante = COALESCE(goles_visitante, 0)
+       WHERE id = ?`
   ).bind(`-${minutos} minutes`, resultadoId).run();
 }
 

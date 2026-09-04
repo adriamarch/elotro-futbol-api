@@ -7938,6 +7938,18 @@ async function handlePrimary(request, env, ctx) {
         // Resultados): un partido "pertenece" a un club tanto si juega en
         // casa como fuera, así que se compara contra las dos columnas.
         const club = url.searchParams.get("club");
+        // Filtro opcional por fecha mínima del partido ("YYYY-MM-DD"),
+        // pensado para pedir "solo la temporada en curso" sin depender de
+        // un LIMIT fijo. Ver el comentario gemelo en worker/src/index.js
+        // (mismo endpoint, backend principal) para la explicación completa
+        // de por qué era necesario: sin esto, la clasificación calculada
+        // en /clasificacion.html podía salir incompleta de forma
+        // intermitente en cuanto un grupo acumulaba más de "limit"
+        // partidos entre varias temporadas sin archivar. Se incluyen
+        // también los partidos con fecha_partido NULL (normalmente
+        // recién creados/sin programar todavía) para no perderlos por no
+        // tener fecha con la que compararlos.
+        const desdeFecha = url.searchParams.get("desde_fecha");
         // El límite era fijo (100) e ignoraba el "?limit=" que ya mandaba
         // el frontend (el panel de admin pide 200 para no dejarse partidos
         // fuera). Si un resultado quedaba fuera de esos 100 primeros, el
@@ -7950,6 +7962,7 @@ async function handlePrimary(request, env, ctx) {
         let query = "SELECT * FROM results WHERE 1=1";
         const binds = [];
         if (competicion) { query += " AND competicion = ?"; binds.push(competicion); }
+        if (desdeFecha) { query += " AND (fecha_partido >= ? OR fecha_partido IS NULL)"; binds.push(desdeFecha); }
         if (estado) { query += " AND estado = ?"; binds.push(estado); }
         if (grupo) { query += " AND grupo = ?"; binds.push(grupo); }
         if (club) {

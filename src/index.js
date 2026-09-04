@@ -3917,8 +3917,31 @@ async function fetchRailway(
   env,
   ctx
 ) {
+  // BUG (incidente): antes se usaba `RAILWAY_URL` a secas, una variable
+  // que no existía en ningún sitio de este archivo (ni const de módulo, ni
+  // en env) -> ReferenceError: RAILWAY_URL is not defined en cuanto se
+  // intentaba hacer failover. Se lee de env.RAILWAY_URL, con la misma URL
+  // pública que ya se usaba como valor por defecto en public/js/config.js
+  // como fallback si no está configurada.
+  //
+  // Además: cuando este mismo archivo corre DENTRO de Railway (importado
+  // por server-railway.js, con env.RUNNING_IN_RAILWAY = true — ver ese
+  // archivo), "hacer failover a Railway" no tiene sentido: Railway ya es
+  // quien está atendiendo la petición. Si su propia consulta a Postgres
+  // falla, reenviarse a su propia URL pública solo crea una petición HTTP
+  // extra contra sí mismo con el mismo resultado. En ese caso se deja que
+  // el error original se propague en vez de reenviar.
+  if (env.RUNNING_IN_RAILWAY) {
+    console.log(
+      `[FAILOVER] Petición dentro de Railway, no se reenvía a sí mismo (${reason})`
+    );
+    throw new Error(
+      `No se puede hacer failover a Railway: ya se está ejecutando en Railway (motivo original: ${reason})`
+    );
+  }
+
   const railwayUrl =
-    RAILWAY_URL +
+    (env.RAILWAY_URL || "https://elotro-futbol-api-production-e57c.up.railway.app") +
     path +
     new URL(request.url).search;
 

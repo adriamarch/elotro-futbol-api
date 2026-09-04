@@ -259,7 +259,6 @@ export const TABLES = [
     cursorColumn: "created_at",
     deleteDetection: false, // los votos no se borran individualmente
   },
-<<<<<<< HEAD
   {
     name: "tienda_productos",
     pk: ["id"],
@@ -285,8 +284,6 @@ export const TABLES = [
     deleteDetection: false, // los pedidos no se borran, se marcan "cancelado"
     syncMode: "authoritative",
   },
-=======
->>>>>>> 671fb73e964d6c6a0e29d4d41aad663db1b8f785
 ];
 
 export function getTable(name) {
@@ -317,8 +314,5 @@ export const DEPENDENCIAS_FK = {
   polls: ["articles", "users"],
   poll_options: ["polls"],
   poll_votes: ["polls", "poll_options", "readers"],
-<<<<<<< HEAD
   tienda_pedidos: ["users", "tienda_productos"],
-=======
->>>>>>> 671fb73e964d6c6a0e29d4d41aad663db1b8f785
 };

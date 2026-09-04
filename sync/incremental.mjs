@@ -34,7 +34,7 @@
 
 import { pathToFileURL } from "node:url";
 import pg from "pg";
-import { ejecutarD1, escaparValorD1 } from "./d1-client.mjs";
+import { ejecutarD1, ejecutarD1Paginado, escaparValorD1 } from "./d1-client.mjs";
 import { TABLES_IN_ORDER, DEPENDENCIAS_FK } from "./tables.mjs";
 import {
   obtenerColumnasPostgres,
@@ -43,7 +43,6 @@ import {
   upsertFilasLote,
   eliminarFila,
   obtenerIdsPostgres,
-  reconciliarTablaAutoritativa,
   reconciliarFilasPorOriginWriteId,
 } from "./pg-writer.mjs";
 import { conReintentos } from "./retry.mjs";
@@ -110,99 +109,134 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
   // canónica y PostgreSQL se reconcilia hasta quedar exactamente igual.
   // Esto corrige también diferencias históricas que un cursor incremental no
   // detectaría (por ejemplo una fila extra en PG o un valor antiguo).
+  //
+  // IMPORTANTE (pico de memoria en Railway free): esto se leía antes con un
+  // único "SELECT * FROM tabla;" que traía la tabla ENTERA a memoria de
+  // golpe (vía subproceso wrangler, con hasta 200MB de buffer) en cada
+  // pasada del scheduler -cada 60s por defecto, para 10 tablas
+  // "authoritative"-, lo que hacía saltar el límite de RAM del plan free y
+  // tumbaba el proceso. Ahora se lee con ejecutarD1Paginado (ver
+  // d1-client.mjs): página a página por cursor de PK, aplicando el upsert
+  // de cada página contra Postgres antes de pedir la siguiente, así que en
+  // memoria solo hay como mucho una página (500 filas) de la tabla en vez
+  // de la tabla completa.
   if (tableConfig.syncMode === "authoritative") {
-    console.log(`[${name}] leyendo D1 (reconciliación autoritativa)...`);
-    const filasD1 = await conReintentos(
-      () => ejecutarD1(`SELECT * FROM ${name};`),
-      {
-        onRetry: ({ intento, error }) =>
-          console.warn(`[${name}] reintento lectura D1 autoritativa (${intento}): ${error.message}`),
-      }
-    );
+    console.log(`[${name}] leyendo D1 por páginas (reconciliación autoritativa)...`);
 
-    console.log(`[${name}] D1: ${filasD1.length} registros`);
-
-    const columnasUtilizables = filasD1.length
-      ? Object.keys(filasD1[0]).filter((c) => columnasPG.includes(c))
-      : [];
-
-    const faltanEnPG = filasD1.length
-      ? Object.keys(filasD1[0]).filter((c) => !columnasPG.includes(c))
-      : [];
-    if (faltanEnPG.length > 0) {
-      detalle.errors.push(`Columnas D1 sin equivalente en PG: ${faltanEnPG.join(", ")}`);
-      return detalle;
-    }
+    let columnasUtilizables = null; // se fija con la primera página no vacía
+    let ultimoCursorValor = cursor?.last_synced_at ?? null;
+    const idsVistosEnD1 = new Set(); // solo PKs (string), no filas completas: ligero incluso en tablas grandes
+    let totalFilas = 0;
+    let erroresColumnas = false;
 
     try {
-      // Antes de la reconciliación autoritativa normal (por PK), se resuelven
-      // los casos de failover: filas de D1 que traen origin_write_id y cuyo
-      // PK no coincide con el que tenía la fila equivalente creada en
-      // PostgreSQL durante el failover (ver reconciliarFilasPorOriginWriteId
-      // para el porqué completo). Sin este paso, reconciliarTablaAutoritativa
-      // insertaría la fila de D1 como ADICIONAL (PK distinto) y dejaría la
-      // fila de Postgres huérfana -pero como esta tabla es autoritativa, ni
-      // siquiera se borraría sola en la siguiente pasada, porque su PK
-      // seguiría sin existir en D1 solo si nadie la reconcilia antes-.
-      const reconciliacionWriteId = await conReintentos(
-        () => reconciliarFilasPorOriginWriteId(client, name, filasD1, pk),
-        {
-          onRetry: ({ intento, error }) =>
-            console.warn(`[${name}] reintento reconciliación por origin_write_id (${intento}): ${error.message}`),
-        }
+      await ejecutarD1Paginado(
+        name,
+        pk[0], // todas las tablas "authoritative" actuales tienen PK de una columna, ver tables.mjs
+        async (pagina) => {
+          totalFilas += pagina.length;
+
+          if (columnasUtilizables === null) {
+            columnasUtilizables = Object.keys(pagina[0]).filter((c) => columnasPG.includes(c));
+            const faltanEnPG = Object.keys(pagina[0]).filter((c) => !columnasPG.includes(c));
+            if (faltanEnPG.length > 0) {
+              detalle.errors.push(`Columnas D1 sin equivalente en PG: ${faltanEnPG.join(", ")}`);
+              erroresColumnas = true;
+              return; // ejecutarD1Paginado sigue pidiendo páginas; se corta abajo con el flag
+            }
+          }
+          if (erroresColumnas) return;
+
+          for (const row of pagina) idsVistosEnD1.add(String(row[pk[0]]));
+
+          // Igual que en la rama incremental: resuelve primero huérfanas de
+          // failover por origin_write_id antes del upsert normal por PK
+          // (ver reconciliarFilasPorOriginWriteId en pg-writer.mjs).
+          const reconciliacionWriteId = await conReintentos(
+            () => reconciliarFilasPorOriginWriteId(client, name, pagina, pk),
+            {
+              onRetry: ({ intento, error }) =>
+                console.warn(`[${name}] reintento reconciliación por origin_write_id, página que termina en ${pagina[pagina.length - 1][pk[0]]} (${intento}): ${error.message}`),
+            }
+          );
+          if (reconciliacionWriteId.huerfanasEliminadas > 0) {
+            console.log(`[${name}] reconciliadas ${reconciliacionWriteId.huerfanasEliminadas} fila(s) huérfana(s) de failover por origin_write_id.`);
+          }
+          if (reconciliacionWriteId.conflictos.length > 0) {
+            detalle.errors.push(`${reconciliacionWriteId.conflictos.length} conflicto(s) de origin_write_id sin resolver, ver sync_write_id_conflicts.`);
+          }
+
+          try {
+            const resultado = await conReintentos(
+              () => upsertFilasLote(client, name, pagina, columnasUtilizables, pk),
+              {
+                onRetry: ({ intento, error }) =>
+                  console.warn(`[${name}] reintento página que termina en ${pagina[pagina.length - 1][pk[0]]} (${intento}): ${error.message}`),
+              }
+            );
+            detalle.inserted += resultado.inserted;
+            detalle.updated += resultado.updated;
+          } catch (paginaError) {
+            console.warn(`[${name}] página falló; reintentando fila a fila: ${paginaError.message}`);
+            for (const row of pagina) {
+              try {
+                const resultado = await conReintentos(() => upsertFila(client, name, row, columnasUtilizables, pk, { onConflictAction: "update" }));
+                if (resultado === "inserted") detalle.inserted++;
+                else if (resultado === "updated") detalle.updated++;
+              } catch (error) {
+                const key = pk.map((c) => String(row[c])).join("\u0000");
+                detalle.errors.push(`Fila ${key}: ${error.message}`);
+                console.error(`[${name}] error definitivo en fila ${key}:`, error.message);
+              }
+            }
+          }
+
+          for (const row of pagina) {
+            const value = row[cursorColumn];
+            if (value && (!ultimoCursorValor || value > ultimoCursorValor)) ultimoCursorValor = value;
+          }
+          console.log(`[${name}] progreso ${totalFilas} leídos de D1`);
+        },
+        { tamanoPagina: 500 }
       );
-      if (reconciliacionWriteId.huerfanasEliminadas > 0) {
-        console.log(`[${name}] reconciliadas ${reconciliacionWriteId.huerfanasEliminadas} fila(s) huérfana(s) de failover por origin_write_id.`);
-      }
-      if (reconciliacionWriteId.conflictos.length > 0) {
-        detalle.errors.push(`${reconciliacionWriteId.conflictos.length} conflicto(s) de origin_write_id sin resolver, ver sync_write_id_conflicts.`);
-      }
-
-      // Nota: sin conReintentos aquí a propósito. reconciliarTablaAutoritativa
-      // ya no es una única transacción (ver pg-writer.mjs): hace commit por
-      // lote/fila conforme avanza, así que si lanza un error las filas
-      // buenas YA quedaron persistidas. Reintentar la llamada completa
-      // volvería a procesar de cero todas las filas (inofensivo por ser
-      // upsert idempotente, pero redundante); en vez de eso se deja que
-      // sean las filas realmente problemáticas -reportadas en el error- las
-      // que se reintenten solas en la siguiente pasada del scheduler.
-      let resultado;
-      try {
-        resultado = await reconciliarTablaAutoritativa(client, name, filasD1, columnasUtilizables, pk);
-      } catch (error) {
-        // Progreso parcial: las filas sin error ya se confirmaron en PG
-        // (commits por lote/fila), así que sí se reportan aquí -a
-        // diferencia de antes, cuando toda la transacción hacía ROLLBACK y
-        // el resumen se ponía a 0 aunque el trabajo se hubiera hecho.
-        const parcial = error.parcial || { inserted: 0, updated: 0, deleted: 0 };
-        detalle.inserted += parcial.inserted;
-        detalle.updated += parcial.updated;
-        detalle.deleted += parcial.deleted;
-        detalle.errors.push(`Reconciliación autoritativa: ${error.message}`);
-        console.error(`[${name}] ERROR en reconciliación autoritativa (progreso parcial insertados=${parcial.inserted} actualizados=${parcial.updated} borrados=${parcial.deleted}): ${error.message}`);
-        console.log(`[${name}] fin: insertados=${detalle.inserted} actualizados=${detalle.updated} borrados=${detalle.deleted} errores=${detalle.errors.length}`);
-        return detalle;
-      }
-
-      detalle.inserted += resultado.inserted;
-      detalle.updated += resultado.updated;
-      detalle.deleted += resultado.deleted;
-
-      const ultimo = filasD1.reduce((max, row) => {
-        const value = row[cursorColumn];
-        return value && (!max || value > max) ? value : max;
-      }, cursor?.last_synced_at ?? null);
-      if (ultimo && ultimo !== cursor?.last_synced_at) {
-        await guardarCursor(client, name, { lastSyncedAt: ultimo });
-      }
-
-      return detalle;
     } catch (error) {
       detalle.errors.push(`Reconciliación autoritativa: ${error.message}`);
-      console.error(`[${name}] ERROR en reconciliación autoritativa: ${error.message}`);
+      console.error(`[${name}] ERROR en reconciliación autoritativa (progreso parcial insertados=${detalle.inserted} actualizados=${detalle.updated}): ${error.message}`);
       console.log(`[${name}] fin: insertados=${detalle.inserted} actualizados=${detalle.updated} borrados=${detalle.deleted} errores=${detalle.errors.length}`);
       return detalle;
     }
+
+    if (erroresColumnas) return detalle;
+
+    console.log(`[${name}] D1: ${totalFilas} registros`);
+
+    // Borrados: cualquier fila que Postgres tenga y que no haya aparecido en
+    // ninguna página de D1. idsVistosEnD1 es un Set de solo PKs (strings),
+    // no las filas completas, así que sigue siendo barato incluso en tablas
+    // con miles de filas.
+    try {
+      const idsPGRows = await obtenerIdsPostgres(client, name, pk);
+      for (const row of idsPGRows) {
+        const key = String(row[pk[0]]);
+        if (!idsVistosEnD1.has(key)) {
+          try {
+            await conReintentos(() => eliminarFila(client, name, pk, [row[pk[0]]]));
+            detalle.deleted++;
+          } catch (error) {
+            detalle.errors.push(`Borrado ${key}: ${error.message}`);
+          }
+        }
+      }
+    } catch (error) {
+      detalle.errors.push(`Detección de borrados (autoritativa): ${error.message}`);
+    }
+
+    if (ultimoCursorValor && ultimoCursorValor !== cursor?.last_synced_at) {
+      await guardarCursor(client, name, { lastSyncedAt: ultimoCursorValor });
+    }
+
+    console.log(`[${name}] fin: insertados=${detalle.inserted} actualizados=${detalle.updated} borrados=${detalle.deleted} errores=${detalle.errors.length}`);
+    return detalle;
   }
 
   // 1) Leer de D1 solo las filas cambiadas desde el cursor.

@@ -31,6 +31,13 @@ const DB_NAME = process.env.D1_DATABASE_NAME || "elotrofutbol";
 const ES_WINDOWS = process.platform === "win32";
 const NPX_CMD = ES_WINDOWS ? "npx.cmd" : "npx";
 const D1_TIMEOUT_MS = Number(process.env.D1_TIMEOUT_MS || 120000);
+// 200MB pensado originalmente para traer tablas enteras de golpe
+// (SELECT * FROM tabla sin LIMIT). Con la lectura paginada
+// (ejecutarD1Paginado) cada llamada trae como mucho una página, así que
+// 20MB es de sobra incluso para filas con contenido de texto largo
+// (articles.contenido, etc.) y deja mucho menos margen de pico de
+// memoria si algo se descontrola.
+const D1_MAX_BUFFER = Number(process.env.D1_MAX_BUFFER_BYTES || 20 * 1024 * 1024);
 
 function citarArgumentoWindows(arg) {
   // Escapa comillas dobres duplicándolas (regla de cmd.exe) y envuelve el
@@ -63,7 +70,7 @@ export async function ejecutarD1(sql) {
       const comando = [NPX_CMD, ...args.map(citarArgumentoWindows)].join(" ");
       ({ stdout } = await execFileAsync(comando, {
         shell: true,
-        maxBuffer: 200 * 1024 * 1024,
+        maxBuffer: D1_MAX_BUFFER,
         windowsHide: true,
           timeout: D1_TIMEOUT_MS,
         }));
@@ -71,7 +78,7 @@ export async function ejecutarD1(sql) {
       // execFile con array de argumentos, sin shell: evita problemas de
       // escapado en Linux/Mac (el SQL entero viaja como un único argumento).
       ({ stdout } = await execFileAsync(NPX_CMD, args, {
-        maxBuffer: 200 * 1024 * 1024,
+        maxBuffer: D1_MAX_BUFFER,
         windowsHide: true,
           timeout: D1_TIMEOUT_MS,
         }));
@@ -109,4 +116,45 @@ export function escaparValorD1(value) {
 export async function contarD1(table) {
   const rows = await ejecutarD1(`SELECT COUNT(*) AS total FROM ${table};`);
   return Number(rows[0]?.total || 0);
+}
+
+/**
+ * Lee una tabla D1 completa página a página por cursor de PK, en vez de
+ * un único "SELECT * FROM tabla;" que trae toda la tabla de golpe.
+ *
+ * Por qué por cursor de PK y no LIMIT/OFFSET: con OFFSET, si una fila se
+ * borra o se inserta entre dos páginas (la sincronización tarda varios
+ * segundos/minutos en tablas grandes y el sitio sigue recibiendo tráfico
+ * mientras tanto), el desplazamiento de todas las filas posteriores hace
+ * que OFFSET salte o repita filas. Comparando siempre "pk > último visto"
+ * ese problema no existe: cada fila se ve como mucho una vez, sin
+ * importar qué cambie por delante o detrás del cursor mientras se pagina.
+ * Solo requiere que el PK sea comparable con ">" y estable (todas las
+ * tablas "authoritative" de tables.mjs usan id numérico autoincremental o
+ * una clave natural estable, así que se cumple).
+ *
+ * Cada página se entrega a `onPagina` en cuanto llega (no se acumula un
+ * array con la tabla entera en memoria); onPagina normalmente hace el
+ * upsert de esa página contra Postgres antes de pedir la siguiente.
+ *
+ * Solo soporta PK de una columna (todas las tablas "authoritative"
+ * actuales cumplen esto -ver tables.mjs-); si en el futuro alguna
+ * necesitara PK compuesta, esta función tendría que extenderse primero.
+ */
+export async function ejecutarD1Paginado(table, pkColumn, onPagina, { tamanoPagina = 500 } = {}) {
+  let ultimoValor = null;
+  let totalFilas = 0;
+  for (;;) {
+    const where = ultimoValor === null ? "" : `WHERE ${pkColumn} > ${escaparValorD1(ultimoValor)} `;
+    const sql = `SELECT * FROM ${table} ${where}ORDER BY ${pkColumn} ASC LIMIT ${tamanoPagina};`;
+    const pagina = await ejecutarD1(sql);
+    if (pagina.length === 0) break;
+
+    await onPagina(pagina);
+    totalFilas += pagina.length;
+    ultimoValor = pagina[pagina.length - 1][pkColumn];
+
+    if (pagina.length < tamanoPagina) break; // última página
+  }
+  return totalFilas;
 }

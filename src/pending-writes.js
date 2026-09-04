@@ -75,7 +75,23 @@ export function debeEncolarse(method, path) {
 export async function encolarEscritura({ writeId: writeIdEntrante, method, path, queryString, body, authorizationHeader, userId, originalStatus }) {
   const writeId = writeIdEntrante || crypto.randomUUID();
   if (!writeIdEntrante) {
-    console.warn(`[pending-writes] encolando ${method} ${path} sin writeId pre-generado: la fila creada en Postgres (si la hay) no llevará origin_write_id y no podrá reconciliarse automáticamente al llegar de vuelta desde D1.`);
+    // Antes: console.warn por CADA escritura sin writeId pre-generado.
+    // Durante un failover real y largo, con tráfico normal llegando, esto
+    // podía sumar cientos/miles de líneas en el log de Railway -el propio
+    // volumen de logging (buffers de stdout acumulándose si el proceso no
+    // puede vaciarlos tan rápido como se generan, más el coste de formatear
+    // cada línea) contribuía al pico de memoria que terminaba en "Killed",
+    // aparte de ser puro ruido para diagnosticar el failover en sí.
+    // Se sustituye por un contador en memoria que se resume periódicamente
+    // (ver contadorSinWriteId más abajo): la primera vez que ocurre se
+    // avisa igual (para no perder la señal de que algo raro pasa), pero las
+    // siguientes se acumulan en silencio y se vuelcan como un único
+    // resumen cada RESUMEN_INTERVALO_MS, no una línea por escritura.
+    contadorSinWriteId.total++;
+    if (contadorSinWriteId.total === 1) {
+      console.warn(`[pending-writes] encolando ${method} ${path} sin writeId pre-generado: la fila creada en Postgres (si la hay) no llevará origin_write_id y no podrá reconciliarse automáticamente al llegar de vuelta desde D1. (siguientes ocurrencias se resumirán cada ${RESUMEN_INTERVALO_MS / 1000}s)`);
+    }
+    programarResumenSinWriteId();
   }
   try {
     await pool.query(
@@ -84,12 +100,53 @@ export async function encolarEscritura({ writeId: writeIdEntrante, method, path,
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [writeId, method, path, queryString || null, body || null, authorizationHeader || null, userId || null, originalStatus || null]
     );
-    console.log(`[pending-writes] encolada ${method} ${path} (write_id=${writeId})`);
+    // Antes: console.log por CADA escritura encolada -- mismo problema que
+    // arriba (verboso en un failover largo). Se sustituye por un contador
+    // que también se resume periódicamente, en vez de una línea por
+    // escritura. contarPendientes() (usado por /api/internal/pending-writes-count)
+    // sigue dando el conteo exacto en cualquier momento si hace falta
+    // precisión inmediata; este log es solo para seguimiento en vivo.
+    contadorEncoladas.total++;
+    programarResumenEncoladas();
     return writeId;
   } catch (error) {
     console.error("[pending-writes] no se pudo encolar la escritura:", error.message);
     return null;
   }
+}
+
+// --- Resumen periódico en vez de una línea por escritura ---
+//
+// RESUMEN_INTERVALO_MS configurable por si se quiere un resumen más o
+// menos frecuente sin tocar código. 30s por defecto: suficiente para ver
+// el ritmo de encolado en vivo durante un failover sin generar una línea
+// por cada request.
+const RESUMEN_INTERVALO_MS = Number(process.env.PENDING_WRITES_LOG_INTERVAL_MS || 30_000);
+
+const contadorEncoladas = { total: 0, timer: null };
+function programarResumenEncoladas() {
+  if (contadorEncoladas.timer) return; // ya hay un resumen programado
+  contadorEncoladas.timer = setTimeout(() => {
+    console.log(`[pending-writes] ${contadorEncoladas.total} escritura(s) encolada(s) en los últimos ${RESUMEN_INTERVALO_MS / 1000}s.`);
+    contadorEncoladas.total = 0;
+    contadorEncoladas.timer = null;
+  }, RESUMEN_INTERVALO_MS);
+  // unref(): no debe mantener vivo el proceso solo por este timer si el
+  // resto del proceso ya quiere cerrar (p.ej. en tests o en un shutdown).
+  contadorEncoladas.timer.unref?.();
+}
+
+const contadorSinWriteId = { total: 0, timer: null };
+function programarResumenSinWriteId() {
+  if (contadorSinWriteId.timer) return;
+  contadorSinWriteId.timer = setTimeout(() => {
+    if (contadorSinWriteId.total > 1) {
+      console.warn(`[pending-writes] ${contadorSinWriteId.total} escritura(s) sin writeId pre-generado en los últimos ${RESUMEN_INTERVALO_MS / 1000}s.`);
+    }
+    contadorSinWriteId.total = 0;
+    contadorSinWriteId.timer = null;
+  }, RESUMEN_INTERVALO_MS);
+  contadorSinWriteId.timer.unref?.();
 }
 
 export async function contarPendientes() {

@@ -116,7 +116,7 @@ function cors(resp) {
   // explícitamente. Sin esta línea, el frontend no tiene forma de saber
   // que una respuesta con status 200 vino en realidad de Railway a través
   // del reenvío interno del Worker (ver fetchRailway más abajo).
-  resp.headers.set("Access-Control-Expose-Headers", "X-Failover-Backend,X-Failover-Test,X-Failover-Reason");
+  resp.headers.set("Access-Control-Expose-Headers", "X-Failover-Backend,X-Failover-Test,X-Failover-Reason,X-Data-Staleness-Ms,X-Data-Staleness-Stale,X-Data-Staleness-Warning");
   return resp;
 }
 function json(data, status = 200) {
@@ -312,6 +312,142 @@ function escapeHtmlEmail(str) {
   return String(str ?? "")
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// Página de mantenimiento temporal (ver "MODO MANTENIMIENTO TEMPORAL" en
+// el fetch handler). "horaHasta" es un texto libre opcional (p.ej. "00:00
+// (medianoche, hora española)") que se muestra si se ha configurado la
+// variable MAINTENANCE_HASTA; si no, se omite esa frase sin dejar un
+// hueco raro.
+function paginaMantenimiento(horaHasta, desdeISO) {
+  const fraseHora = horaHasta
+    ? `Volvemos sobre las <strong>${escapeHtmlEmail(horaHasta)}</strong>.`
+    : "Volvemos en breve.";
+  // Igual que en public/mantenimiento.html: se expone el instante real
+  // de inicio del mantenimiento (MAINTENANCE_DESDE) para que, si esta
+  // plantilla de reserva llegara a tener su propia barra de progreso en
+  // el futuro, calcule el % real en vez de inventar un ciclo fijo. Hoy
+  // esta plantilla de texto no incluye barra de progreso, pero se deja
+  // aquí disponible por si se añade.
+  void desdeISO;
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex">
+<title>ELOTROFÚTBOLTV — En mantenimiento</title>
+<style>
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-14px); }
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: .55; }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  }
+  body {
+    min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(circle at 20% 20%, #0f3d5c 0%, #0a2540 45%, #061627 100%);
+    color: #eaf2f8;
+    overflow: hidden;
+    position: relative;
+  }
+  body::before, body::after {
+    content: "";
+    position: absolute;
+    border-radius: 50%;
+    filter: blur(60px);
+    opacity: .35;
+  }
+  body::before {
+    width: 420px; height: 420px;
+    background: #e63946;
+    top: -120px; left: -120px;
+  }
+  body::after {
+    width: 380px; height: 380px;
+    background: #1d7a8c;
+    bottom: -140px; right: -100px;
+  }
+  .card {
+    position: relative;
+    z-index: 1;
+    max-width: 480px;
+    margin: 24px;
+    padding: 48px 36px;
+    text-align: center;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 24px;
+    backdrop-filter: blur(14px);
+    box-shadow: 0 25px 60px rgba(0,0,0,0.45);
+  }
+  .ball {
+    font-size: 56px;
+    display: inline-block;
+    animation: float 3s ease-in-out infinite;
+  }
+  h1 {
+    margin: 20px 0 8px;
+    font-size: 26px;
+    letter-spacing: .3px;
+    color: #ffffff;
+  }
+  p {
+    margin: 0 0 6px;
+    font-size: 15.5px;
+    line-height: 1.6;
+    color: #c6d6e2;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 22px;
+    padding: 8px 16px;
+    border-radius: 999px;
+    background: rgba(230, 57, 70, 0.15);
+    border: 1px solid rgba(230, 57, 70, 0.4);
+    color: #ff9aa2;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: .4px;
+    text-transform: uppercase;
+  }
+  .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #ff5a64;
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  .brand {
+    margin-top: 28px;
+    font-size: 13px;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: rgba(234,242,248,0.45);
+  }
+  .brand b { color: rgba(234,242,248,0.75); }
+</style>
+</head>
+<body>
+  <div class="card">
+    <span class="ball">⚽</span>
+    <h1>Estamos haciendo un ajuste rápido</h1>
+    <p>ELOTROFÚTBOLTV vuelve enseguida, mejor que nunca.</p>
+    <p>${fraseHora}</p>
+    <div class="badge"><span class="dot"></span>Mantenimiento en curso</div>
+    <div class="brand">EL<b>OTRO</b>FÚTBOLTV</div>
+  </div>
+</body>
+</html>`;
 }
 
 // Plantilla HTML compartida por todos los avisos: cabecera con el logo
@@ -1140,13 +1276,21 @@ async function requireAuth(request, env, url) {
   // por sí solos, para no desconectar a todo el mundo de golpe.
   if (payload.sid) {
     const sesion = await env.DB.prepare(
-      "SELECT id FROM sessions WHERE id = ? AND user_id = ? AND revoked_at IS NULL"
+      "SELECT id, last_seen_at FROM sessions WHERE id = ? AND user_id = ? AND revoked_at IS NULL"
     ).bind(payload.sid, payload.uid).first();
     if (!sesion) return null;
     // No bloqueamos la respuesta por esto: es solo para que la lista de
     // "Mis sesiones" muestre cuándo se ha usado cada una por última vez.
-    env.DB.prepare("UPDATE sessions SET last_seen_at = datetime('now') WHERE id = ?")
-      .bind(payload.sid).run().catch(() => {});
+    // Throttle a 5 minutos: sin esto, cada request autenticado (que puede
+    // ser decenas por minuto en uso normal del panel) dispara un UPDATE,
+    // multiplicando innecesariamente las escrituras en D1 solo para un
+    // dato que no necesita esa precisión.
+    const yaReciente = sesion.last_seen_at &&
+      (Date.now() - new Date(sesion.last_seen_at.replace(" ", "T") + "Z").getTime()) < 5 * 60 * 1000;
+    if (!yaReciente) {
+      env.DB.prepare("UPDATE sessions SET last_seen_at = datetime('now') WHERE id = ?")
+        .bind(payload.sid).run().catch(() => {});
+    }
   }
   return payload;
 }
@@ -1239,11 +1383,16 @@ async function requireReaderAuth(request, env) {
   if (!payload || !payload.rid) return null;
   if (payload.sid) {
     const sesion = await env.DB.prepare(
-      "SELECT id FROM reader_sessions WHERE id = ? AND reader_id = ? AND revoked_at IS NULL"
+      "SELECT id, last_seen_at FROM reader_sessions WHERE id = ? AND reader_id = ? AND revoked_at IS NULL"
     ).bind(payload.sid, payload.rid).first();
     if (!sesion) return null;
-    env.DB.prepare("UPDATE reader_sessions SET last_seen_at = datetime('now') WHERE id = ?")
-      .bind(payload.sid).run().catch(() => {});
+    // Mismo throttle de 5 minutos que requireAuth, por el mismo motivo.
+    const yaReciente = sesion.last_seen_at &&
+      (Date.now() - new Date(sesion.last_seen_at.replace(" ", "T") + "Z").getTime()) < 5 * 60 * 1000;
+    if (!yaReciente) {
+      env.DB.prepare("UPDATE reader_sessions SET last_seen_at = datetime('now') WHERE id = ?")
+        .bind(payload.sid).run().catch(() => {});
+    }
   }
   return payload;
 }
@@ -1869,7 +2018,9 @@ async function contarPublicacionesPorTipo(env, autorId) {
 // Igual que contarPublicacionesPorTipo, pero para VARIOS autores a la
 // vez con una sola consulta (en vez de una por usuario). La usa
 // GET /api/users para no lanzar una query por cada fila de la tabla de
-// usuarios del panel.
+// usuarios del panel (antes: N usuarios listados = N consultas
+// idénticas escaneando "articles" una y otra vez; ver panel Analíticas >
+// Queries de Cloudflare D1, "rows read" de esta consulta).
 //
 // UNION ALL en vez de "WHERE autor_id IN (...) OR coautor_id IN (...)":
 // así cada mitad puede usar su propio índice (idx_articles_autor_publicado
@@ -2346,12 +2497,434 @@ async function publicarArticulosProgramados(env) {
     });
   }
 }
-const RAILWAY_URL =
-  "https://elotro-futbol-api-production-e57c.up.railway.app";
+// ================================================================
+// ALERTA DE CUOTA DIARIA DE D1 (prevención tras el aviso del
+// 1-sep-2026: la cuenta agotó las 5.000.000 lecturas/día gratuitas de
+// D1 y la web entera cayó en failover a Railway durante horas sin que
+// nadie se enterara hasta revisar los logs a mano).
+//
+// Consulta la GraphQL Analytics API de Cloudflare (requiere los
+// secretos CF_API_TOKEN y CF_ACCOUNT_ID, ver README) para saber cuántas
+// filas se han leído de D1 en las últimas 24h, y manda un email de
+// aviso si se supera el 80% del límite gratuito. Esta llamada NO
+// consume cuota de D1 (es a la API de Cloudflare, no a la base de
+// datos), así que es segura de hacer con frecuencia; aun así se limita
+// a una vez por hora (guardado en settings) para no ser ruidosa ni
+// generar tráfico de más sin necesidad.
+//
+// Un solo aviso por umbral y por día (guardado en settings) para no
+// mandar un email cada hora una vez superado el 80%.
+// ================================================================
+const LIMITE_DIARIO_D1_FILAS_LEIDAS = 5_000_000;
+const UMBRAL_AVISO_CUOTA_D1 = 0.8; // avisa al superar el 80% del límite
+
+async function comprobarCuotaD1SiToca(env) {
+  if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) {
+    // Sin credenciales configuradas: no es un error, simplemente esta
+    // comprobación está desactivada hasta que se configuren los
+    // secretos (ver README, sección "Alerta de cuota de D1").
+    return;
+  }
+
+  try {
+    const ultimaComprobacion = await env.DB.prepare(
+      "SELECT value FROM settings WHERE key = 'ultima_comprobacion_cuota_d1'"
+    ).first();
+    if (ultimaComprobacion?.value) {
+      const minutosDesde = (Date.now() - new Date(ultimaComprobacion.value).getTime()) / 60000;
+      // Antes cada 1h: un pico como el del 1-sep-2026 (13M filas en un
+      // día) puede agotar la cuota entera en minutos, así que el aviso
+      // por email llegaba tarde para servir de nada. 15 min reduce ese
+      // margen sin disparar demasiadas llamadas a la API de Cloudflare
+      // (esta llamada no consume cuota de D1, solo tráfico normal).
+      if (minutosDesde < 15) return;
+    }
+
+    // Guardamos la marca de "comprobado ahora" ANTES de llamar a la API
+    // externa: si la llamada falla o tarda, no queremos que el próximo
+    // disparo del cron (dentro de 1 minuto) lo intente otra vez de
+    // inmediato -- una comprobación por hora es más que suficiente y
+    // así no se amontonan llamadas si la API de Cloudflare responde
+    // lenta.
+    await env.DB.prepare(
+      `INSERT INTO settings (key, value, updated_at) VALUES ('ultima_comprobacion_cuota_d1', ?, datetime('now'))
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    ).bind(new Date().toISOString()).run();
+
+    const consulta = `
+      query {
+        viewer {
+          accounts(filter: { accountTag: "${env.CF_ACCOUNT_ID}" }) {
+            d1AnalyticsAdaptiveGroups(
+              limit: 1
+              filter: { datetime_geq: "${new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()}" }
+            ) {
+              sum { readQueries rowsRead }
+            }
+          }
+        }
+      }
+    `;
+
+    const resp = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${env.CF_API_TOKEN}`,
+      },
+      body: JSON.stringify({ query: consulta }),
+    });
+
+    if (!resp.ok) {
+      console.error(`[cuota-d1] La API de Cloudflare respondió ${resp.status} al pedir analíticas.`);
+      return;
+    }
+
+    const datos = await resp.json();
+    if (datos.errors?.length) {
+      console.error("[cuota-d1] Error de GraphQL:", JSON.stringify(datos.errors));
+      return;
+    }
+
+    const grupos = datos?.data?.viewer?.accounts?.[0]?.d1AnalyticsAdaptiveGroups || [];
+    const filasLeidas = grupos.reduce((acc, g) => acc + (g.sum?.rowsRead || 0), 0);
+    const porcentaje = filasLeidas / LIMITE_DIARIO_D1_FILAS_LEIDAS;
+
+    console.log(`[cuota-d1] Filas leídas últimas 24h: ${filasLeidas.toLocaleString("es-ES")} (${(porcentaje * 100).toFixed(1)}% del límite gratuito).`);
+
+    if (porcentaje < UMBRAL_AVISO_CUOTA_D1) return;
+
+    // Un solo aviso por día natural (UTC, que es cuando D1 resetea la
+    // cuota), aunque el cron siga comprobando cada hora mientras el
+    // consumo se mantenga alto.
+    const hoyUTC = new Date().toISOString().slice(0, 10);
+    const ultimoAviso = await env.DB.prepare(
+      "SELECT value FROM settings WHERE key = 'ultimo_aviso_cuota_d1_fecha'"
+    ).first();
+    if (ultimoAviso?.value === hoyUTC) return;
+
+    await env.DB.prepare(
+      `INSERT INTO settings (key, value, updated_at) VALUES ('ultimo_aviso_cuota_d1_fecha', ?, datetime('now'))
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    ).bind(hoyUTC).run();
+
+    const filasFmt = filasLeidas.toLocaleString("es-ES");
+    const limiteFmt = LIMITE_DIARIO_D1_FILAS_LEIDAS.toLocaleString("es-ES");
+    await enviarEmailNotificacion(env, {
+      asunto: `⚠️ Aviso: D1 al ${(porcentaje * 100).toFixed(0)}% de su cuota diaria gratuita`,
+      texto: `La base de datos D1 de ElOtroFútbolTV ha leído ${filasFmt} filas en las últimas 24h, ` +
+        `un ${(porcentaje * 100).toFixed(0)}% del límite gratuito diario (${limiteFmt}).\n\n` +
+        `Si se supera el 100%, la web entera empezará a fallar en 500 y pasará automáticamente a ` +
+        `servir desde la copia de Railway (con datos desactualizados) hasta que la cuota se resetee ` +
+        `a medianoche UTC.\n\n` +
+        `Revisa el panel de Analíticas: si alguien lo ha usado con el filtro de 365 días, suele ser ` +
+        `la causa más probable de un pico así.`,
+      html: plantillaEmail({
+        etiqueta: "⚠️ Aviso de cuota",
+        titulo: "D1 se acerca a su límite diario",
+        parrafo: `Se han leído ${filasFmt} de ${limiteFmt} filas permitidas hoy (${(porcentaje * 100).toFixed(0)}%). ` +
+          `Si se agota, la web caerá en failover a Railway con datos desactualizados hasta medianoche UTC.`,
+        filas: [
+          { etiqueta: "Filas leídas (24h)", valor: filasFmt },
+          { etiqueta: "Límite diario gratuito", valor: limiteFmt },
+          { etiqueta: "Porcentaje consumido", valor: `${(porcentaje * 100).toFixed(1)}%` },
+        ],
+      }),
+    }, { destinatario: EMAIL_NOTIFICACIONES });
+  } catch (error) {
+    console.error("[cuota-d1] Error al comprobar la cuota:", error);
+  }
+}
+
+
 
 const FAILOVER_HEADER = "X-Failover-Backend";
 const FAILOVER_TEST_HEADER = "X-Failover-Test";
 const FAILOVER_REASON_HEADER = "X-Failover-Reason";
+
+// ---------- Aviso de datos desfasados durante failover ----------
+// Complementa la cabecera X-Data-Staleness-Warning (pasiva, solo visible
+// si alguien mira las devtools): manda un email cuando el failover lleva
+// sirviendo datos con más de 30 min de desfase, para que no dependa de
+// que alguien esté mirando en ese momento -- mismo patrón anti-spam que
+// comprobarCuotaD1SiToca (un aviso cada 30 min, guardado en settings).
+async function avisarStalenessSiToca(env, staleForMsTexto) {
+  try {
+    const ultimoAviso = await env.DB.prepare(
+      "SELECT value FROM settings WHERE key = 'ultimo_aviso_staleness_failover'"
+    ).first();
+    const ahora = Date.now();
+    if (ultimoAviso?.value) {
+      const minutosDesde = (ahora - new Date(ultimoAviso.value).getTime()) / 60000;
+      if (minutosDesde < 30) return;
+    }
+    await env.DB.prepare(
+      `INSERT INTO settings (key, value, updated_at) VALUES ('ultimo_aviso_staleness_failover', ?, datetime('now'))
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    ).bind(new Date(ahora).toISOString()).run();
+
+    const staleForMs = parseInt(staleForMsTexto || "0", 10);
+    const minutos = Math.round(staleForMs / 60000);
+    await enviarEmailNotificacion(env, {
+      asunto: `⚠️ Failover activo sirviendo datos con ${minutos} min de desfase`,
+      texto: `La web está sirviendo desde Railway (failover) y el sincronizador D1->Postgres ` +
+        `lleva aproximadamente ${minutos} minutos sin avanzar. Esto significa que los datos que ` +
+        `ven los usuarios ahora mismo pueden estar desactualizados por ese tiempo.\n\n` +
+        `Revisa que sync/scheduler.mjs siga corriendo en Railway y que D1 no siga agotado más ` +
+        `tiempo del esperado. Si D1 ya se ha recuperado, el sincronizador debería ponerse al día ` +
+        `solo; si el desfase sigue creciendo, es señal de que el proceso está caído.`,
+    });
+  } catch (err) {
+    console.error("[staleness-aviso] fallo al comprobar/enviar (no crítico):", err);
+  }
+}
+
+
+// ================================================================
+// El aviso por email (comprobarCuotaD1SiToca, arriba) solo informa: si
+// un pico de lecturas ocurre entre dos comprobaciones (cada 1h), la
+// cuota se agota igualmente antes de que llegue el email. Esto añade
+// un límite que SÍ corta tráfico:
+//
+// 1. CACHÉ_ANALITICAS: cada sub-ruta de /api/admin/analiticas/* se
+//    cachea en KV durante CACHE_ANALITICAS_TTL_SEGUNDOS. Si el admin
+//    recarga el panel 20 veces seguidas, D1 solo se consulta una vez
+//    por ventana de caché, sin perder utilidad real (los números de
+//    analíticas no cambian segundo a segundo).
+//
+// 2. RANGO MÁXIMO: ?dias=365 puede escanear un año entero de
+//    article_views/article_reading. Se capa a RANGO_ANALITICAS_MAX_DIAS
+//    salvo que se pida explícitamente vía header interno (no vía
+//    querystring, para que no sea un simple "cambia la URL").
+//
+// 3. CORTACIRCUITOS GLOBAL: un contador en KV (incrementado en cada
+//    petición a una ruta "pesada") que, al superar un umbral horario,
+//    fuerza que esas rutas devuelvan 503 en vez de seguir golpeando
+//    D1. Se autorrepara solo (el contador expira) sin intervención
+//    manual -- a diferencia del modo mantenimiento manual de hoy.
+//
+// Todo esto vive en KV (ELOTROFUTBOL_KV), no en D1: consultarlo NO
+// consume cuota de lecturas de D1.
+// ================================================================
+
+const RANGO_ANALITICAS_MAX_DIAS = 90;
+const CACHE_ANALITICAS_TTL_SEGUNDOS = 600; // 10 minutos
+
+// Presupuesto horario de peticiones a rutas "pesadas" (analíticas y
+// cualquier otra que se registre con protegerRutaPesada). No es un
+// conteo exacto de filas D1 (eso solo lo sabe Cloudflare a posteriori),
+// sino un límite preventivo de cuántas veces se puede golpear una ruta
+// cara por hora -- suficiente para frenar tanto un bucle/bot como un
+// admin dejando el dashboard en autorefresco.
+const LIMITE_PETICIONES_PESADAS_POR_HORA = 60;
+
+// Incrementa el contador de la ventana horaria actual para `clave` y
+// devuelve true si YA se ha superado el límite (es decir: hay que
+// cortar y no tocar D1). Falla "abierto" (deja pasar) si KV no está
+// configurado o falla, para que un problema de KV nunca tumbe el sitio
+// entero -- el cortacircuitos es una capa extra, no la única defensa.
+async function superaLimitePeticionesPesadas(env, clave) {
+  if (!env.ELOTROFUTBOL_KV) return false;
+  try {
+    const ventana = new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
+    const kvKey = `cortacircuitos:${clave}:${ventana}`;
+    const actual = parseInt((await env.ELOTROFUTBOL_KV.get(kvKey)) || "0", 10);
+    if (actual >= LIMITE_PETICIONES_PESADAS_POR_HORA) return true;
+    await env.ELOTROFUTBOL_KV.put(kvKey, String(actual + 1), { expirationTtl: 3600 });
+    return false;
+  } catch (err) {
+    console.error("[cortacircuitos] fallo al comprobar KV, dejando pasar:", err);
+    return false;
+  }
+}
+
+// Envuelve una ruta cara en caché de KV: si hay una respuesta reciente
+// guardada bajo `cacheKey`, la devuelve sin tocar D1; si no, ejecuta
+// `generar` (que sí consulta D1), guarda el resultado y lo devuelve.
+async function conCacheKV(env, cacheKey, ttlSegundos, generar) {
+  if (env.ELOTROFUTBOL_KV) {
+    try {
+      const cacheado = await env.ELOTROFUTBOL_KV.get(cacheKey, "json");
+      if (cacheado) return { datos: cacheado, deCache: true };
+    } catch (err) {
+      console.error("[cache-kv] fallo al leer, se consulta D1:", err);
+    }
+  }
+  const datos = await generar();
+  if (env.ELOTROFUTBOL_KV) {
+    try {
+      await env.ELOTROFUTBOL_KV.put(cacheKey, JSON.stringify(datos), { expirationTtl: ttlSegundos });
+    } catch (err) {
+      console.error("[cache-kv] fallo al guardar (no crítico):", err);
+    }
+  }
+  return { datos, deCache: false };
+}
+
+// ---------- Consultas reales de cada sub-ruta de analíticas ----------
+// Extraídas a funciones aparte (mismo SQL de siempre, sin cambios) para
+// poder envolver cada una en conCacheKV desde el router sin duplicar
+// las queries. `desde` ya viene con el rango capado a
+// RANGO_ANALITICAS_MAX_DIAS aplicado por el router.
+
+async function calcularResumenAnaliticas(env, desde) {
+  const kpis = await env.DB.prepare(
+    `SELECT
+       COUNT(*) AS paginas_vistas,
+       COUNT(DISTINCT visitante_hash) AS visitantes,
+       COUNT(DISTINCT article_id) AS noticias_con_vistas
+     FROM article_views WHERE created_at >= ${desde}`
+  ).first();
+
+  const lectura = await env.DB.prepare(
+    `SELECT AVG(segundos) AS media_segundos, AVG(scroll_maximo) AS media_scroll
+     FROM article_reading WHERE created_at >= ${desde}`
+  ).first();
+
+  const { results: evolucion } = await env.DB.prepare(
+    `SELECT date(created_at) AS fecha,
+            COUNT(*) AS vistas,
+            COUNT(DISTINCT visitante_hash) AS visitantes
+     FROM article_views
+     WHERE created_at >= ${desde}
+     GROUP BY date(created_at)
+     ORDER BY fecha ASC`
+  ).all();
+
+  const { results: dispositivosFilas } = await env.DB.prepare(
+    `SELECT dispositivo, COUNT(*) AS vistas
+     FROM article_views WHERE created_at >= ${desde}
+     GROUP BY dispositivo`
+  ).all();
+
+  const dispositivos = { movil: 0, escritorio: 0, tablet: 0 };
+  for (const fila of dispositivosFilas || []) {
+    if (fila.dispositivo in dispositivos) dispositivos[fila.dispositivo] = Number(fila.vistas) || 0;
+  }
+
+  return {
+    vistas: kpis?.paginas_vistas || 0,
+    visitantes: kpis?.visitantes || 0,
+    noticias_con_vistas: kpis?.noticias_con_vistas || 0,
+    tiempo_medio_segundos: Math.round(lectura?.media_segundos || 0),
+    completitud: Math.round((lectura?.media_scroll || 0) * 10) / 10,
+    evolucion_diaria: evolucion || [],
+    dispositivos,
+    kpis: {
+      paginas_vistas: kpis?.paginas_vistas || 0,
+      visitantes: kpis?.visitantes || 0,
+      noticias_con_vistas: kpis?.noticias_con_vistas || 0,
+      tiempo_medio_lectura_segundos: Math.round(lectura?.media_segundos || 0),
+    },
+  };
+}
+
+async function calcularMasLeidasAnaliticas(env, desde, limit) {
+  const { results } = await env.DB.prepare(
+    `SELECT a.id, a.slug, a.titulo, a.categoria, a.autor_nombre,
+            COUNT(v.id) AS vistas,
+            COUNT(DISTINCT v.visitante_hash) AS visitantes,
+            (SELECT AVG(r.segundos) FROM article_reading r WHERE r.article_id = a.id AND r.created_at >= ${desde}) AS tiempo_medio_segundos
+     FROM article_views v
+     JOIN articles a ON a.id = v.article_id
+     WHERE v.created_at >= ${desde}
+     GROUP BY a.id
+     ORDER BY vistas DESC
+     LIMIT ?`
+  ).bind(limit).all();
+  return { noticias: (results || []).map((n) => ({ ...n, tiempo_medio_segundos: Math.round(n.tiempo_medio_segundos || 0) })) };
+}
+
+async function calcularFuentesAnaliticas(env, desde) {
+  const { results } = await env.DB.prepare(
+    `SELECT fuente, COUNT(*) AS vistas
+     FROM article_views WHERE created_at >= ${desde}
+     GROUP BY fuente ORDER BY vistas DESC`
+  ).all();
+  const { results: referidos } = await env.DB.prepare(
+    `SELECT referer_dominio AS dominio, fuente, COUNT(*) AS vistas
+     FROM article_views
+     WHERE created_at >= ${desde} AND referer_dominio IS NOT NULL
+     GROUP BY referer_dominio, fuente ORDER BY vistas DESC LIMIT 15`
+  ).all();
+  return { fuentes: results || [], dominios: referidos || [] };
+}
+
+async function calcularAutoresAnaliticas(env, desde) {
+  // Reescrita para evitar el "fan-out" de un doble JOIN (articles x
+  // article_views x article_reading): antes, un artículo con muchas
+  // vistas Y muchas lecturas multiplicaba filas (vistas × lecturas) antes
+  // de agregar, disparando las "rows read" muy por encima del volumen
+  // real de eventos. Ahora cada tabla de eventos se agrega por separado
+  // (ya filtrada por fecha, aprovechando el índice compuesto
+  // idx_article_views_created_article / idx_article_reading_created_article)
+  // y solo al final se cruzan los tres resultados, ya reducidos, por
+  // autor.
+  const { results: vistasPorArticulo } = await env.DB.prepare(
+    `SELECT article_id, COUNT(*) AS vistas
+     FROM article_views WHERE created_at >= ${desde}
+     GROUP BY article_id`
+  ).all();
+  if (!vistasPorArticulo || vistasPorArticulo.length === 0) return { autores: [] };
+
+  const idsConVistas = vistasPorArticulo.map((v) => v.article_id);
+  const placeholders = idsConVistas.map(() => "?").join(",");
+  const { results: articulos } = await env.DB.prepare(
+    `SELECT id, autor_nombre FROM articles WHERE id IN (${placeholders}) AND autor_nombre IS NOT NULL`
+  ).bind(...idsConVistas).all();
+  if (!articulos || articulos.length === 0) return { autores: [] };
+
+  const { results: lecturasPorArticulo } = await env.DB.prepare(
+    `SELECT article_id, AVG(segundos) AS tiempo_medio_segundos
+     FROM article_reading WHERE created_at >= ${desde} AND article_id IN (${placeholders})
+     GROUP BY article_id`
+  ).bind(...idsConVistas).all();
+
+  const vistasPorId = new Map(vistasPorArticulo.map((v) => [v.article_id, v.vistas]));
+  const lecturaPorId = new Map((lecturasPorArticulo || []).map((r) => [r.article_id, r.tiempo_medio_segundos]));
+
+  const porAutor = new Map();
+  for (const art of articulos) {
+    const acumulado = porAutor.get(art.autor_nombre) || { autor: art.autor_nombre, noticias: 0, vistas: 0, sumaTiempo: 0, conTiempo: 0 };
+    acumulado.noticias += 1;
+    acumulado.vistas += vistasPorId.get(art.id) || 0;
+    const tiempo = lecturaPorId.get(art.id);
+    if (tiempo != null) { acumulado.sumaTiempo += tiempo; acumulado.conTiempo += 1; }
+    porAutor.set(art.autor_nombre, acumulado);
+  }
+
+  const autores = [...porAutor.values()]
+    .map((a) => ({
+      autor: a.autor,
+      noticias: a.noticias,
+      vistas: a.vistas,
+      tiempo_medio_segundos: Math.round(a.conTiempo ? a.sumaTiempo / a.conTiempo : 0),
+    }))
+    .sort((a, b) => b.vistas - a.vistas);
+
+  return { autores };
+}
+
+async function calcularTiempoLecturaAnaliticas(env, desde) {
+  const { results } = await env.DB.prepare(
+    `SELECT a.categoria,
+            AVG(r.segundos) AS tiempo_medio_segundos,
+            COUNT(r.id) AS lecturas,
+            AVG(r.scroll_maximo) AS scroll_medio
+     FROM article_reading r
+     JOIN articles a ON a.id = r.article_id
+     WHERE r.created_at >= ${desde}
+     GROUP BY a.categoria
+     ORDER BY tiempo_medio_segundos DESC`
+  ).all();
+  return {
+    categorias: (results || []).map((c) => ({
+      ...c,
+      tiempo_medio_segundos: Math.round(c.tiempo_medio_segundos || 0),
+      scroll_medio: Math.round(c.scroll_medio || 0),
+    })),
+  };
+}
 
 export default {
   // Expuestas también como propiedades del handler (no solo usadas
@@ -2378,6 +2951,95 @@ export default {
 
     if (method === "OPTIONS") {
       return cors(new Response(null, { status: 204 }));
+    }
+
+    /*
+     * ============================================================
+     * MODO MANTENIMIENTO TEMPORAL
+     *
+     * Activado a mano mientras D1 tiene la cuota diaria de lecturas
+     * agotada (1-sep-2026, ver aviso). Se desactiva solo comentando o
+     * borrando la variable MAINTENANCE_MODE en wrangler.toml (o en el
+     * dashboard de Cloudflare, sin necesitar redeploy si se cambia ahí).
+     * No afecta a /api/internal/* (drain-pending-writes, cron-respaldo)
+     * para no romper la sincronización con Railway mientras tanto, ni al
+     * bypass con el header X-Maintenance-Bypass para poder seguir
+     * probando desde el panel de admin.
+     * ============================================================
+     */
+    if (
+      env.MAINTENANCE_MODE === "true" &&
+      !path.startsWith("/api/internal/") &&
+      request.headers.get("X-Maintenance-Bypass") !== env.MAINTENANCE_BYPASS_SECRET
+    ) {
+      // Servimos el MISMO archivo mantenimiento.html que usa el sitio
+      // (public/mantenimiento.html, en el otro proyecto de Cloudflare,
+      // el Worker "elotrofutboltv"). Como este Worker de la API no tiene
+      // acceso directo a esos archivos (son proyectos distintos, sin
+      // binding ASSETS aquí), lo pedimos por HTTP a
+      // https://elotrofutbol.media/mantenimiento.html. Así solo hay que
+      // editar un archivo para que el diseño de mantenimiento cambie en
+      // los dos sitios a la vez.
+      // Si esa petición fallara (el frontend caído, timeout, etc.), no
+      // dejamos la API sin respuesta: usamos paginaMantenimiento() como
+      // reserva, que genera un HTML equivalente sin depender de nada
+      // externo.
+      let html;
+      try {
+        const respuestaSitio = await fetch("https://elotrofutbol.media/mantenimiento.html", {
+          cf: { cacheTtl: 0 },
+        });
+        // OJO: el propio sitio devuelve mantenimiento.html con status 503
+        // (no 200) cuando está en mantenimiento, así que NO comprobamos
+        // response.ok aquí -- comprobamos que haya contenido de verdad.
+        const texto = await respuestaSitio.text();
+        if (!texto || texto.length < 100) throw new Error("Respuesta vacía o demasiado corta");
+        // El sitio (Pages) ya inyecta MAINTENANCE_DESDE en su propia
+        // copia de MAINTENANCE_DESDE (ver public/_worker.js), así que
+        // normalmente esto llega ya resuelto. Por si acaso ese proyecto
+        // no lo hubiera sustituido (versión desincronizada), lo
+        // resolvemos también aquí con la variable de ESTE Worker, para
+        // que la barra de progreso nunca se quede con el placeholder
+        // literal sin sustituir.
+        html = texto.includes("__MAINTENANCE_DESDE_ISO__")
+          ? texto.replace("__MAINTENANCE_DESDE_ISO__", escapeHtmlEmail(env.MAINTENANCE_DESDE || ""))
+          : texto;
+      } catch (err) {
+        html = paginaMantenimiento(env.MAINTENANCE_HASTA || null, env.MAINTENANCE_DESDE || null);
+      }
+      return new Response(html, {
+        status: 503,
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Retry-After": "3600",
+          "Cache-Control": "no-store",
+        },
+      });
+    }
+
+    /*
+     * ============================================================
+     * CORTACIRCUITOS DE RUTAS PESADAS (prevención dura de cuota D1)
+     *
+     * Antes de llegar a cualquier ruta de /api/admin/analiticas, se
+     * comprueba el presupuesto horario en KV. Si se ha superado, se
+     * corta aquí con 503 sin ejecutar ninguna consulta a D1 -- esto es
+     * lo que evita que un pico (bucle, bot, admin con autorefresco)
+     * repita lo de hoy, en vez de solo avisar por email después de que
+     * ya haya pasado. Ver comprobarCuotaD1SiToca para el aviso, y
+     * conCacheKV/RANGO_ANALITICAS_MAX_DIAS para las otras dos capas.
+     * ============================================================
+     */
+    if (path.startsWith("/api/admin/analiticas")) {
+      if (await superaLimitePeticionesPesadas(env, "analiticas")) {
+        return json(
+          {
+            error:
+              "Panel de analíticas temporalmente limitado para proteger la cuota de la base de datos. Inténtalo de nuevo en unos minutos.",
+          },
+          503
+        );
+      }
     }
 
     /*
@@ -2624,7 +3286,9 @@ export default {
       return await fetchRailway(
         request,
         path,
-        "FAILOVER_TEST"
+        "FAILOVER_TEST",
+        env,
+        ctx
       );
     }
 
@@ -2838,6 +3502,21 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
      * ============================================================
      */
 
+    // Cortacircuito por ruta (ver definición arriba, junto a
+    // fetchRailway): si esta ruta+método viene fallando de forma
+    // sostenida en el primario, se salta el intento y se va directo a
+    // Railway, en vez de sumar un intento fallido al primario en CADA
+    // petición mientras dura el problema.
+    if (await circuitoEstaAbierto(env, method, path)) {
+      return await fetchRailway(
+        request,
+        path,
+        "CIRCUITO_ABIERTO",
+        env,
+        ctx
+      );
+    }
+
     try {
       const primaryResponse = await handlePrimary(
         request,
@@ -2858,6 +3537,13 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
        */
 
       if (primaryResponse.status < 500) {
+        // Éxito (o al menos, no es un fallo del servidor): limpia
+        // cualquier contador de fallos que hubiera para esta ruta. Se
+        // hace con ctx.waitUntil porque no es algo que deba retrasar la
+        // respuesta al usuario -es limpieza de estado, no parte de la
+        // respuesta en sí-.
+        ctx.waitUntil(circuitoRegistrarExitoPrimario(env, method, path));
+
         const headers = new Headers(
           primaryResponse.headers
         );
@@ -2890,15 +3576,30 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
        * ==========================================================
        */
 
+      let cuerpoErrorPrimario = "";
+      try {
+        cuerpoErrorPrimario = await primaryResponse.clone().text();
+      } catch (e) {
+        cuerpoErrorPrimario = `[no se pudo leer el body: ${e.message}]`;
+      }
       console.error(
         `[FAILOVER] Principal respondió ${primaryResponse.status}. ` +
-        `Activando Railway.`
+        `Activando Railway. Body: ${cuerpoErrorPrimario}`
       );
+
+      // Igual que el éxito de arriba: no debe retrasar la respuesta al
+      // usuario, así que se registra en segundo plano. El failover a
+      // Railway de ESTA petición ya se decide con el contador actual
+      // (antes de sumar este fallo); el efecto de este fallo se nota a
+      // partir de la SIGUIENTE petición a la misma ruta.
+      ctx.waitUntil(circuitoRegistrarFalloPrimario(env, method, path));
 
       return await fetchRailway(
         request,
         path,
-        `PRIMARY_${primaryResponse.status}`
+        `PRIMARY_${primaryResponse.status}`,
+        env,
+        ctx
       );
 
     } catch (primaryError) {
@@ -2916,10 +3617,14 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         primaryError
       );
 
+      ctx.waitUntil(circuitoRegistrarFalloPrimario(env, method, path));
+
       return await fetchRailway(
         request,
         path,
-        "PRIMARY_EXCEPTION"
+        "PRIMARY_EXCEPTION",
+        env,
+        ctx
       );
     }
   },
@@ -2937,6 +3642,10 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
     // "desatendido" justo después y no se dupliquen los avisos.
     ctx.waitUntil(marcarPartidosColgados(env, ctx).then(() => revisarPartidosDesatendidos(env, ctx)));
     ctx.waitUntil(enviarBoletinSemanalSiToca(env));
+    // Comprobación de cuota de D1 (ver "ALERTA DE CUOTA DIARIA DE D1"
+    // más abajo). Se autolimita a una vez por hora internamente, así
+    // que es seguro dejarla en el cron de cada minuto.
+    ctx.waitUntil(comprobarCuotaD1SiToca(env));
   },
 };
 
@@ -3049,19 +3758,191 @@ async function drainPendingWrites(request, env, ctx) {
   return json({ results: resultados });
 }
 
+// ============================================================
+// CORTACIRCUITO DE FAILOVER POR RUTA (server-side, en KV)
+// ============================================================
+//
+// Contexto del problema: sin esto, cada petición individual que llega al
+// Worker mientras UNA ruta concreta está devolviendo 5xx en el primario
+// (p.ej. un bug puntual en /api/polls/portada, o D1 con un problema
+// aislado a esa consulta) intentaba SIEMPRE primero contra el primario
+// -que fallaba- y LUEGO hacía failover a Railway. Con tráfico sostenido a
+// alta frecuencia contra esa misma ruta (un bucle de reintentos del
+// cliente, un bot, o simplemente mucho tráfico normal coincidiendo con el
+// fallo), esto duplica el trabajo en cada petición: un intento fallido al
+// primario más una petición completa a Railway, sin ningún límite. Es lo
+// que se vio en producción el 2026-09-04: ~30 peticiones/segundo a
+// /api/polls/portada, cada una golpeando primario Y Railway, sostenido
+// varios minutos -Railway terminó con "Killed" (OOM) por la carga real
+// generada, no por logs.
+//
+// Nótese que esto es DISTINTO del circuit breaker que ya existe en el
+// navegador (public/js/config.js, eofApiState): aquel vive en memoria de
+// cada pestaña del navegador y solo protege a ESE cliente. Este vive en
+// KV (compartido entre TODOS los isolates del Worker, en todas las
+// regiones) y protege al propio backend de tener que intentar el
+// primario en cada petición de CUALQUIER cliente mientras una ruta está
+// claramente caída.
+//
+// Diseño (a propósito más simple que el del navegador, sin "half-open"):
+//   - Se cuenta, en KV, cuántos 5xx consecutivos ha dado el primario para
+//     una ruta+método concretos (normalizando IDs numéricos en la ruta,
+//     ver normalizarRutaParaCircuito, para que /api/articles/123 y
+//     /api/articles/456 compartan contador -si no, un bucle que varía el
+//     ID nunca acumularía fallos "de la misma ruta").
+//   - Al llegar a CIRCUITO_FALLOS_PARA_ABRIR, se guarda una marca "abierto
+//     hasta <timestamp>" con TTL en KV.
+//   - Mientras el circuito esté abierto para esa ruta, las peticiones
+//     entrantes se envían DIRECTAMENTE a Railway, sin intentar el
+//     primario -así se evita el doble trabajo, y el primario deja de
+//     recibir presión de una ruta que ya se sabe que está fallando,
+//     dándole margen para recuperarse en vez de seguir recibiendo el
+//     mismo volumen de tráfico que causó/acompaña el problema-.
+//   - Pasado CIRCUITO_ABIERTO_MS, la siguiente petición vuelve a intentar
+//     el primario (sin contador de "medio abierto": si vuelve a fallar,
+//     se reabre inmediatamente con el próximo fallo).
+//   - Un solo 5xx aislado NO abre el circuito (evita que un error puntual
+//     tumbe la ruta entera durante 20s); hace falta que se repita.
+//
+// Todo esto es "best effort": si KV falla o no está disponible, se
+// comporta exactamente como antes (intenta primario en cada petición) --
+// nunca debe ser la causa de que una petición no se atienda.
+const CIRCUITO_FALLOS_PARA_ABRIR = 5;
+const CIRCUITO_ABIERTO_MS = 20_000;
+const CIRCUITO_KV_PREFIX = "circuito:";
+
+function normalizarRutaParaCircuito(path) {
+  // Los IDs numéricos varían por petición pero deben compartir contador
+  // (/api/articles/123, /api/articles/456 -> /api/articles/:id). Sin
+  // esto, un bucle contra distintos IDs de una ruta con bug nunca
+  // acumularía suficientes fallos para abrir el circuito.
+  return path.replace(/\/\d+(?=\/|$)/g, "/:id");
+}
+
+function claveCircuito(method, path) {
+  return `${CIRCUITO_KV_PREFIX}${method}:${normalizarRutaParaCircuito(path)}`;
+}
+
+async function circuitoEstaAbierto(env, method, path) {
+  if (!env.ELOTROFUTBOL_KV) return false;
+  try {
+    const valor = await env.ELOTROFUTBOL_KV.get(claveCircuito(method, path));
+    if (!valor) return false;
+    const datos = JSON.parse(valor);
+    return typeof datos.abiertoHasta === "number" && Date.now() < datos.abiertoHasta;
+  } catch (error) {
+    // No dejar que un fallo leyendo KV bloquee la petición: se comporta
+    // como si el circuito estuviera cerrado (intenta primario, como
+    // siempre se ha hecho).
+    console.warn("[circuito] no se pudo leer estado, se asume cerrado:", error.message);
+    return false;
+  }
+}
+
+async function circuitoRegistrarFalloPrimario(env, method, path) {
+  if (!env.ELOTROFUTBOL_KV) return;
+  const clave = claveCircuito(method, path);
+  try {
+    const actual = await env.ELOTROFUTBOL_KV.get(clave);
+    const datos = actual ? JSON.parse(actual) : { fallos: 0, abiertoHasta: 0 };
+    // Si el circuito ya estaba abierto, este fallo no suma al contador de
+    // "fallos consecutivos para abrir" -ya está abierto-, pero si acaba
+    // de expirar el TTL de apertura anterior, se trata como un fallo
+    // nuevo tras haber estado cerrado.
+    const yaAbierto = Date.now() < datos.abiertoHasta;
+    const nuevosFallos = yaAbierto ? datos.fallos : datos.fallos + 1;
+    const abrirAhora = nuevosFallos >= CIRCUITO_FALLOS_PARA_ABRIR;
+    const nuevoEstado = {
+      fallos: abrirAhora ? 0 : nuevosFallos, // se resetea el contador al abrir
+      abiertoHasta: abrirAhora ? Date.now() + CIRCUITO_ABIERTO_MS : datos.abiertoHasta,
+    };
+    // TTL generoso (el doble del tiempo que el circuito puede estar
+    // abierto): suficiente para que la clave sobreviva mientras el
+    // circuito está abierto, pero sin dejar contadores de fallos
+    // colgados en KV indefinidamente si la ruta se recupera y no vuelve
+    // a fallar.
+    await env.ELOTROFUTBOL_KV.put(clave, JSON.stringify(nuevoEstado), {
+      expirationTtl: Math.ceil((CIRCUITO_ABIERTO_MS * 2) / 1000),
+    });
+    if (abrirAhora && !yaAbierto) {
+      console.warn(
+        `[circuito] ABIERTO para ${method} ${normalizarRutaParaCircuito(path)} tras ` +
+        `${CIRCUITO_FALLOS_PARA_ABRIR} fallos consecutivos del primario. ` +
+        `Las próximas peticiones a esta ruta irán directas a Railway durante ${CIRCUITO_ABIERTO_MS / 1000}s.`
+      );
+    }
+  } catch (error) {
+    console.warn("[circuito] no se pudo registrar fallo:", error.message);
+  }
+}
+
+async function circuitoRegistrarExitoPrimario(env, method, path) {
+  if (!env.ELOTROFUTBOL_KV) return;
+  const clave = claveCircuito(method, path);
+  try {
+    // Un éxito limpia el contador de fallos por completo (no hace falta
+    // esperar un TTL): la ruta ha demostrado estar sana de nuevo.
+    await env.ELOTROFUTBOL_KV.delete(clave);
+  } catch (error) {
+    // No es crítico: el peor caso es que el contador tarde un poco más
+    // en resetearse (el TTL de arriba lo limpia de todas formas).
+  }
+}
+
+// Resumen periódico del volumen de peticiones que van a Railway por
+// tener el circuito abierto (ver fetchRailway más abajo). Vive en
+// memoria del isolate (no en KV): cada isolate de Cloudflare Workers es
+// efímero y de corta vida, así que no hace falta compartir este contador
+// entre isolates -es solo para no generar una línea de log por cada
+// petición mientras dura un mismo isolate atendiendo tráfico hacia una
+// ruta con el circuito abierto-.
+const RESUMEN_FAILOVER_INTERVALO_MS = 30_000;
+const contadorFailoverPorCircuito = { total: 0, timer: null };
+function programarResumenFailoverPorCircuito() {
+  if (contadorFailoverPorCircuito.timer) return;
+  contadorFailoverPorCircuito.timer = setTimeout(() => {
+    console.log(
+      `[FAILOVER] ${contadorFailoverPorCircuito.total} petición(es) enviadas directas a Railway ` +
+      `por circuito abierto en los últimos ${RESUMEN_FAILOVER_INTERVALO_MS / 1000}s.`
+    );
+    contadorFailoverPorCircuito.total = 0;
+    contadorFailoverPorCircuito.timer = null;
+  }, RESUMEN_FAILOVER_INTERVALO_MS);
+}
+
 async function fetchRailway(
   request,
   path,
-  reason
+  reason,
+  env,
+  ctx
 ) {
   const railwayUrl =
     RAILWAY_URL +
     path +
     new URL(request.url).search;
 
-  console.log(
-    `[FAILOVER] Railway → ${request.method} ${path} (${reason})`
-  );
+  // Antes: console.log incondicional por CADA petición reenviada a
+  // Railway. Bajo el patrón visto en producción (una ruta fallando de
+  // forma sostenida, ~30 peticiones/segundo durante minutos) esto por sí
+  // solo generaba miles de líneas en wrangler tail. Con reason ===
+  // "CIRCUITO_ABIERTO" (ver circuitoEstaAbierto arriba) puede seguir
+  // habiendo ese mismo volumen de peticiones yendo directas a Railway
+  // mientras el circuito sigue abierto -es justo el caso que el
+  // cortacircuito no puede evitar del todo, solo evita el intento
+  // duplicado contra el primario-, así que aquí también se resume en vez
+  // de loguear una línea por petición cuando la razón es el circuito.
+  // Para el resto de razones (PRIMARY_5xx puntual, excepción, test
+  // manual) sí interesa ver cada una: son mucho menos frecuentes y cada
+  // una es señal de un fallo real distinto.
+  if (reason === "CIRCUITO_ABIERTO") {
+    contadorFailoverPorCircuito.total++;
+    programarResumenFailoverPorCircuito();
+  } else {
+    console.log(
+      `[FAILOVER] Railway → ${request.method} ${path} (${reason})`
+    );
+  }
 
   try {
     /*
@@ -3137,7 +4018,38 @@ async function fetchRailway(
     // (ver el mismo razonamiento en la función cors() de este archivo).
     headers.set(
       "Access-Control-Expose-Headers",
-      "X-Failover-Backend,X-Failover-Test,X-Failover-Reason"
+      "X-Failover-Backend,X-Failover-Test,X-Failover-Reason,X-Data-Staleness-Ms,X-Data-Staleness-Stale,X-Data-Staleness-Warning"
+    );
+
+    // Railway marca X-Data-Staleness-Warning cuando el sincronizador
+    // D1->Postgres lleva más de 30 min sin avanzar (ver
+    // UMBRAL_AVISO_STALENESS_MS en worker-secondary/src/server-railway.js).
+    // Se avisa por email para que esto no se descubra solo mirando la
+    // consola del navegador, como pasó el 1-sep-2026.
+    if (ctx && headers.get("X-Data-Staleness-Warning") === "true") {
+      ctx.waitUntil(avisarStalenessSiToca(env, headers.get("X-Data-Staleness-Ms")));
+    }
+
+    // FORZAMOS el CORS aquí, en vez de confiar en que Railway lo haya
+    // puesto (server-railway.js lo añade normalmente vía el middleware
+    // cors() de Hono, pero si Railway está caído, reiniciándose, o el
+    // error ocurre a nivel de plataforma/proxy antes de llegar a Hono, su
+    // respuesta llega sin cabecera CORS). Sin esto, el navegador bloquea
+    // la respuesta de Railway con un error de CORS que oculta el error
+    // real (que puede ser un 502/503/500 legítimo), como pasaba en
+    // producción: la consola mostraba "blocked by CORS policy" en vez del
+    // fallo real de Railway.
+    headers.set(
+      "Access-Control-Allow-Origin",
+      "https://elotrofutbol.media"
+    );
+    headers.set(
+      "Access-Control-Allow-Methods",
+      "GET,POST,PUT,DELETE,OPTIONS"
+    );
+    headers.set(
+      "Access-Control-Allow-Headers",
+      "Content-Type,Authorization"
     );
 
     /*
@@ -3445,11 +4357,14 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- Editar perfil propio (lector logueado): nombre + avatar ----------
-      // Falta también aquí bajo este path exacto (existía como
-      // /api/me/perfil, otra ruta): public/cuenta.html llama a
-      // /api/readers/me/perfil, y si algún día esta API atiende ese
-      // tráfico durante un failover, necesita responder igual que el
-      // Worker primario para que el drain no vuelva a fallar con 404.
+      // Faltaba en este Worker (solo existía como /api/me/perfil en
+      // worker-secondary, con otro path): público/cuenta.html la llama
+      // como GET y PUT a /api/readers/me/perfil. El GET ya lo cubre
+      // /api/readers/me de arriba (mismos campos), así que aquí solo
+      // hace falta el PUT. Se reutiliza el mismo patrón que
+      // /api/readers/me/password: requireReaderAuth + devolver un JWT
+      // nuevo (el frontend guarda { token, reader } tras cada guardado
+      // para reflejar el cambio sin tener que volver a iniciar sesión).
       if (path === "/api/readers/me/perfil" && method === "PUT") {
         const payload = await requireReaderAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
@@ -3464,6 +4379,11 @@ async function handlePrimary(request, env, ctx) {
         await env.DB.prepare("UPDATE readers SET nombre = ?, avatar_url = ? WHERE id = ?")
           .bind(nombre, avatarUrl, lector.id).run();
 
+        // Se reemite el JWT (mismo sid, no se cierra ninguna sesión) para
+        // que el objeto "reader" que guarda el frontend en localStorage
+        // quede con el nombre/avatar nuevos sin tener que volver a hacer
+        // login. Mismos campos en el payload que crearSesionLector, para
+        // no cambiar la forma del JWT que ya emite el login normal.
         const token = await createJWT(
           { rid: lector.id, nombre, email: lector.email, sid: payload.sid },
           env.JWT_SECRET
@@ -4130,6 +5050,12 @@ async function handlePrimary(request, env, ctx) {
         if (q) { query += " AND (descripcion LIKE ? OR usuario_nombre LIKE ?)"; binds.push(`%${q}%`, `%${q}%`); }
         if (desde) { query += " AND created_at >= ?"; binds.push(`${desde} 00:00:00`); }
         if (hasta) { query += " AND created_at <= ?"; binds.push(`${hasta} 23:59:59`); }
+        // Si no se pasa "desde", se acota igualmente a los últimos 90 días
+        // por defecto: sin esto, el COUNT(*) de abajo escaneaba
+        // activity_log entera (solo crece, nunca se purga) cada vez que se
+        // abría el panel de Actividad sin filtros — esta ruta ya fue la
+        // causa de agotar la cuota diaria de D1 el 1-sep-2026.
+        if (!desde) { query += " AND created_at >= datetime('now', '-90 days')"; }
 
         let countQuery = query.replace("SELECT *", "SELECT COUNT(*) AS total");
         const totalRow = await env.DB.prepare(countQuery).bind(...binds).first();
@@ -4140,19 +5066,37 @@ async function handlePrimary(request, env, ctx) {
 
         // Lista de acciones y usuarios distintos, para rellenar los
         // desplegables de filtro en el panel sin tener que traerse todo
-        // el historial.
+        // el historial. IMPORTANTE: acotado a los últimos 90 días -- sin
+        // este filtro, estas dos consultas escaneaban la tabla
+        // activity_log ENTERA (que solo crece, nunca se purga) cada vez
+        // que se abría el panel de Actividad, y fueron la causa de
+        // agotar la cuota diaria gratuita de lecturas de D1 (ver aviso
+        // del 1-sep-2026). 90 días es de sobra para los desplegables de
+        // filtro sin necesitar leer años de histórico en cada carga.
         const { results: accionesDistintas } = await env.DB.prepare(
-          "SELECT DISTINCT accion FROM activity_log ORDER BY accion"
+          "SELECT DISTINCT accion FROM activity_log WHERE created_at >= datetime('now', '-90 days') ORDER BY accion"
         ).all();
         const { results: usuariosDistintos } = await env.DB.prepare(
-          "SELECT DISTINCT usuario_id, usuario_nombre FROM activity_log WHERE usuario_id IS NOT NULL ORDER BY usuario_nombre"
+          "SELECT DISTINCT usuario_id, usuario_nombre FROM activity_log WHERE usuario_id IS NOT NULL AND created_at >= datetime('now', '-90 days') ORDER BY usuario_nombre"
         ).all();
+        // Se añade el equipo de cada usuario (si lo tiene) para poder
+        // diferenciar en el desplegable de filtro a usuarios con el mismo
+        // nombre, igual que se hace en el selector de autor de la noticia.
+        const { results: equiposUsuarios } = await env.DB.prepare(
+          "SELECT id, equipo FROM users"
+        ).all();
+        const equipoPorUsuarioId = {};
+        equiposUsuarios.forEach((u) => { equipoPorUsuarioId[u.id] = parsearEquipos(u.equipo); });
+        const usuariosConEquipo = usuariosDistintos.map((u) => ({
+          ...u,
+          usuario_equipo: equipoPorUsuarioId[u.usuario_id] || [],
+        }));
 
         return json({
           actividad: results,
           total: totalRow ? totalRow.total : 0,
           acciones: accionesDistintas.map((a) => a.accion),
-          usuarios: usuariosDistintos,
+          usuarios: usuariosConEquipo,
         });
       }
 
@@ -4791,9 +5735,13 @@ async function handlePrimary(request, env, ctx) {
         // (noticia.html?slug=...), a qué categoría pertenece y así poder
         // hacer el 301 a la URL bonita /futbol/{categoria}/{slug}.
         const slugExacto = url.searchParams.get("slug");
-        // Tope máximo de 2000: sin este cap, cualquiera podía pedir
-        // ?limit=100000 y forzar un escaneo/orden gigante sobre articles
-        // (mismo criterio que el Worker principal, ver worker/src/index.js).
+        // Tope máximo de 2000 (mismo criterio que /api/results): sin este
+        // cap, cualquiera podía pedir ?limit=100000 y forzar un
+        // escaneo/orden gigante sobre articles. Antes el tope era 100, lo
+        // que dejaba fuera del panel de Redacción > Noticias cualquier
+        // noticia que no estuviera entre las 100 más recientes (el
+        // buscador de ese listado solo filtra en texto DENTRO de lo ya
+        // traído), aunque siguiera existiendo en la base de datos.
         const limitPedido = parseInt(url.searchParams.get("limit") || "30", 10);
         const limit = Number.isInteger(limitPedido) && limitPedido > 0 ? Math.min(limitPedido, 2000) : 30;
         let admin = url.searchParams.get("admin") === "1";
@@ -4811,7 +5759,9 @@ async function handlePrimary(request, env, ctx) {
         // en): son columnas grandes de HTML que los listados nunca
         // muestran. Para saber qué idiomas están completos
         // (conIdiomasDisponibles exige título Y contenido no vacíos) basta
-        // con la LONGITUD del contenido traducido, no su texto.
+        // con la LONGITUD del contenido traducido, no su texto: se pide
+        // como "contenido_XX_len" y se traduce a un booleano equivalente
+        // a tener contenido, sin transferir el HTML entero.
         let query = `SELECT id, slug, titulo, subtitulo, contenido, tipo, categoria, club, imagen_url, imagenes,
             resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado,
             estado_borrador, programado_para, slug_congelado, fecha_publicacion, created_at, updated_at,
@@ -4837,12 +5787,15 @@ async function handlePrimary(request, env, ctx) {
         // puede usar índice por el comodín inicial y provoca un full table
         // scan leyendo el contenido completo de cada artículo. Si hace
         // falta buscar también en el cuerpo, la solución correcta es una
-        // tabla FTS5/tsvector, no este LIKE (igual que el Worker principal).
+        // tabla FTS5 de SQLite, no este LIKE.
         if (busqueda) { query += " AND titulo LIKE ?"; binds.push(`%${busqueda}%`); }
         query += " ORDER BY fecha_publicacion DESC LIMIT ?";
         binds.push(limit);
 
         const { results } = await env.DB.prepare(query).bind(...binds).all();
+        // Reconstruye, a partir de las longitudes pedidas, los mismos
+        // campos "contenido_XX" que espera conIdiomasDisponibles (solo le
+        // importa si están vacíos o no), sin haber transferido el texto.
         const articulosParaIdiomas = results.map((a) => ({
           ...a,
           contenido_eu: a.contenido_eu_len ? "x" : null,
@@ -4857,7 +5810,6 @@ async function handlePrimary(request, env, ctx) {
           }),
         });
       }
-
       if (path === "/api/articles" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
@@ -4932,8 +5884,9 @@ async function handlePrimary(request, env, ctx) {
         const imagenPortada = body.imagen_url || (imagenes.find((i) => i.tipo !== "tweet") || {}).url || null;
         // Es obligatorio poner al menos una imagen de portada por noticia.
         // Un borrador "en proceso" (todavía se está escribiendo) puede no
-        // tenerla todavía; para cualquier otro caso (publicada, programada
-        // o borrador "terminado") es obligatoria.
+        // tenerla todavía, igual que puede no cumplir los límites de
+        // longitud del contenido; para cualquier otro caso (publicada,
+        // programada o borrador "terminado") es obligatoria.
         if (!imagenPortada && estadoBorrador !== "en_proceso") {
           return json({ error: "Debes añadir al menos una imagen de portada a la noticia." }, 400);
         }
@@ -4976,8 +5929,9 @@ async function handlePrimary(request, env, ctx) {
         const slugCongelado = body.publicado !== false ? 1 : 0;
 
         // Ficha técnica del partido (solo tiene sentido para crónicas). Se
-        // manda ya normalizada desde el panel; aquí solo se guarda tal
-        // cual como JSON, o NULL si no se manda o viene vacía.
+        // manda ya normalizada desde el panel (ver admin.js,
+        // obtenerFichaTecnicaFormulario); aquí solo se guarda tal cual como
+        // JSON, o NULL si no se manda o viene vacía.
         const fichaTecnica = (body.tipo === "cronica" && body.ficha_tecnica && Object.keys(body.ficha_tecnica).length)
           ? JSON.stringify(body.ficha_tecnica)
           : null;
@@ -5273,13 +6227,18 @@ async function handlePrimary(request, env, ctx) {
 
         const body = await request.json();
 
-        // Un redactor de Nivel 1 no puede publicar directamente al editar:
-        // si no es admin y no ha llegado a Nivel 2, cualquier intento de
-        // dejarla publicada (true, o sin mandar el campo, que por defecto
-        // publicaría) se guarda siempre sin publicar salvo que use
-        // "Última hora" con su PIN.
+        // Un redactor de Nivel 1 no puede publicar directamente una noticia
+        // NUEVA al editarla: si no es admin y no ha llegado a Nivel 2,
+        // cualquier intento de dejarla publicada (true, o sin mandar el
+        // campo, que por defecto publicaría) se guarda sin publicar salvo
+        // que use "Última hora" con su PIN. Pero esto solo se aplica
+        // mientras la noticia todavía no estaba publicada: si ya lo
+        // estaba, simplemente editarla (p. ej. corregir una errata) no
+        // debe despublicarla y devolverla a borrador, o cualquier
+        // redactor de Nivel 1 la haría desaparecer de la web sin querer
+        // cada vez que la retocase.
         let nivelUsuario = payload.rol === "admin" ? NIVEL_MAXIMO : null;
-        if (payload.rol !== "admin" && body.publicado !== false) {
+        if (payload.rol !== "admin" && body.publicado !== false && !articuloParaPermiso.publicado) {
           nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
           if (nivelUsuario < 2) {
             const puedeUltimaHora = await comprobarUltimaHora(env, body.ultima_hora_pin);
@@ -5400,7 +6359,8 @@ async function handlePrimary(request, env, ctx) {
         // Ficha técnica del partido (solo crónicas). Igual que al crear:
         // si se manda el campo, se guarda tal cual (o se borra si llega
         // vacío/null); si no se manda en absoluto, se conserva la que ya
-        // hubiera.
+        // hubiera (p. ej. una edición que solo toca el título no debe
+        // borrar la ficha técnica ya rellenada).
         const tipoFinal = body.tipo || articuloParaPermiso.tipo || "noticia";
         let fichaTecnica = articuloParaPermiso.ficha_tecnica || null;
         if (Object.prototype.hasOwnProperty.call(body, "ficha_tecnica")) {
@@ -5722,6 +6682,361 @@ async function handlePrimary(request, env, ctx) {
           accion: "crear_club_personalizado", entidad: "club",
           descripcion: `Ha añadido "${nombre}" a la lista de clubes de ${categoria}`,
         }));
+        return json({ ok: true });
+      }
+
+      // ---------- TIENDA DE ACREDITACIÓN (gorra, camiseta, micro...) ----------
+      // Sin pasarela de pago: el pago se hace por Bizum fuera de la web y
+      // un admin (o un redactor con permiso "puede_gestionar_tienda") lo
+      // confirma a mano desde el panel. Ver worker/migracion_tienda.sql.
+
+      // Comprueba si quien hace la petición puede gestionar TODOS los
+      // pedidos de la tienda (verlos y cambiarles el estado), no solo
+      // los suyos propios: los admin siempre pueden, y además cualquier
+      // usuario al que se le haya dado el permiso puede_gestionar_tienda.
+      async function puedeGestionarTienda(env, payload) {
+        if (payload.rol === "admin") return true;
+        const fila = await env.DB.prepare(
+          "SELECT puede_gestionar_tienda FROM users WHERE id = ?"
+        ).bind(payload.uid).first();
+        return !!(fila && fila.puede_gestionar_tienda === 1);
+      }
+
+      // Catálogo de productos activos, visible para cualquier persona
+      // logueada en el panel (no hace falta ser admin para ver la tienda).
+      if (path === "/api/tienda/productos" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const { results: productos } = await env.DB.prepare(
+          `SELECT id, nombre, descripcion, precio_centimos, imagen_url, variantes
+           FROM tienda_productos WHERE activo = 1 ORDER BY orden ASC, id ASC`
+        ).all();
+        return json({
+          productos: productos.map((p) => ({
+            ...p,
+            variantes: p.variantes ? JSON.parse(p.variantes) : [],
+          })),
+        });
+      }
+
+      // ---------- Gestión del catálogo (crear/editar/activar productos) ----------
+      // Todo lo de aquí abajo solo para quien puede gestionar la tienda
+      // (admin o redactor con el permiso concedido).
+
+      // Listado completo, incluidos los productos desactivados, para la
+      // subtab "Productos" del panel de gestión.
+      if (path === "/api/tienda/productos/todos" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!(await puedeGestionarTienda(env, payload))) {
+          return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
+        }
+        const { results: productos } = await env.DB.prepare(
+          `SELECT id, nombre, descripcion, precio_centimos, imagen_url, variantes, activo, orden
+           FROM tienda_productos ORDER BY orden ASC, id ASC`
+        ).all();
+        return json({
+          productos: productos.map((p) => ({
+            ...p,
+            variantes: p.variantes ? JSON.parse(p.variantes) : [],
+          })),
+        });
+      }
+
+      // Valida y normaliza los campos de un producto recibidos del panel,
+      // compartido entre crear y editar. Lanza un Error con el mensaje a
+      // mostrar si algo no es válido.
+      function validarCamposProducto(body) {
+        const nombre = normalizarTexto(body.nombre);
+        if (!nombre) throw new Error("Falta el nombre del producto");
+        const precio = Number(body.precio_centimos);
+        if (!Number.isInteger(precio) || precio <= 0) {
+          throw new Error("El precio no es válido (debe ser un número de céntimos mayor que 0)");
+        }
+        let variantes = [];
+        if (Array.isArray(body.variantes)) {
+          variantes = body.variantes
+            .map((v) => (typeof v === "string" ? v.trim() : ""))
+            .filter(Boolean);
+        }
+        return {
+          nombre,
+          descripcion: normalizarTexto(body.descripcion),
+          precio_centimos: precio,
+          imagen_url: normalizarTexto(body.imagen_url),
+          variantes: JSON.stringify(variantes),
+          orden: Number.isInteger(Number(body.orden)) ? Number(body.orden) : 0,
+        };
+      }
+
+      // Crea un producto nuevo en el catálogo.
+      if (path === "/api/tienda/productos" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!(await puedeGestionarTienda(env, payload))) {
+          return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
+        }
+        const body = await request.json();
+        let campos;
+        try {
+          campos = validarCamposProducto(body);
+        } catch (err) {
+          return json({ error: err.message }, 400);
+        }
+        const { meta } = await env.DB.prepare(
+          `INSERT INTO tienda_productos (nombre, descripcion, precio_centimos, imagen_url, variantes, orden)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).bind(campos.nombre, campos.descripcion, campos.precio_centimos, campos.imagen_url, campos.variantes, campos.orden).run();
+
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "crear_producto_tienda", entidad: "producto_tienda", entidad_id: meta.last_row_id,
+          descripcion: `${payload.nombre} ha creado el producto "${campos.nombre}" en la tienda`,
+        }));
+
+        return json({ ok: true, id: meta.last_row_id });
+      }
+
+      // Edita un producto existente (datos, o solo activo/inactivo si el
+      // body trae únicamente ese campo).
+      if (path.match(/^\/api\/tienda\/productos\/\d+$/) && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!(await puedeGestionarTienda(env, payload))) {
+          return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
+        }
+        const productoId = parseInt(path.split("/").pop(), 10);
+        const body = await request.json();
+
+        // Cambio rápido de solo "activo" (activar/desactivar desde el
+        // interruptor de la lista), sin tener que reenviar todos los campos.
+        if (typeof body.activo === "boolean" && Object.keys(body).length === 1) {
+          const resultado = await env.DB.prepare(
+            "UPDATE tienda_productos SET activo = ? WHERE id = ?"
+          ).bind(body.activo ? 1 : 0, productoId).run();
+          if (!resultado.meta.changes) return json({ error: "Producto no encontrado" }, 404);
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "actualizar_producto_tienda", entidad: "producto_tienda", entidad_id: productoId,
+            descripcion: `${payload.nombre} ha ${body.activo ? "activado" : "desactivado"} un producto de la tienda`,
+          }));
+          return json({ ok: true });
+        }
+
+        let campos;
+        try {
+          campos = validarCamposProducto(body);
+        } catch (err) {
+          return json({ error: err.message }, 400);
+        }
+        const activo = typeof body.activo === "boolean" ? (body.activo ? 1 : 0) : undefined;
+        const resultado = await env.DB.prepare(
+          `UPDATE tienda_productos
+           SET nombre = ?, descripcion = ?, precio_centimos = ?, imagen_url = ?, variantes = ?, orden = ?,
+               activo = ${activo === undefined ? "activo" : "?"}
+           WHERE id = ?`
+        ).bind(...(activo === undefined
+          ? [campos.nombre, campos.descripcion, campos.precio_centimos, campos.imagen_url, campos.variantes, campos.orden, productoId]
+          : [campos.nombre, campos.descripcion, campos.precio_centimos, campos.imagen_url, campos.variantes, campos.orden, activo, productoId]
+        )).run();
+        if (!resultado.meta.changes) return json({ error: "Producto no encontrado" }, 404);
+
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "actualizar_producto_tienda", entidad: "producto_tienda", entidad_id: productoId,
+          descripcion: `${payload.nombre} ha editado el producto "${campos.nombre}" en la tienda`,
+        }));
+
+        return json({ ok: true });
+      }
+
+      // Crea un pedido nuevo, en estado "pendiente_pago": el redactor
+      // acaba de elegir el producto, todavía no se ha confirmado que el
+      // Bizum haya llegado. "referencia_pago" es lo que el propio
+      // redactor escribe (p.ej. el concepto que ha puesto en el Bizum)
+      // para que sea fácil de localizar al confirmarlo.
+      if (path === "/api/tienda/pedidos" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const body = await request.json();
+        const productoId = parseInt(body.producto_id, 10);
+        if (!productoId) return json({ error: "Falta el producto" }, 400);
+        const producto = await env.DB.prepare(
+          "SELECT * FROM tienda_productos WHERE id = ? AND activo = 1"
+        ).bind(productoId).first();
+        if (!producto) return json({ error: "Ese producto no está disponible" }, 404);
+
+        const variantesDisponibles = producto.variantes ? JSON.parse(producto.variantes) : [];
+        const variante = normalizarTexto(body.variante);
+        if (variantesDisponibles.length > 0 && !variantesDisponibles.includes(variante)) {
+          return json({ error: "Elige una talla/variante válida" }, 400);
+        }
+        const referenciaPago = normalizarTexto(body.referencia_pago);
+
+        const { meta } = await env.DB.prepare(
+          `INSERT INTO tienda_pedidos
+             (usuario_id, producto_id, producto_nombre, variante, precio_centimos, referencia_pago)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).bind(payload.uid, producto.id, producto.nombre, variantesDisponibles.length ? variante : null,
+               producto.precio_centimos, referenciaPago).run();
+
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "crear_pedido_tienda", entidad: "pedido_tienda", entidad_id: meta.last_row_id,
+          descripcion: `${payload.nombre} ha pedido "${producto.nombre}"${variante ? " (" + variante + ")" : ""} en la tienda`,
+        }));
+
+        return json({ ok: true, pedido_id: meta.last_row_id });
+      }
+
+      // Pedidos del propio redactor (para ver en qué estado está lo que
+      // ha pedido: pendiente de pago, pagado, enviado...).
+      if (path === "/api/tienda/mis-pedidos" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const { results: pedidos } = await env.DB.prepare(
+          `SELECT id, producto_nombre, variante, precio_centimos, estado, referencia_pago, created_at
+           FROM tienda_pedidos WHERE usuario_id = ? ORDER BY created_at DESC`
+        ).bind(payload.uid).all();
+        return json({ pedidos });
+      }
+
+      // El propio redactor cancela un pedido suyo, pero solo mientras
+      // siga "pendiente_pago" (una vez pagado/enviado ya no se puede
+      // cancelar desde aquí; eso lo gestiona quien administra la tienda).
+      if (path.match(/^\/api\/tienda\/mis-pedidos\/\d+\/cancelar$/) && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const pedidoId = parseInt(path.split("/")[3], 10);
+        const pedido = await env.DB.prepare(
+          "SELECT id, usuario_id, estado, producto_nombre FROM tienda_pedidos WHERE id = ?"
+        ).bind(pedidoId).first();
+        if (!pedido || pedido.usuario_id !== payload.uid) {
+          return json({ error: "Pedido no encontrado" }, 404);
+        }
+        if (pedido.estado !== "pendiente_pago") {
+          return json({ error: "Solo puedes cancelar un pedido mientras está pendiente de pago" }, 400);
+        }
+        await env.DB.prepare(
+          `UPDATE tienda_pedidos SET estado = 'cancelado', gestionado_en = datetime('now')
+           WHERE id = ?`
+        ).bind(pedidoId).run();
+
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "cancelar_pedido_tienda", entidad: "pedido_tienda", entidad_id: pedidoId,
+          descripcion: `${payload.nombre} ha cancelado su pedido "${pedido.producto_nombre}" en la tienda`,
+        }));
+
+        return json({ ok: true });
+      }
+
+      // El propio redactor borra un pedido suyo del historial (distinto
+      // de cancelar: esto elimina la fila por completo). Solo se permite
+      // si el pedido ya está en un estado "cerrado" (cancelado o
+      // enviado): mientras está pendiente de pago o ya pagado pero sin
+      // enviar, primero hay que cancelarlo o esperar a que se gestione,
+      // para no perder de vista un Bizum que aún puede estar en curso.
+      if (path.match(/^\/api\/tienda\/mis-pedidos\/\d+$/) && method === "DELETE") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const pedidoId = parseInt(path.split("/").pop(), 10);
+        const pedido = await env.DB.prepare(
+          "SELECT id, usuario_id, estado, producto_nombre FROM tienda_pedidos WHERE id = ?"
+        ).bind(pedidoId).first();
+        if (!pedido || pedido.usuario_id !== payload.uid) {
+          return json({ error: "Pedido no encontrado" }, 404);
+        }
+        if (!["cancelado", "enviado"].includes(pedido.estado)) {
+          return json({ error: "Solo puedes borrar un pedido cancelado o ya enviado" }, 400);
+        }
+        await env.DB.prepare("DELETE FROM tienda_pedidos WHERE id = ?").bind(pedidoId).run();
+
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "borrar_pedido_tienda", entidad: "pedido_tienda", entidad_id: pedidoId,
+          descripcion: `${payload.nombre} ha borrado su pedido "${pedido.producto_nombre}" de la tienda`,
+        }));
+
+        return json({ ok: true });
+      }
+
+      // Todos los pedidos de todo el mundo: solo para quien puede
+      // gestionar la tienda (admin o redactor con el permiso concedido).
+      if (path === "/api/tienda/pedidos" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!(await puedeGestionarTienda(env, payload))) {
+          return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
+        }
+        const estado = url.searchParams.get("estado");
+        let query = `SELECT tp.id, tp.producto_nombre, tp.variante, tp.precio_centimos, tp.estado,
+                            tp.referencia_pago, tp.nota_gestion, tp.created_at, tp.gestionado_en,
+                            u.nombre AS redactor_nombre, u.email AS redactor_email
+                     FROM tienda_pedidos tp
+                     JOIN users u ON u.id = tp.usuario_id`;
+        const binds = [];
+        if (estado) {
+          query += " WHERE tp.estado = ?";
+          binds.push(estado);
+        }
+        query += " ORDER BY tp.created_at DESC";
+        const { results: pedidos } = await env.DB.prepare(query).bind(...binds).all();
+        return json({ pedidos });
+      }
+
+      // Cambia el estado de un pedido (confirmar pago, marcar enviado,
+      // cancelar...). Solo quien puede gestionar la tienda.
+      if (path.match(/^\/api\/tienda\/pedidos\/\d+$/) && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!(await puedeGestionarTienda(env, payload))) {
+          return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
+        }
+        const pedidoId = parseInt(path.split("/").pop(), 10);
+        const body = await request.json();
+        const estadosValidos = ["pendiente_pago", "pagado", "enviado", "cancelado"];
+        if (!estadosValidos.includes(body.estado)) {
+          return json({ error: "Estado no válido" }, 400);
+        }
+        // Distinguimos "no han mandado nota_gestion" (se mantiene la que
+        // hubiera) de "han mandado una cadena vacía" (se borra a propósito,
+        // p.ej. al vaciar el campo de nota en el panel).
+        const seEnviaNota = typeof body.nota_gestion === "string";
+        const notaGestion = seEnviaNota ? normalizarTexto(body.nota_gestion) : undefined;
+        const resultado = await env.DB.prepare(
+          `UPDATE tienda_pedidos
+           SET estado = ?, nota_gestion = ${seEnviaNota ? "?" : "nota_gestion"},
+               gestionado_por = ?, gestionado_en = datetime('now')
+           WHERE id = ?`
+        ).bind(...(seEnviaNota ? [body.estado, notaGestion, payload.uid, pedidoId] : [body.estado, payload.uid, pedidoId])).run();
+        if (!resultado.meta.changes) return json({ error: "Pedido no encontrado" }, 404);
+
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "actualizar_pedido_tienda", entidad: "pedido_tienda", entidad_id: pedidoId,
+          descripcion: `${payload.nombre} ha marcado el pedido #${pedidoId} de la tienda como "${body.estado}"`,
+        }));
+
+        return json({ ok: true });
+      }
+
+      // Borra un pedido por completo (no solo cambiarle el estado). Solo
+      // quien puede gestionar la tienda; sin restricción de estado, ya
+      // que quien gestiona puede necesitar limpiar pedidos duplicados,
+      // de prueba o mal introducidos en cualquier momento.
+      if (path.match(/^\/api\/tienda\/pedidos\/\d+$/) && method === "DELETE") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!(await puedeGestionarTienda(env, payload))) {
+          return json({ error: "No tienes permiso para gestionar la tienda" }, 403);
+        }
+        const pedidoId = parseInt(path.split("/").pop(), 10);
+        const pedido = await env.DB.prepare(
+          "SELECT id, producto_nombre FROM tienda_pedidos WHERE id = ?"
+        ).bind(pedidoId).first();
+        if (!pedido) return json({ error: "Pedido no encontrado" }, 404);
+
+        await env.DB.prepare("DELETE FROM tienda_pedidos WHERE id = ?").bind(pedidoId).run();
+
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "borrar_pedido_tienda", entidad: "pedido_tienda", entidad_id: pedidoId,
+          descripcion: `${payload.nombre} ha borrado el pedido #${pedidoId} ("${pedido.producto_nombre}") de la tienda`,
+        }));
+
         return json({ ok: true });
       }
 
@@ -6249,156 +7564,67 @@ async function handlePrimary(request, env, ctx) {
         const payload = await requireAuth(request, env, url);
         if (!payload || payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las analíticas" }, 403);
 
-        const diasPermitidos = [1, 7, 28, 90, 365];
+        // Rango capado a RANGO_ANALITICAS_MAX_DIAS (90): 365 días puede
+        // escanear un año entero de article_views/article_reading sin
+        // límite de filas (fue la causa más probable de las ~13M filas
+        // leídas en un día el 1-sep-2026). Ya no se ofrece 365 como
+        // opción real -- si se pide, se sirve como si fueran 90.
+        const diasPermitidos = [1, 7, 28, 90];
         let dias = parseInt(url.searchParams.get("dias") || "28", 10);
-        if (!diasPermitidos.includes(dias)) dias = 28;
+        if (!diasPermitidos.includes(dias)) dias = Math.min(dias || 28, RANGO_ANALITICAS_MAX_DIAS) || 28;
         const desde = `datetime('now', '-${dias} days')`;
+
+        // Cada sub-ruta se cachea en KV por separado (clave = ruta +
+        // días) durante CACHE_ANALITICAS_TTL_SEGUNDOS. Los números de
+        // analíticas no necesitan estar al segundo, así que recargar el
+        // panel varias veces seguidas no vuelve a golpear D1 hasta que
+        // caduque la caché.
+        const cacheKey = `analiticas-cache:${path}:${dias}${path === "/api/admin/analiticas/mas-leidas" ? ":" + (url.searchParams.get("limit") || "10") : ""}`;
 
         // ---------- Resumen: KPIs + evolución diaria + dispositivos ----------
         if (path === "/api/admin/analiticas/resumen") {
-          const kpis = await env.DB.prepare(
-            `SELECT
-               COUNT(*) AS paginas_vistas,
-               COUNT(DISTINCT visitante_hash) AS visitantes,
-               COUNT(DISTINCT article_id) AS noticias_con_vistas
-             FROM article_views WHERE created_at >= ${desde}`
-          ).first();
-
-          // AVG(segundos): tiempo medio de lectura, para el KPI "Tiempo
-          // medio". AVG(scroll_maximo): % medio de la noticia que se ha
-          // llegado a ver en pantalla, para el KPI "Lectura completa"
-          // (ver kpiCompletitud en panel-analiticas.html) -- no hay una
-          // señal de "terminó de leer" más precisa que el scroll
-          // alcanzado, así que se usa directamente como proxy.
-          const lectura = await env.DB.prepare(
-            `SELECT AVG(segundos) AS media_segundos, AVG(scroll_maximo) AS media_scroll
-             FROM article_reading WHERE created_at >= ${desde}`
-          ).first();
-
-          const { results: evolucion } = await env.DB.prepare(
-            `SELECT date(created_at) AS fecha,
-                    COUNT(*) AS vistas,
-                    COUNT(DISTINCT visitante_hash) AS visitantes
-             FROM article_views
-             WHERE created_at >= ${desde}
-             GROUP BY date(created_at)
-             ORDER BY fecha ASC`
-          ).all();
-
-          const { results: dispositivosFilas } = await env.DB.prepare(
-            `SELECT dispositivo, COUNT(*) AS vistas
-             FROM article_views WHERE created_at >= ${desde}
-             GROUP BY dispositivo`
-          ).all();
-
-          // El panel (panel-analiticas.html -> cargarResumen) espera los
-          // KPIs como campos sueltos en la raíz del JSON (data.vistas,
-          // data.visitantes, data.tiempo_medio_segundos, data.completitud)
-          // y "dispositivos" como un objeto {movil, escritorio, tablet: N},
-          // no como el array de filas {dispositivo, vistas} que devuelve
-          // la consulta SQL de arriba. Se traduce aquí para no tener que
-          // tocar el frontend (que ya funciona igual para mas-leidas/
-          // fuentes/autores/tiempo-lectura, cuyo formato sí coincide).
-          const dispositivos = { movil: 0, escritorio: 0, tablet: 0 };
-          for (const fila of dispositivosFilas || []) {
-            if (fila.dispositivo in dispositivos) dispositivos[fila.dispositivo] = Number(fila.vistas) || 0;
-          }
-
-          return json({
-            vistas: kpis?.paginas_vistas || 0,
-            visitantes: kpis?.visitantes || 0,
-            noticias_con_vistas: kpis?.noticias_con_vistas || 0,
-            tiempo_medio_segundos: Math.round(lectura?.media_segundos || 0),
-            completitud: Math.round((lectura?.media_scroll || 0) * 10) / 10,
-            evolucion_diaria: evolucion || [],
-            dispositivos,
-            // Se conserva también "kpis" (formato anterior, anidado) por
-            // si algún otro consumidor de esta ruta lo esperaba así; no
-            // estorba, el frontend actual solo lee los campos de arriba.
-            kpis: {
-              paginas_vistas: kpis?.paginas_vistas || 0,
-              visitantes: kpis?.visitantes || 0,
-              noticias_con_vistas: kpis?.noticias_con_vistas || 0,
-              tiempo_medio_lectura_segundos: Math.round(lectura?.media_segundos || 0),
-            },
-          });
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularResumenAnaliticas(env, desde)
+          );
+          return json(datos);
         }
 
         // ---------- Noticias más leídas ----------
         if (path === "/api/admin/analiticas/mas-leidas") {
           const limit = Math.min(parseInt(url.searchParams.get("limit") || "10", 10), 50);
-          const { results } = await env.DB.prepare(
-            `SELECT a.id, a.slug, a.titulo, a.categoria, a.autor_nombre,
-                    COUNT(v.id) AS vistas,
-                    COUNT(DISTINCT v.visitante_hash) AS visitantes,
-                    (SELECT AVG(r.segundos) FROM article_reading r WHERE r.article_id = a.id AND r.created_at >= ${desde}) AS tiempo_medio_segundos
-             FROM article_views v
-             JOIN articles a ON a.id = v.article_id
-             WHERE v.created_at >= ${desde}
-             GROUP BY a.id
-             ORDER BY vistas DESC
-             LIMIT ?`
-          ).bind(limit).all();
-          return json({ noticias: (results || []).map((n) => ({ ...n, tiempo_medio_segundos: Math.round(n.tiempo_medio_segundos || 0) })) });
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularMasLeidasAnaliticas(env, desde, limit)
+          );
+          return json(datos);
         }
 
         // ---------- Tráfico por fuente ----------
         if (path === "/api/admin/analiticas/fuentes") {
-          const { results } = await env.DB.prepare(
-            `SELECT fuente, COUNT(*) AS vistas
-             FROM article_views WHERE created_at >= ${desde}
-             GROUP BY fuente ORDER BY vistas DESC`
-          ).all();
-          const { results: referidos } = await env.DB.prepare(
-            `SELECT referer_dominio AS dominio, fuente, COUNT(*) AS vistas
-             FROM article_views
-             WHERE created_at >= ${desde} AND referer_dominio IS NOT NULL
-             GROUP BY referer_dominio, fuente ORDER BY vistas DESC LIMIT 15`
-          ).all();
-          return json({ fuentes: results || [], dominios: referidos || [] });
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularFuentesAnaliticas(env, desde)
+          );
+          return json(datos);
         }
 
         // ---------- Rendimiento por autor ----------
         if (path === "/api/admin/analiticas/autores") {
-          const { results } = await env.DB.prepare(
-            `SELECT a.autor_nombre AS autor,
-                    COUNT(DISTINCT a.id) AS noticias,
-                    COUNT(v.id) AS vistas,
-                    AVG(r.segundos) AS tiempo_medio_segundos
-             FROM articles a
-             JOIN article_views v ON v.article_id = a.id AND v.created_at >= ${desde}
-             LEFT JOIN article_reading r ON r.article_id = a.id AND r.created_at >= ${desde}
-             WHERE a.autor_nombre IS NOT NULL
-             GROUP BY a.autor_nombre
-             ORDER BY vistas DESC`
-          ).all();
-          return json({ autores: (results || []).map((au) => ({ ...au, tiempo_medio_segundos: Math.round(au.tiempo_medio_segundos || 0) })) });
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularAutoresAnaliticas(env, desde)
+          );
+          return json(datos);
         }
 
         // ---------- Tiempo medio de lectura por categoría ----------
         if (path === "/api/admin/analiticas/tiempo-lectura") {
-          const { results } = await env.DB.prepare(
-            `SELECT a.categoria,
-                    AVG(r.segundos) AS tiempo_medio_segundos,
-                    COUNT(r.id) AS lecturas,
-                    AVG(r.scroll_maximo) AS scroll_medio
-             FROM article_reading r
-             JOIN articles a ON a.id = r.article_id
-             WHERE r.created_at >= ${desde}
-             GROUP BY a.categoria
-             ORDER BY tiempo_medio_segundos DESC`
-          ).all();
-          return json({
-            categorias: (results || []).map((c) => ({
-              ...c,
-              tiempo_medio_segundos: Math.round(c.tiempo_medio_segundos || 0),
-              scroll_medio: Math.round(c.scroll_medio || 0),
-            })),
-          });
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularTiempoLecturaAnaliticas(env, desde)
+          );
+          return json(datos);
         }
 
         return json({ error: "Ruta de analíticas no encontrada" }, 404);
       }
+
 
       // Admin: listar (por estado), aprobar/rechazar y borrar.
       if (path === "/api/admin/comments" && method === "GET") {
@@ -6697,10 +7923,6 @@ async function handlePrimary(request, env, ctx) {
         // (sin inicio_cronometro_at), así que el cronómetro no arrancaba
         // nunca aunque el backend sí lo hubiera guardado bien.
         const limitParam = parseInt(url.searchParams.get("limit"), 10);
-        // Ver el comentario equivalente en worker/src/index.js: se sube el
-        // tope de "limit" y se ordena por fecha_partido (no por jornada)
-        // para que jornadas bajas de una competición no queden fuera del
-        // LIMIT al mezclarse con jornadas más altas de otras competiciones.
         const limit = Number.isInteger(limitParam) && limitParam > 0 && limitParam <= 2000 ? limitParam : 100;
         let query = "SELECT * FROM results WHERE 1=1";
         const binds = [];
@@ -6711,6 +7933,17 @@ async function handlePrimary(request, env, ctx) {
           query += " AND (equipo_local = ? OR equipo_visitante = ?)";
           binds.push(club, club);
         }
+        // Antes se ordenaba "ORDER BY jornada DESC, fecha_partido DESC": al
+        // mezclar todas las competiciones en una sola consulta, eso hacía
+        // que el LIMIT se llenara con las jornadas MÁS ALTAS de cada
+        // competición antes de llegar a las bajas, así que una jornada 1
+        // podía quedar fuera del recorte y desaparecer del panel de admin
+        // (que no filtra por competición, solo busca en texto dentro de lo
+        // ya traído) aunque siguiera existiendo en la base de datos y
+        // apareciera bien en la web pública (que sí filtra por competición
+        // en la propia consulta). Se ordena por fecha_partido en su lugar,
+        // que es lo relevante para "traer los partidos más recientes" y no
+        // deja huecos según la jornada de cada competición.
         query += ` ORDER BY fecha_partido DESC LIMIT ${limit}`;
         const { results } = await env.DB.prepare(query).bind(...binds).all();
         // Se añade el instante del último evento (gol, tarjeta, cambio...)

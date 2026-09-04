@@ -2239,6 +2239,89 @@ async function iniciarPartidosProgramadosCuyaHoraHaLlegado(env) {
   }
 }
 
+// Minuto a partir del cual se pita el descanso solo, si nadie lo ha
+// hecho a mano todavía. Igual que "inicio_partido" se inserta solo al
+// arrancar el cronómetro (ver iniciarPartidosProgramadosCuyaHoraHaLlegado),
+// este evento "descanso" se inserta solo al llegar el cronómetro a este
+// minuto, sin esperar a que el redactor pulse el botón del panel.
+const MINUTO_DESCANSO_AUTOMATICO = 45;
+
+// Revisa cada minuto (mismo cron que ya revisa partidos programados y
+// partidos desatendidos) los partidos "en_juego" cuyo cronómetro sigue
+// corriendo y ya ha alcanzado MINUTO_DESCANSO_AUTOMATICO, y les inserta
+// el evento "descanso" solo si todavía no existe uno para ese partido.
+// Se limita a partidos con el cronómetro corriendo (no pausado): si ya
+// está pausado es que alguien ya ha pitado algo (descanso, hidratación...)
+// y no hay que tocarlo.
+async function crearDescansoAutomaticoAlMinuto45(env) {
+  const { results: partidos } = await env.DB.prepare(
+    `SELECT id, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos
+     FROM results WHERE estado = 'en_juego' AND cronometro_pausado_en IS NULL`
+  ).all();
+  if (!partidos.length) return;
+
+  for (const partido of partidos) {
+    const minuto = minutoEnVivoServidor(partido);
+    if (minuto < MINUTO_DESCANSO_AUTOMATICO) continue;
+
+    const yaHuboDescanso = await env.DB.prepare(
+      "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = 'descanso' LIMIT 1"
+    ).bind(partido.id).first();
+    if (yaHuboDescanso) continue;
+
+    await env.DB.prepare(
+      `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden) VALUES (?, 'descanso', 'ninguno', ?, 0)`
+    ).bind(partido.id, MINUTO_DESCANSO_AUTOMATICO).run();
+  }
+}
+
+// Minuto a partir del cual se da el partido por finalizado solo, si
+// nadie ha pulsado "Fin del partido" a mano. Deliberadamente más alto
+// que 90' (a diferencia del descanso, que sí va justo a 45'): a partir
+// de los 90' minutos reales de partido puede haber tiempo añadido,
+// prórroga (Copa, playoffs) o incluso tanda de penaltis, así que cerrar
+// el partido en automático justo al pisar el 90' cortaría de raíz
+// cualquier partido que se alargue un poco más de lo normal -y un
+// partido real casi nunca llega a MINUTO_FIN_PARTIDO_AUTOMATICO sin que
+// alguien haya pitado ya el final, así que este umbral alto solo actúa
+// de red de seguridad, no como forma habitual de cerrar partidos.
+const MINUTO_FIN_PARTIDO_AUTOMATICO = 100;
+
+// Revisa cada minuto los partidos "en_juego" cuyo cronómetro sigue
+// corriendo y ya ha superado MINUTO_FIN_PARTIDO_AUTOMATICO, y les
+// inserta el evento "fin_partido" (con el mismo efecto que pulsar el
+// botón a mano: pasa el partido a 'finalizado', ver POST /eventos) solo
+// si todavía no existe uno para ese partido. Igual que con el descanso,
+// se limita a partidos con el cronómetro corriendo: si ya está pausado
+// (por ejemplo en el descanso o una hidratación) no se toca -no hay
+// riesgo de "colarse" cerrando un partido que solo está parado un
+// momento-, y ese caso ya lo cubre revisarPartidosDesatendidos() con su
+// propio aviso.
+async function crearFinPartidoAutomaticoAlMinuto90(env) {
+  const { results: partidos } = await env.DB.prepare(
+    `SELECT id, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos
+     FROM results WHERE estado = 'en_juego' AND cronometro_pausado_en IS NULL`
+  ).all();
+  if (!partidos.length) return;
+
+  for (const partido of partidos) {
+    const minuto = minutoEnVivoServidor(partido);
+    if (minuto < MINUTO_FIN_PARTIDO_AUTOMATICO) continue;
+
+    const yaHuboFin = await env.DB.prepare(
+      "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = 'fin_partido' LIMIT 1"
+    ).bind(partido.id).first();
+    if (yaHuboFin) continue;
+
+    await env.DB.prepare(
+      `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden) VALUES (?, 'fin_partido', 'ninguno', ?, 0)`
+    ).bind(partido.id, MINUTO_FIN_PARTIDO_AUTOMATICO).run();
+    await env.DB.prepare(
+      "UPDATE results SET estado = 'finalizado', aviso_desatendido_mitad = NULL WHERE id = ?"
+    ).bind(partido.id).run();
+  }
+}
+
 // ---------- MINUTO A MINUTO: aviso de partido "desatendido" ----------
 // Detecta partidos que llevan el cronómetro corriendo (nadie ha pulsado
 // "Descanso" ni "Fin del partido") mucho más allá de lo normal, señal
@@ -3650,6 +3733,8 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
   async scheduled(event, env, ctx) {
     ctx.waitUntil(publicarArticulosProgramados(env));
     ctx.waitUntil(iniciarPartidosProgramadosCuyaHoraHaLlegado(env));
+    ctx.waitUntil(crearDescansoAutomaticoAlMinuto45(env));
+    ctx.waitUntil(crearFinPartidoAutomaticoAlMinuto90(env));
     // marcarPartidosColgados va ANTES de revisarPartidosDesatendidos:
     // pasa a 'colgado' los partidos con más de 2000' corriendo, para que
     // ya no aparezcan como 'en_juego' cuando se ejecute la revisión de

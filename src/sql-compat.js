@@ -15,6 +15,35 @@ export function translateSql(sql, params = []) {
     // timestamp exacto.
     .replace(/\bdate\(([a-zA-Z_][\w.]*)\)/gi, "$1::date");
   out = out.replace(/programado_para\s*(<=|>)\s*CURRENT_TIMESTAMP/gi, "programado_para::timestamptz $1 CURRENT_TIMESTAMP");
+  // Las columnas "created_at"/"updated_at"/"cierra_en" están declaradas
+  // como TEXT en el esquema de Postgres (para mantener paridad con
+  // SQLite/D1, donde no hay un tipo timestamp real), pero las expresiones
+  // de arriba ya se han traducido a CURRENT_TIMESTAMP / (CURRENT_TIMESTAMP
+  // + INTERVAL '...'), que en Postgres son "timestamp with time zone".
+  // Comparar "columna_text >= timestamptz" no tiene operador válido en
+  // Postgres (error 42883: "operator does not exist: text >= timestamp
+  // with time zone"), lo que hacía fallar cualquier consulta que filtrase
+  // por rango de fechas (analíticas, activity_log, encuestas cerradas por
+  // fecha, etc.) en cuanto el failover pasaba a Railway/Postgres.
+  //
+  // Se castea explícitamente la columna del lado izquierdo a timestamptz
+  // SOLO cuando aparece en una comparación (=, >, <, >=, <=) contra una
+  // expresión de fecha, nunca en una asignación "SET columna = ..." /
+  // "ON CONFLICT ... DO UPDATE SET columna = ...", donde castear la
+  // columna no tiene efecto (o es inválido) y lo correcto es dejar que
+  // Postgres guarde el timestamp tal cual en la columna TEXT. Se captura
+  // también el carácter que precede a la columna (o "," / "SET" si es una
+  // asignación) para decidir en un único paso, evitando el doble-paso
+  // (frágil) de detectar y luego re-machear la misma expresión.
+  out = out.replace(
+    /(,\s*|\bSET\s+)?\b((?:created_at|updated_at|cierra_en))(?!::date)\s*(>=|<=|>|<|=)\s*(CURRENT_TIMESTAMP\b|\(CURRENT_TIMESTAMP\s*\+\s*(?:\?::interval|INTERVAL\s*'[^']+')\))/gi,
+    (match, assignPrefix, col, op, rhs) => {
+      const isAssignment = op === "=" && !!assignPrefix;
+      if (isAssignment) return match; // "SET columna = ..." / ", columna = ...": no castear
+      const prefix = assignPrefix || "";
+      return `${prefix}${col}::timestamptz ${op} ${rhs}`;
+    }
+  );
   // "columna IS ?" es válido en SQLite (comparación tolerante a NULL, se
   // comporta como "=" salvo que alguno de los dos lados sea NULL), pero en
   // PostgreSQL "IS" solo admite los literales NULL/TRUE/FALSE a su derecha

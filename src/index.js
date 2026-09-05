@@ -2237,13 +2237,28 @@ async function iniciarPartidosProgramadosCuyaHoraHaLlegado(env) {
   // no UTC (ver fechaPartidoAUtcSqlite más arriba). Comparar su texto
   // directamente contra datetime('now') -que sí es UTC- desfasaba el
   // arranque automático 1-2h según la época del año. Se filtran primero
-  // en SQL los candidatos con hora conocida y aún "programado" (barato),
-  // y la comparación fina de instante ya corregida se hace en JS.
-  const { results: candidatos } = await env.DB.prepare(
+  // en SQL los candidatos con hora conocida (barato), y la comparación
+  // fina de instante ya corregida se hace en JS.
+  //
+  // Se contemplan DOS estados de partido, cada uno mirando su propia
+  // columna de hora:
+  //   - "programado": fecha_partido (la hora original).
+  //   - "retrasado": fecha_partido_retrasado (la nueva hora fijada al
+  //     retrasar el partido). Antes de este cambio, un partido
+  //     retrasado se quedaba en "retrasado" para siempre por mucho que
+  //     pasara su nueva hora -- el redactor tenía que arrancarlo a mano
+  //     porque nada volvía a comprobar esta columna una vez guardada.
+  const { results: candidatosProgramados } = await env.DB.prepare(
     `SELECT id, fecha_partido FROM results
      WHERE estado = 'programado' AND fecha_partido IS NOT NULL
        AND length(fecha_partido) = 16` // "YYYY-MM-DDTHH:MM": solo si se conoce la hora, no solo la fecha
   ).all();
+  const { results: candidatosRetrasados } = await env.DB.prepare(
+    `SELECT id, fecha_partido_retrasado AS fecha_partido FROM results
+     WHERE estado = 'retrasado' AND fecha_partido_retrasado IS NOT NULL
+       AND length(fecha_partido_retrasado) = 16`
+  ).all();
+  const candidatos = [...candidatosProgramados, ...candidatosRetrasados];
   const ahoraSqlite = aSqliteDatetimeUTC(new Date());
   const pendientes = candidatos.filter((p) => {
     const inicioUtc = fechaPartidoAUtcSqlite(p.fecha_partido);

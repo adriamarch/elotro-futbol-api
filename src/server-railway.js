@@ -201,7 +201,8 @@ app.get("/api/health", async (c) => {
 // una es idempotente sobre su propia base de datos (una actualiza
 // D1, la otra Postgres; nunca la misma fila dos veces con el mismo
 // efecto -- iniciarPartidosProgramadosCuyaHoraHaLlegado solo actúa
-// sobre partidos que siguen en estado "programado", por ejemplo).
+// sobre partidos en estado "programado" o "retrasado" cuya hora
+// correspondiente ya haya llegado).
 app.post("/api/internal/cron-respaldo", async (c) => {
   const secretoEsperado = env.INTERNAL_CRON_SECRET;
   if (!secretoEsperado) {

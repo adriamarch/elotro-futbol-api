@@ -199,6 +199,13 @@ CREATE TABLE results (
   -- los dos si todavía no se ha elegido.
   mvp_jugador TEXT,
   mvp_equipo TEXT, -- 'local' | 'visitante'
+  -- Marca si este partido se cerró SOLO por el cron
+  -- (crearFinPartidoAutomaticoAlMinuto90) al llegar al minuto
+  -- MINUTO_FIN_PARTIDO_AUTOMATICO sin que nadie pulsara "Fin del
+  -- partido" antes: 0 = finalizado normal, 1 = cierre automático sin
+  -- cubrir. Se usa para pintar "FINALIZADO NO CUBIERTO" en el panel
+  -- admin (ver migracion_fin_no_cubierto.sql).
+  finalizado_no_cubierto INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (autor_id) REFERENCES users(id)
 );
 

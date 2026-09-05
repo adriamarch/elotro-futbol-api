@@ -2275,17 +2275,17 @@ async function crearDescansoAutomaticoAlMinuto45(env) {
   }
 }
 
-// Minuto a partir del cual se da el partido por finalizado solo, si
-// nadie ha pulsado "Fin del partido" a mano. Deliberadamente más alto
-// que 90' (a diferencia del descanso, que sí va justo a 45'): a partir
-// de los 90' minutos reales de partido puede haber tiempo añadido,
-// prórroga (Copa, playoffs) o incluso tanda de penaltis, así que cerrar
-// el partido en automático justo al pisar el 90' cortaría de raíz
-// cualquier partido que se alargue un poco más de lo normal -y un
-// partido real casi nunca llega a MINUTO_FIN_PARTIDO_AUTOMATICO sin que
-// alguien haya pitado ya el final, así que este umbral alto solo actúa
-// de red de seguridad, no como forma habitual de cerrar partidos.
-const MINUTO_FIN_PARTIDO_AUTOMATICO = 100;
+// Minuto real (de cronómetro) a partir del cual se considera que nadie
+// va a cubrir ya el final del partido y el cron lo cierra solo. Subido
+// de 100 a 150 (ver mismo cambio en worker/src/index.js) para dar mucho
+// más margen antes de intervenir.
+const MINUTO_FIN_PARTIDO_AUTOMATICO = 150;
+
+// Minuto con el que se REGISTRA el evento "fin_partido" y el marcador
+// del partido cuando lo cierra el cron (no el minuto real en el que se
+// detecta, MINUTO_FIN_PARTIDO_AUTOMATICO). Ver comentario gemelo en
+// worker/src/index.js.
+const MINUTO_REGISTRADO_FIN_AUTOMATICO = 90;
 
 // Revisa cada minuto los partidos "en_juego" cuyo cronómetro sigue
 // corriendo y ya ha superado MINUTO_FIN_PARTIDO_AUTOMATICO, y les
@@ -2296,7 +2296,8 @@ const MINUTO_FIN_PARTIDO_AUTOMATICO = 100;
 // (por ejemplo en el descanso o una hidratación) no se toca -no hay
 // riesgo de "colarse" cerrando un partido que solo está parado un
 // momento-, y ese caso ya lo cubre revisarPartidosDesatendidos() con su
-// propio aviso.
+// propio aviso. Marca finalizado_no_cubierto = 1 (ver misma columna en
+// worker/src/index.js) para el aviso "FINALIZADO NO CUBIERTO" del panel.
 async function crearFinPartidoAutomaticoAlMinuto90(env) {
   const { results: partidos } = await env.DB.prepare(
     `SELECT id, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos
@@ -2315,9 +2316,9 @@ async function crearFinPartidoAutomaticoAlMinuto90(env) {
 
     await env.DB.prepare(
       `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden) VALUES (?, 'fin_partido', 'ninguno', ?, 0)`
-    ).bind(partido.id, MINUTO_FIN_PARTIDO_AUTOMATICO).run();
+    ).bind(partido.id, MINUTO_REGISTRADO_FIN_AUTOMATICO).run();
     await env.DB.prepare(
-      "UPDATE results SET estado = 'finalizado', aviso_desatendido_mitad = NULL WHERE id = ?"
+      "UPDATE results SET estado = 'finalizado', aviso_desatendido_mitad = NULL, finalizado_no_cubierto = 1 WHERE id = ?"
     ).bind(partido.id).run();
   }
 }
@@ -8317,7 +8318,7 @@ async function handlePrimary(request, env, ctx) {
         const grupoCalculadoEdicion = grupoAutomaticoSegundaFederacion(body.competicion, body.equipo_local, body.equipo_visitante);
         const grupoAGuardarEdicion = body.competicion === "segunda_federacion" ? grupoCalculadoEdicion : (body.grupo || null);
         await env.DB.prepare(
-          `UPDATE results SET competicion=?, grupo=?, jornada=?, equipo_local=?, equipo_visitante=?, goles_local=?, goles_visitante=?, penaltis_local=?, penaltis_visitante=?, fecha_partido=?, estado=?, ubicacion=?, flashscore_url=?, escudo_local_url=?, escudo_visitante_url=?, fecha_partido_retrasado=? WHERE id=?`
+          `UPDATE results SET competicion=?, grupo=?, jornada=?, equipo_local=?, equipo_visitante=?, goles_local=?, goles_visitante=?, penaltis_local=?, penaltis_visitante=?, fecha_partido=?, estado=?, ubicacion=?, flashscore_url=?, escudo_local_url=?, escudo_visitante_url=?, fecha_partido_retrasado=?, finalizado_no_cubierto=0 WHERE id=?`
         ).bind(
           body.competicion, grupoAGuardarEdicion, body.jornada, body.equipo_local, body.equipo_visitante,
           body.goles_local ?? null, body.goles_visitante ?? null,
@@ -8785,8 +8786,10 @@ async function handlePrimary(request, env, ctx) {
           // Se limpia también aquí aviso_desatendido_mitad: si este mismo
           // partido se reabre más adelante por otra vía que no pase por
           // iniciarCronometroPartido(), no debe arrastrar avisos de una
-          // "vida" anterior del partido.
-          await env.DB.prepare("UPDATE results SET estado = 'finalizado', aviso_desatendido_mitad = NULL WHERE id = ?").bind(resultadoId).run();
+          // "vida" anterior del partido. finalizado_no_cubierto se pone
+          // explícitamente a 0: cierre MANUAL (ver mismo comentario en
+          // worker/src/index.js).
+          await env.DB.prepare("UPDATE results SET estado = 'finalizado', aviso_desatendido_mitad = NULL, finalizado_no_cubierto = 0 WHERE id = ?").bind(resultadoId).run();
         }
         if (body.tipo === "partido_retrasado") {
           await env.DB.prepare("UPDATE results SET estado = 'retrasado' WHERE id = ?").bind(resultadoId).run();

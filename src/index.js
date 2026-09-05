@@ -103,8 +103,35 @@ function fechaPartidoAUtcSqlite(fechaPartido) {
   return aSqliteDatetimeUTC(real);
 }
 
-function cors(resp) {
-  resp.headers.set("Access-Control-Allow-Origin", "*");
+// Whitelist de orígenes permitidos para CORS: solo el dominio de
+// producción (con y sin "www") y localhost en varios puertos habituales
+// de desarrollo. Antes se devolvía "*" para cualquier origen. Esta copia
+// de index.js corre dentro de Railway (ver server-railway.js), que ya
+// aplica su propia whitelist vía el middleware cors() de Hono; esto es
+// una segunda capa por si esta función se invoca fuera de ese flujo.
+const ORIGENES_PERMITIDOS = [
+  "https://elotrofutbol.media",
+  "https://www.elotrofutbol.media",
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "http://localhost:8788",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:5173",
+  "http://127.0.0.1:8788",
+];
+
+function origenPermitido(origin) {
+  return !!origin && ORIGENES_PERMITIDOS.includes(origin);
+}
+
+let ORIGEN_PETICION_ACTUAL = null;
+
+function cors(resp, origin) {
+  const efectivo = origin !== undefined ? origin : ORIGEN_PETICION_ACTUAL;
+  if (origenPermitido(efectivo)) {
+    resp.headers.set("Access-Control-Allow-Origin", efectivo);
+    resp.headers.set("Vary", "Origin");
+  }
   resp.headers.set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   resp.headers.set("Access-Control-Allow-Headers", "Content-Type,Authorization");
   // Sin esto, el JavaScript del navegador no puede leer estas cabeceras
@@ -3040,6 +3067,7 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
+    ORIGEN_PETICION_ACTUAL = request.headers.get("Origin");
 
     /*
      * ============================================================
@@ -4161,11 +4189,11 @@ async function fetchRailway(
     // la respuesta de Railway con un error de CORS que oculta el error
     // real (que puede ser un 502/503/500 legítimo), como pasaba en
     // producción: la consola mostraba "blocked by CORS policy" en vez del
-    // fallo real de Railway.
-    headers.set(
-      "Access-Control-Allow-Origin",
-      "https://elotrofutbol.media"
-    );
+    // fallo real de Railway. Se usa la whitelist en vez de un origen fijo.
+    if (origenPermitido(ORIGEN_PETICION_ACTUAL)) {
+      headers.set("Access-Control-Allow-Origin", ORIGEN_PETICION_ACTUAL);
+      headers.set("Vary", "Origin");
+    }
     headers.set(
       "Access-Control-Allow-Methods",
       "GET,POST,PUT,DELETE,OPTIONS"
@@ -4202,7 +4230,7 @@ async function fetchRailway(
       railwayError
     );
 
-    return new Response(
+    const respuestaFailoverTotal = new Response(
       JSON.stringify(
         {
           status: "FAILOVER_ERROR",
@@ -4225,13 +4253,6 @@ async function fetchRailway(
           "Cache-Control":
             "no-store",
 
-          // Sin estas dos cabeceras CORS, el navegador rechaza la
-          // respuesta antes de que el código de la página llegue a verla
-          // (fetch() rechaza la promesa con un error de CORS genérico en
-          // vez de dejar leer el status 502), así que el frontend nunca
-          // se entera de que ambas APIs han caído -- ve un error de red
-          // indistinguible de cualquier otro fallo de conexión.
-          "Access-Control-Allow-Origin": "*",
           "Access-Control-Expose-Headers":
             "X-Failover-Backend,X-Failover-Test,X-Failover-Reason",
 
@@ -4248,6 +4269,11 @@ async function fetchRailway(
         }
       }
     );
+    if (origenPermitido(ORIGEN_PETICION_ACTUAL)) {
+      respuestaFailoverTotal.headers.set("Access-Control-Allow-Origin", ORIGEN_PETICION_ACTUAL);
+      respuestaFailoverTotal.headers.set("Vary", "Origin");
+    }
+    return respuestaFailoverTotal;
   }
 }
 

@@ -20,10 +20,24 @@ import { debeEncolarse, encolarEscritura, contarPendientes } from "./pending-wri
 import { ejecutarMigraciones } from "../scripts/migrate.mjs";
 
 const app = new Hono();
+// Misma whitelist que worker/src/index.js (ORIGENES_PERMITIDOS): el
+// dominio de producción con y sin "www", más localhost en los puertos
+// habituales de desarrollo. Antes solo se permitía "https://elotrofutbol.media"
+// a secas, lo que ya era mucho más seguro que un origin: "*", pero
+// dejaba fuera cualquier prueba en local contra esta API.
 app.use(
   "*",
   cors({
-    origin: "https://elotrofutbol.media",
+    origin: [
+      "https://elotrofutbol.media",
+      "https://www.elotrofutbol.media",
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "http://localhost:8788",
+      "http://127.0.0.1:3000",
+      "http://127.0.0.1:5173",
+      "http://127.0.0.1:8788",
+    ],
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization"],
   })

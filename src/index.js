@@ -8088,19 +8088,117 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true });
       }
 
-      // Segunda Federación: mismo cálculo automático de grupo que en el
-      // worker principal (ver worker/src/index.js,
-      // grupoAutomaticoSegundaFederacion) -- se mantiene aquí duplicado
-      // porque este worker-secondary es el backend de respaldo (Railway)
-      // y necesita el mismo comportamiento durante un failover.
+      // Segunda Federación: composición OFICIAL completa de los 5 grupos
+      // (90 clubes), temporada 2026/27. MISMA lista que en el worker
+      // principal (worker/src/index.js) y que
+      // TODOS_LOS_CLUBES_SEGUNDA_FEDERACION en public/js/clubs.js -- si
+      // se actualiza una hay que actualizar las tres (no se puede
+      // compartir el archivo porque este worker-secondary es el backend
+      // de respaldo en Railway y necesita el mismo comportamiento
+      // durante un failover). Cada verano, cuando la RFEF redefine los
+      // grupos, hay que revisar y actualizar las tres listas.
+      //
+      // OJO: este cálculo automático es solo un VALOR POR DEFECTO. Si
+      // el panel de admin manda explícitamente un body.grupo (porque el
+      // redactor lo ha escrito o corregido a mano), esa elección manual
+      // SIEMPRE prevalece y nunca se pisa aquí -- ver grupoAGuardar /
+      // grupoAGuardarEdicion más abajo.
       const GRUPO_SEGUNDA_FEDERACION_POR_EQUIPO = {
-        "Linares Deportivo": "Grupo 4",
-        "Recreativo de Huelva": "Grupo 4",
+        // Grupo 1
+        "Deportivo Alavés B": "Grupo 1",
+        "Atlético Astorga": "Grupo 1",
+        "Arosa SC": "Grupo 1",
+        "Bergantiños": "Grupo 1",
+        "CD Basconia": "Grupo 1",
+        "Coruxo": "Grupo 1",
+        "SD Eibar B": "Grupo 1",
+        "Club Portugalete": "Grupo 1",
+        "SD Gernika": "Grupo 1",
+        "Ourense CF": "Grupo 1",
+        "RS Gimnástica de Torrelavega": "Grupo 1",
+        "Rayo Cantabria": "Grupo 1",
+        "Real Oviedo Vetusta": "Grupo 1",
+        "SD Amorebieta": "Grupo 1",
+        "Sestao River": "Grupo 1",
+        "SD Compostela": "Grupo 1",
+        "UD Llanera": "Grupo 1",
+        "Club Marino de Luanco": "Grupo 1",
+        // Grupo 2
+        "CD Arnedo": "Grupo 2",
+        "CE Manresa": "Grupo 2",
+        "FC Barcelona Atlètic": "Grupo 2",
+        "Náxara": "Grupo 2",
+        "UE Olot": "Grupo 2",
+        "CD Ebro": "Grupo 2",
+        "Peña Sport": "Grupo 2",
+        "Utebo": "Grupo 2",
+        "Reus FC Reddis": "Grupo 2",
+        "Atlético Osasuna B": "Grupo 2",
+        "SD Logroñés": "Grupo 2",
+        "RCD Espanyol B": "Grupo 2",
+        "CF Calamocha": "Grupo 2",
+        "Terrassa": "Grupo 2",
+        "CD Tudelano": "Grupo 2",
+        "UD Logroñés B": "Grupo 2",
+        "UD Barbastro": "Grupo 2",
+        "Girona FC B": "Grupo 2",
+        // Grupo 3
+        "CD Alcoyano": "Grupo 3",
+        "CD Cieza": "Grupo 3",
+        "UD Castellonense": "Grupo 3",
+        "UCAM Murcia": "Grupo 3",
+        "CF La Nucía": "Grupo 3",
+        "UD Poblense": "Grupo 3",
+        "CF Lorca Deportiva": "Grupo 3",
+        "Elche Ilicitano": "Grupo 3",
+        "CD Minera": "Grupo 3",
+        "SCR Peña Deportiva": "Grupo 3",
+        "Real Murcia Imperial": "Grupo 3",
+        "Orihuela CF": "Grupo 3",
+        "CD Castellón B": "Grupo 3",
+        "CF Intercity": "Grupo 3",
+        "Valencia Mestalla": "Grupo 3",
+        "RCD Mallorca B": "Grupo 3",
+        "Yeclano Deportivo": "Grupo 3",
+        "CD Atlético Baleares": "Grupo 3",
+        // Grupo 4
+        "Atlético Antoniano": "Grupo 4",
+        "CD Don Benito": "Grupo 4",
+        "Salerm Cosmetics Puente Genil": "Grupo 4",
+        "CP Mijas Las Lagunas": "Grupo 4",
         "CD Badajoz": "Grupo 4",
+        "CD Tenerife B": "Grupo 4",
+        "Atlético Central": "Grupo 4",
+        "Recreativo de Huelva": "Grupo 4",
+        "CD Estepona": "Grupo 4",
+        "Xerez CD": "Grupo 4",
+        "Linares Deportivo": "Grupo 4",
+        "CD Ciudad de Lucena": "Grupo 4",
+        "Las Palmas Atlético": "Grupo 4",
+        "Betis Deportivo": "Grupo 4",
+        "Marbella FC": "Grupo 4",
+        "Atlético Sanluqueño": "Grupo 4",
+        "UD Tamaraceite": "Grupo 4",
+        "Sevilla Atlético": "Grupo 4",
+        // Grupo 5
+        "Real Madrid C": "Grupo 5",
+        "Atlético Albacete": "Grupo 5",
+        "Atlético de Madrid C": "Grupo 5",
+        "Real Ávila": "Grupo 5",
+        "CD Atlético Paso": "Grupo 5",
         "CD Numancia": "Grupo 5",
         "CD Guadalajara": "Grupo 5",
-        "UB Conquense": "Grupo 5",
+        "Salamanca UDS": "Grupo 5",
+        "Calvo Sotelo Puertollano": "Grupo 5",
+        "Gimnástica Segoviana": "Grupo 5",
+        "RSD Alcalá": "Grupo 5",
         "CF Talavera de la Reina": "Grupo 5",
+        "Real Valladolid Promesas": "Grupo 5",
+        "CDA Navalcarnero": "Grupo 5",
+        "Atlético Tordesillas": "Grupo 5",
+        "UD San Sebastián de los Reyes": "Grupo 5",
+        "UB Conquense": "Grupo 5",
+        "Getafe B": "Grupo 5",
       };
       function grupoAutomaticoSegundaFederacion(competicion, equipoLocal, equipoVisitante) {
         if (competicion !== "segunda_federacion") return null;
@@ -8270,12 +8368,17 @@ async function handlePrimary(request, env, ctx) {
           }
         }
         const flashscoreUrl = flashscoreUrlValido(body.competicion, body.estado, body.flashscore_url);
-        // El grupo de Segunda Federación se calcula solo (ver
-        // grupoAutomaticoSegundaFederacion arriba) y pisa lo que venga en
-        // body.grupo; en el resto de competiciones se respeta lo que
-        // mande el panel, igual que siempre.
+        // El grupo de Segunda Federación se rellena automáticamente (ver
+        // grupoAutomaticoSegundaFederacion arriba) SOLO cuando el panel
+        // no manda ya un grupo explícito; si el redactor lo ha escrito o
+        // corregido a mano, esa elección manual prevalece siempre (ver
+        // comentario extenso en worker/src/index.js). En el resto de
+        // competiciones se sigue respetando siempre lo que mande el
+        // panel, igual que antes.
         const grupoCalculado = grupoAutomaticoSegundaFederacion(body.competicion, body.equipo_local, body.equipo_visitante);
-        const grupoAGuardar = body.competicion === "segunda_federacion" ? grupoCalculado : (body.grupo || null);
+        const grupoAGuardar = body.competicion === "segunda_federacion"
+          ? (body.grupo || grupoCalculado)
+          : (body.grupo || null);
         const insertResult = await env.DB.prepare(
           `INSERT INTO results (competicion, grupo, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido, estado, ubicacion, flashscore_url, escudo_local_url, escudo_visitante_url, autor_id, autor_nombre, origin_write_id)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -8354,10 +8457,14 @@ async function handlePrimary(request, env, ctx) {
         // limpia siempre (evita que quede "colgado" de un retraso previo
         // si luego el partido se reprograma o se juega con normalidad).
         const fechaRetrasado = body.estado === "retrasado" ? (body.fecha_partido_retrasado || null) : null;
-        // Mismo cálculo automático del grupo que en la creación (POST) y
-        // que en el worker principal.
+        // Mismo cálculo automático del grupo que en la creación (POST),
+        // con la misma prioridad: si el panel manda body.grupo a mano,
+        // se respeta siempre; el cálculo automático es solo el valor
+        // por defecto cuando no viene nada (ver POST de arriba).
         const grupoCalculadoEdicion = grupoAutomaticoSegundaFederacion(body.competicion, body.equipo_local, body.equipo_visitante);
-        const grupoAGuardarEdicion = body.competicion === "segunda_federacion" ? grupoCalculadoEdicion : (body.grupo || null);
+        const grupoAGuardarEdicion = body.competicion === "segunda_federacion"
+          ? (body.grupo || grupoCalculadoEdicion)
+          : (body.grupo || null);
         await env.DB.prepare(
           `UPDATE results SET competicion=?, grupo=?, jornada=?, equipo_local=?, equipo_visitante=?, goles_local=?, goles_visitante=?, penaltis_local=?, penaltis_visitante=?, fecha_partido=?, estado=?, ubicacion=?, flashscore_url=?, escudo_local_url=?, escudo_visitante_url=?, fecha_partido_retrasado=?, finalizado_no_cubierto=0 WHERE id=?`
         ).bind(

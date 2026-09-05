@@ -6646,25 +6646,56 @@ async function handlePrimary(request, env, ctx) {
         // para mostrar el detalle completo a un admin: quién la pide, de
         // quién es originalmente el contenido, y qué noticia/resultado es
         // exactamente (título, tipo, estado de publicación...).
-        const solicitudes = await Promise.all(results.map(async (s) => {
-          const [solicitante, autor] = await Promise.all([
-            env.DB.prepare("SELECT id, nombre, username, email FROM users WHERE id = ?").bind(s.solicitante_id).first(),
-            s.autor_id ? env.DB.prepare("SELECT id, nombre, username, email FROM users WHERE id = ?").bind(s.autor_id).first() : null,
-          ]);
-          let entidad = null;
-          if (s.tipo_entidad === "resultado") {
-            entidad = await env.DB.prepare(
-              "SELECT id, equipo_local, equipo_visitante, competicion, estado FROM results WHERE id = ?"
-            ).bind(s.entidad_id).first();
-          } else {
-            entidad = await env.DB.prepare(
-              "SELECT id, titulo, subtitulo, tipo, categoria, publicado, estado_borrador FROM articles WHERE id = ?"
-            ).bind(s.entidad_id).first();
-          }
-          let resuelta_por = null;
-          if (s.resuelta_por_id) {
-            resuelta_por = await env.DB.prepare("SELECT id, nombre FROM users WHERE id = ?").bind(s.resuelta_por_id).first();
-          }
+        //
+        // ANTES: esto lanzaba hasta 4 queries POR CADA fila (solicitante,
+        // autor, entidad, resuelta_por) con un .map(async ...) -con el
+        // límite de 200 filas de arriba, hasta 800 queries individuales
+        // en una sola petición HTTP-. Es exactamente el patrón "N+1" que
+        // más RAM/CPU consume: cada prepare().bind().first() es su propio
+        // round-trip. Se sustituye por un puñado de consultas por LOTES
+        // con "IN (...)", una única vez para todas las filas, y luego se
+        // cruzan en memoria con Maps (barato, ya en el Worker). Mismo
+        // arreglo aplicado en worker/src/index.js (API principal): debe
+        // mantenerse igual en ambas para el failover.
+        const idsUsuarios = [...new Set(
+          results.flatMap((s) => [s.solicitante_id, s.autor_id, s.resuelta_por_id]).filter((id) => id != null)
+        )];
+        const idsResultados = [...new Set(
+          results.filter((s) => s.tipo_entidad === "resultado").map((s) => s.entidad_id)
+        )];
+        const idsArticulos = [...new Set(
+          results.filter((s) => s.tipo_entidad !== "resultado").map((s) => s.entidad_id)
+        )];
+
+        const [usuariosRows, resultadosRows, articulosRows] = await Promise.all([
+          idsUsuarios.length
+            ? env.DB.prepare(
+                `SELECT id, nombre, username, email FROM users WHERE id IN (${idsUsuarios.map(() => "?").join(",")})`
+              ).bind(...idsUsuarios).all()
+            : { results: [] },
+          idsResultados.length
+            ? env.DB.prepare(
+                `SELECT id, equipo_local, equipo_visitante, competicion, estado FROM results WHERE id IN (${idsResultados.map(() => "?").join(",")})`
+              ).bind(...idsResultados).all()
+            : { results: [] },
+          idsArticulos.length
+            ? env.DB.prepare(
+                `SELECT id, titulo, subtitulo, tipo, categoria, publicado, estado_borrador FROM articles WHERE id IN (${idsArticulos.map(() => "?").join(",")})`
+              ).bind(...idsArticulos).all()
+            : { results: [] },
+        ]);
+
+        const usuariosPorId = new Map(usuariosRows.results.map((u) => [u.id, u]));
+        const resultadosPorId = new Map(resultadosRows.results.map((r) => [r.id, r]));
+        const articulosPorId = new Map(articulosRows.results.map((a) => [a.id, a]));
+
+        const solicitudes = results.map((s) => {
+          const solicitante = usuariosPorId.get(s.solicitante_id) || null;
+          const autor = s.autor_id ? (usuariosPorId.get(s.autor_id) || null) : null;
+          const entidad = s.tipo_entidad === "resultado"
+            ? (resultadosPorId.get(s.entidad_id) || null)
+            : (articulosPorId.get(s.entidad_id) || null);
+          const resuelta_por = s.resuelta_por_id ? (usuariosPorId.get(s.resuelta_por_id) || null) : null;
           return {
             ...s,
             solicitante_nombre: solicitante ? solicitante.nombre : null,
@@ -6681,7 +6712,7 @@ async function handlePrimary(request, env, ctx) {
             entidad_existe: Boolean(entidad),
             resuelta_por_nombre: resuelta_por ? resuelta_por.nombre : null,
           };
-        }));
+        });
 
         return json({ solicitudes });
       }
@@ -7383,14 +7414,46 @@ async function handlePrimary(request, env, ctx) {
            ORDER BY p.created_at DESC`
         ).all();
 
-        const conResultados = await Promise.all(
-          encuestas.map(async (p) => ({
-            ...(await obtenerEncuestaConResultados(env, p, null)),
+        // ANTES: una query de opciones+votos POR CADA encuesta vía
+        // obtenerEncuestaConResultados (N+1, sin LIMIT, crece con el
+        // histórico de encuestas). Se sustituye por UNA sola consulta que
+        // trae ya agregadas las opciones+votos de TODAS las encuestas del
+        // listado, y se reparte en memoria con un Map por poll_id. Mismo
+        // arreglo aplicado en worker/src/index.js (API principal).
+        const idsEncuestas = encuestas.map((p) => p.id);
+        const opcionesPorEncuesta = new Map(idsEncuestas.map((id) => [id, []]));
+        if (idsEncuestas.length) {
+          const { results: opcionesTodas } = await env.DB.prepare(
+            `SELECT po.id, po.poll_id, po.texto, po.orden, COUNT(pv.id) AS votos
+             FROM poll_options po
+             LEFT JOIN poll_votes pv ON pv.option_id = po.id
+             WHERE po.poll_id IN (${idsEncuestas.map(() => "?").join(",")})
+             GROUP BY po.id
+             ORDER BY po.orden ASC, po.id ASC`
+          ).bind(...idsEncuestas).all();
+          for (const o of opcionesTodas) {
+            opcionesPorEncuesta.get(o.poll_id).push(o);
+          }
+        }
+
+        const conResultados = encuestas.map((p) => {
+          const opciones = opcionesPorEncuesta.get(p.id) || [];
+          const totalVotos = opciones.reduce((acc, o) => acc + o.votos, 0);
+          return {
+            id: p.id,
+            pregunta: p.pregunta,
+            article_id: p.article_id,
+            en_portada: !!p.en_portada,
+            estado: p.estado,
+            cierra_en: p.cierra_en,
+            total_votos: totalVotos,
+            mi_voto: null,
+            opciones: opciones.map((o) => ({ id: o.id, texto: o.texto, votos: o.votos })),
             articulo_titulo: p.articulo_titulo || null,
             articulo_slug: p.articulo_slug || null,
             orden_portada: p.orden_portada,
-          }))
-        );
+          };
+        });
         return json({ encuestas: conResultados });
       }
 

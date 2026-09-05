@@ -8798,6 +8798,9 @@ async function handlePrimary(request, env, ctx) {
           await env.DB.prepare("UPDATE results SET estado = 'anulado', cronometro_pausado_en = COALESCE(cronometro_pausado_en, ?) WHERE id = ?")
             .bind(parseInt(body.minuto, 10) || 0, resultadoId).run();
         }
+        // Cualquier evento nuevo cuenta como "ya se está cubriendo" (ver
+        // mismo razonamiento en worker/src/index.js).
+        await env.DB.prepare("UPDATE results SET finalizado_no_cubierto = 0 WHERE id = ?").bind(resultadoId).run();
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "crear_evento_partido", entidad: "resultado", entidad_id: resultadoId,
           descripcion: `Ha añadido un evento (${body.tipo}) al partido con id ${resultadoId}`,
@@ -8837,6 +8840,9 @@ async function handlePrimary(request, env, ctx) {
         ).run();
         await recalcularMarcadorDesdeEventos(env, resultadoId);
         await recalcularPenaltisDesdeEventos(env, resultadoId);
+        // Editar un evento existente también cuenta como "ya se está
+        // cubriendo".
+        await env.DB.prepare("UPDATE results SET finalizado_no_cubierto = 0 WHERE id = ?").bind(resultadoId).run();
         return json({ ok: true });
       }
 
@@ -8853,6 +8859,8 @@ async function handlePrimary(request, env, ctx) {
         await env.DB.prepare("DELETE FROM match_events WHERE id=? AND resultado_id=?").bind(eventoId, resultadoId).run();
         await recalcularMarcadorDesdeEventos(env, resultadoId);
         await recalcularPenaltisDesdeEventos(env, resultadoId);
+        // Borrar un evento también cuenta como "ya se está cubriendo".
+        await env.DB.prepare("UPDATE results SET finalizado_no_cubierto = 0 WHERE id = ?").bind(resultadoId).run();
         return json({ ok: true });
       }
 

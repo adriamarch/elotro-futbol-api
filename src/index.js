@@ -4730,7 +4730,7 @@ async function handlePrimary(request, env, ctx) {
 
         const state = randomSalt();
         const volver = url.searchParams.get("volver") || "";
-        const redirectUri = `${SITIO_URL}/api/readers/discord/callback`;
+        const redirectUri = `${API_URL}/api/readers/discord/callback`;
 
         const paramsDiscord = new URLSearchParams({
           client_id: env.DISCORD_CLIENT_ID,
@@ -4765,7 +4765,7 @@ async function handlePrimary(request, env, ctx) {
         const [stateGuardado, volverGuardado] = decodeURIComponent(cookieState).split("|");
         if (stateGuardado !== stateRecibido) return irConError("No se ha podido verificar el inicio de sesión con Discord");
 
-        const redirectUri = `${SITIO_URL}/api/readers/discord/callback`;
+        const redirectUri = `${API_URL}/api/readers/discord/callback`;
 
         let tokenData;
         try {

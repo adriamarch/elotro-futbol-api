@@ -6606,7 +6606,7 @@ async function handlePrimary(request, env, ctx) {
         // Solo el autor (o coautor, o un admin, o alguien con una
         // solicitud de edición aprobada y vigente para esta noticia)
         // puede editarla.
-        const articuloParaPermiso = await env.DB.prepare("SELECT slug, autor_id, coautor_id, publicado, estado_borrador, fecha_publicacion, slug_congelado, resultado_id, tipo, ficha_tecnica, banner_urgente FROM articles WHERE id = ?").bind(id).first();
+        const articuloParaPermiso = await env.DB.prepare("SELECT slug, autor_id, coautor_id, publicado, estado_borrador, fecha_publicacion, slug_congelado, resultado_id, tipo, categoria, club, ficha_tecnica, banner_urgente FROM articles WHERE id = ?").bind(id).first();
         if (!articuloParaPermiso) return json({ error: "Noticia no encontrada" }, 404);
         if (!(await puedeEditar(env, payload, "articulo", id, articuloParaPermiso.autor_id, articuloParaPermiso.coautor_id))) {
           return json({ error: "No puedes editar esta noticia porque no es tuya. Solicita permiso al autor o a un administrador." }, 403);
@@ -6771,6 +6771,12 @@ async function handlePrimary(request, env, ctx) {
         // hubiera (p. ej. una edición que solo toca el título no debe
         // borrar la ficha técnica ya rellenada).
         const tipoFinal = body.tipo || articuloParaPermiso.tipo || "noticia";
+        // Categoría y club: se usan los que vengan en el body si se manda
+        // ese campo; si no se manda en absoluto (undefined), se conserva
+        // lo que ya tenía la noticia, para que una edición que no los
+        // toca (p. ej. solo corregir el título) no los borre.
+        const categoriaFinal = body.categoria !== undefined ? body.categoria : (articuloParaPermiso.categoria || "hypermotion");
+        const clubFinal = body.club !== undefined ? body.club : articuloParaPermiso.club;
         let fichaTecnica = articuloParaPermiso.ficha_tecnica || null;
         if (Object.prototype.hasOwnProperty.call(body, "ficha_tecnica")) {
           fichaTecnica = (tipoFinal === "cronica" && body.ficha_tecnica && Object.keys(body.ficha_tecnica).length)
@@ -6799,7 +6805,7 @@ async function handlePrimary(request, env, ctx) {
            WHERE id=?`
         ).bind(
           slug, body.titulo, body.subtitulo || null, body.contenido, body.tipo || "noticia",
-          body.categoria || "hypermotion", body.club || null, imagenPortada,
+          categoriaFinal, clubFinal || null, imagenPortada,
           imagenes.length ? JSON.stringify(imagenes) : null, resultadoId,
           autorId, autorNombre, coautorId, coautorNombre,
           body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, slugCongeladoFinal,

@@ -1261,6 +1261,17 @@ function b64urlDecode(str) {
   while (str.length % 4) str += "=";
   return atob(str);
 }
+// Igual que b64urlDecode, pero para trozos que contienen texto (JSON de
+// un JWT): atob() trata la salida como bytes "binarios" de 1 carácter
+// cada uno, así que un nombre con letras como "à" (2 bytes en UTF-8) se
+// corrompe si se usa tal cual. Aquí se reinterpretan esos bytes como
+// UTF-8 antes de devolver la cadena, para que JSON.parse() reciba texto
+// correcto (p. ej. el "name" de Google en verificarGoogleIdToken).
+function b64urlDecodeTexto(str) {
+  const binario = b64urlDecode(str);
+  const bytes = Uint8Array.from(binario, (c) => c.charCodeAt(0));
+  return new TextDecoder("utf-8").decode(bytes);
+}
 async function signHS256(data, secret) {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -1281,7 +1292,7 @@ async function verifyJWT(token, secret) {
   const [h, p, s] = parts;
   const expected = await signHS256(`${h}.${p}`, secret);
   if (expected !== s) return null;
-  const payload = JSON.parse(b64urlDecode(p));
+  const payload = JSON.parse(b64urlDecodeTexto(p));
   if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) return null;
   return payload;
 }
@@ -1473,8 +1484,8 @@ async function verificarGoogleIdToken(idToken, googleClientId) {
   if (parts.length !== 3) return null;
   const [h, p, s] = parts;
 
-  const header = JSON.parse(b64urlDecode(h));
-  const payload = JSON.parse(b64urlDecode(p));
+  const header = JSON.parse(b64urlDecodeTexto(h));
+  const payload = JSON.parse(b64urlDecodeTexto(p));
 
   if (payload.iss !== "https://accounts.google.com" && payload.iss !== "accounts.google.com") return null;
   if (payload.aud !== googleClientId) return null;

@@ -4610,6 +4610,72 @@ async function handlePrimary(request, env, ctx) {
         return json({ reader: { ...lector, email_verificado: !!lector.email_verificado } });
       }
 
+      // ---------- LEER MI PERFIL COMPLETO (nombre + avatar) ----------
+      // Faltaba el GET: cuenta.html lo llama al cargar la pestaña de
+      // perfil (ver cargarMiPerfilLector()) para traer también el
+      // avatar_url, que /api/readers/me de arriba no incluye. Mismo
+      // patrón que /api/me/perfil (redactores) pero con los campos que
+      // tiene la tabla "readers".
+      if (path === "/api/readers/me/perfil" && method === "GET") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const lector = await env.DB.prepare(
+          "SELECT id, nombre, email, email_verificado, avatar_url FROM readers WHERE id = ? AND activo = 1"
+        ).bind(payload.rid).first();
+        if (!lector) return json({ error: "No autorizado" }, 401);
+        return json({ reader: { ...lector, email_verificado: !!lector.email_verificado } });
+      }
+
+      // ---------- MIS SESIONES (dispositivos conectados) ----------
+      // Mismo patrón que /api/me/sesiones para redactores, pero sobre
+      // reader_sessions/readers: cuenta.html la llama desde la pestaña
+      // "Dispositivos" (ver cargaSesionesLector()).
+      if (path === "/api/readers/me/sesiones" && method === "GET") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const { results } = await env.DB.prepare(
+          `SELECT id, user_agent, ip, created_at, last_seen_at FROM reader_sessions
+           WHERE reader_id = ? AND revoked_at IS NULL ORDER BY last_seen_at DESC`
+        ).bind(payload.rid).all();
+        const sesiones = results.map((s) => ({
+          id: s.id,
+          dispositivo: describirDispositivo(s.user_agent),
+          ip: s.ip || null,
+          created_at: s.created_at,
+          last_seen_at: s.last_seen_at,
+          actual: s.id === payload.sid,
+        }));
+        return json({ sesiones });
+      }
+
+      // ---------- CERRAR TODAS LAS DEMÁS SESIONES (lector) ----------
+      // Va antes del DELETE de una sesión concreta con id, para no
+      // confundirla con /api/readers/me/sesiones/:id.
+      if (path === "/api/readers/me/sesiones/otras" && method === "DELETE") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        await env.DB.prepare(
+          "UPDATE reader_sessions SET revoked_at = datetime('now') WHERE reader_id = ? AND id != ? AND revoked_at IS NULL"
+        ).bind(payload.rid, payload.sid || "").run();
+        return json({ ok: true });
+      }
+
+      // ---------- CERRAR UNA SESIÓN CONCRETA (lector) ----------
+      // Solo se puede cerrar una sesión propia (nunca la de otro
+      // lector): se filtra siempre por reader_id = payload.rid.
+      const sesionLectorMatch = path.match(/^\/api\/readers\/me\/sesiones\/([a-f0-9]+)$/);
+      if (sesionLectorMatch && method === "DELETE") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const id = sesionLectorMatch[1];
+        const sesion = await env.DB.prepare(
+          "SELECT id FROM reader_sessions WHERE id = ? AND reader_id = ? AND revoked_at IS NULL"
+        ).bind(id, payload.rid).first();
+        if (!sesion) return json({ error: "Sesión no encontrada" }, 404);
+        await env.DB.prepare("UPDATE reader_sessions SET revoked_at = datetime('now') WHERE id = ?").bind(id).run();
+        return json({ ok: true, era_la_actual: id === payload.sid });
+      }
+
       // ---------- Cambio de contraseña propia (lector logueado) ----------
       // Mismo patrón que /api/me/password para redactores: pide la
       // contraseña actual, valida la nueva y cierra el resto de
@@ -4643,11 +4709,9 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- Editar perfil propio (lector logueado): nombre + avatar ----------
-      // Faltaba en este Worker (solo existía como /api/me/perfil en
-      // worker-secondary, con otro path): público/cuenta.html la llama
-      // como GET y PUT a /api/readers/me/perfil. El GET ya lo cubre
-      // /api/readers/me de arriba (mismos campos), así que aquí solo
-      // hace falta el PUT. Se reutiliza el mismo patrón que
+      // público/cuenta.html la llama como GET y PUT a
+      // /api/readers/me/perfil. El GET está justo arriba, junto a
+      // /api/readers/me. Se reutiliza el mismo patrón que
       // /api/readers/me/password: requireReaderAuth + devolver un JWT
       // nuevo (el frontend guarda { token, reader } tras cada guardado
       // para reflejar el cambio sin tener que volver a iniciar sesión).

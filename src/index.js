@@ -6059,6 +6059,14 @@ async function handlePrimary(request, env, ctx) {
         await env.DB.prepare("UPDATE media SET autor_id = NULL WHERE autor_id = ?").bind(id).run();
         await env.DB.prepare("UPDATE results SET autor_id = NULL WHERE autor_id = ?").bind(id).run();
         await env.DB.prepare("UPDATE custom_clubs SET autor_id = NULL WHERE autor_id = ?").bind(id).run();
+        await env.DB.prepare("UPDATE alineaciones SET autor_id = NULL WHERE autor_id = ?").bind(id).run();
+        await env.DB.prepare("UPDATE comments SET moderado_por_id = NULL WHERE moderado_por_id = ?").bind(id).run();
+        await env.DB.prepare("UPDATE club_info SET autor_id = NULL WHERE autor_id = ?").bind(id).run();
+        // solicitante_id es NOT NULL en club_info_solicitudes: no se puede
+        // poner a NULL (mismo caso que nivel_historial.usuario_id más
+        // abajo), así que se borran las solicitudes que hizo esta persona.
+        await env.DB.prepare("DELETE FROM club_info_solicitudes WHERE solicitante_id = ?").bind(id).run();
+        await env.DB.prepare("UPDATE club_info_solicitudes SET resuelta_por_id = NULL WHERE resuelta_por_id = ?").bind(id).run();
         await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
         // usuario_id es NOT NULL en nivel_historial: no se puede poner a
         // NULL, así que se borra su historial de cambios de nivel.

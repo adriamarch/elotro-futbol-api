@@ -1224,6 +1224,21 @@ async function comprobarUltimaHora(env, pinRecibido) {
   return true;
 }
 
+// ---------- Banner flotante de "última hora" (distinto del PIN de arriba) ----------
+// Ver el comentario gemelo en worker/src/index.js: esto es la marca
+// visual (banner rojo fijo en toda la web), no el PIN de publicación
+// directa. Nombre de columna distinto (banner_urgente) para no
+// confundir los dos conceptos.
+//
+// En minutos (no horas): sql-compat.js traduce SQLite -> Postgres para
+// las consultas que llegan aquí por failover, y solo tiene patrón de
+// traducción ya hecho para "+N minutes" / "+N days" en
+// datetime('now', ...), no para "hours".
+const BANNER_URGENTE_DURACION_MINUTOS = 120; // 2 horas
+function calcularBannerUrgenteHasta(activar) {
+  return activar ? `datetime('now', '+${BANNER_URGENTE_DURACION_MINUTOS} minutes')` : "NULL";
+}
+
 // ---------- Publicación directa según el nivel del colaborador ----------
 // A partir del sistema de niveles, un redactor de Nivel 2 o superior ya
 // no necesita el PIN de "Última hora" para publicar directamente: la
@@ -6073,6 +6088,43 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- ARTICLES: lista pública / creación ----------
+      // ---------- Banner flotante de "última hora" (público) ----------
+      // Ver el comentario gemelo en worker/src/index.js.
+      if (path === "/api/articles/banner-urgente" && method === "GET") {
+        const fila = await env.DB.prepare(
+          `SELECT slug, titulo, categoria FROM articles
+           WHERE banner_urgente = 1 AND banner_urgente_hasta > datetime('now') AND publicado = 1
+           ORDER BY banner_urgente_hasta DESC LIMIT 1`
+        ).first();
+        if (!fila) return json({ activo: false });
+        return json({
+          activo: true,
+          titulo: fila.titulo,
+          url: urlNoticia(fila.categoria, fila.slug),
+        });
+      }
+      const desactivarBannerMatch = path.match(/^\/api\/articles\/(\d+)\/banner-urgente$/);
+      if (desactivarBannerMatch && method === "DELETE") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const id = parseInt(desactivarBannerMatch[1], 10);
+        const articulo = await env.DB.prepare("SELECT autor_id, coautor_id FROM articles WHERE id = ?").bind(id).first();
+        if (!articulo) return json({ error: "Noticia no encontrada" }, 404);
+        if (!(await puedeEditar(env, payload, "articulo", id, articulo.autor_id, articulo.coautor_id))) {
+          return json({ error: "No puedes modificar esta noticia." }, 403);
+        }
+        const nivelUsuario = payload.rol === "admin" ? NIVEL_MAXIMO : await obtenerNivelUsuario(env, payload.uid);
+        if (payload.rol !== "admin" && nivelUsuario < 2) {
+          return json({ error: "No tienes permiso para gestionar el banner de última hora." }, 403);
+        }
+        await env.DB.prepare("UPDATE articles SET banner_urgente = 0, banner_urgente_hasta = NULL, updated_at = datetime('now') WHERE id = ?").bind(id).run();
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "quitar_banner_urgente", entidad: "articulo", entidad_id: id,
+          descripcion: `Ha quitado el banner de última hora de la noticia #${id}.`,
+        }));
+        return json({ ok: true });
+      }
+
       if (path === "/api/articles" && method === "GET") {
         const categoria = url.searchParams.get("categoria");
         const club = url.searchParams.get("club");
@@ -6286,10 +6338,17 @@ async function handlePrimary(request, env, ctx) {
           ? JSON.stringify(body.ficha_tecnica)
           : null;
 
+        // Banner urgente: mismo criterio que en worker/src/index.js (ver
+        // comentario allí) -- solo admin o redactor Nivel 2+ puede
+        // activarlo, y la duración la calcula el servidor.
+        if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
+        const puedeActivarBanner = payload.rol === "admin" || nivelUsuario >= 2;
+        const activarBanner = puedeActivarBanner && body.banner_urgente === true;
+
         await env.DB.prepare(
           `INSERT INTO articles (slug, titulo, subtitulo, contenido, tipo, categoria, club, imagen_url, imagenes, resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado, estado_borrador, programado_para, slug_congelado, fecha_publicacion, updated_at,
-            titulo_eu, subtitulo_eu, contenido_eu, titulo_ca, subtitulo_ca, contenido_ca, titulo_gl, subtitulo_gl, contenido_gl, titulo_en, subtitulo_en, contenido_en, origin_write_id, ficha_tecnica)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            titulo_eu, subtitulo_eu, contenido_eu, titulo_ca, subtitulo_ca, contenido_ca, titulo_gl, subtitulo_gl, contenido_gl, titulo_en, subtitulo_en, contenido_en, origin_write_id, ficha_tecnica, banner_urgente, banner_urgente_hasta)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${calcularBannerUrgenteHasta(activarBanner)})`
         ).bind(
           slug, body.titulo, body.subtitulo || null, body.contenido,
           body.tipo || "noticia", body.categoria || "hypermotion", body.club || null,
@@ -6301,7 +6360,7 @@ async function handlePrimary(request, env, ctx) {
           traducciones.titulo_ca, traducciones.subtitulo_ca, traducciones.contenido_ca,
           traducciones.titulo_gl, traducciones.subtitulo_gl, traducciones.contenido_gl,
           traducciones.titulo_en, traducciones.subtitulo_en, traducciones.contenido_en,
-          origenWriteId, fichaTecnica
+          origenWriteId, fichaTecnica, activarBanner ? 1 : 0
         ).run();
 
         const publicado = body.publicado !== false;
@@ -6547,7 +6606,7 @@ async function handlePrimary(request, env, ctx) {
         // Solo el autor (o coautor, o un admin, o alguien con una
         // solicitud de edición aprobada y vigente para esta noticia)
         // puede editarla.
-        const articuloParaPermiso = await env.DB.prepare("SELECT slug, autor_id, coautor_id, publicado, estado_borrador, fecha_publicacion, slug_congelado, resultado_id, tipo, ficha_tecnica FROM articles WHERE id = ?").bind(id).first();
+        const articuloParaPermiso = await env.DB.prepare("SELECT slug, autor_id, coautor_id, publicado, estado_borrador, fecha_publicacion, slug_congelado, resultado_id, tipo, ficha_tecnica, banner_urgente FROM articles WHERE id = ?").bind(id).first();
         if (!articuloParaPermiso) return json({ error: "Noticia no encontrada" }, 404);
         if (!(await puedeEditar(env, payload, "articulo", id, articuloParaPermiso.autor_id, articuloParaPermiso.coautor_id))) {
           return json({ error: "No puedes editar esta noticia porque no es tuya. Solicita permiso al autor o a un administrador." }, 403);
@@ -6721,9 +6780,22 @@ async function handlePrimary(request, env, ctx) {
           fichaTecnica = null;
         }
 
+        // Banner urgente al editar: mismo criterio que al crear (admin o
+        // Nivel 2+). Si el campo no se manda, se conserva el estado que
+        // ya tuviera la noticia.
+        let bannerUrgenteFinal = articuloParaPermiso.banner_urgente ? 1 : 0;
+        let bannerUrgenteHastaSQL = null; // null = no tocar esta columna
+        if (Object.prototype.hasOwnProperty.call(body, "banner_urgente")) {
+          if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
+          const puedeActivarBanner = payload.rol === "admin" || nivelUsuario >= 2;
+          const activarBanner = puedeActivarBanner && body.banner_urgente === true;
+          bannerUrgenteFinal = activarBanner ? 1 : 0;
+          bannerUrgenteHastaSQL = calcularBannerUrgenteHasta(activarBanner);
+        }
+
         await env.DB.prepare(
           `UPDATE articles SET slug=?, titulo=?, subtitulo=?, contenido=?, tipo=?, categoria=?, club=?, imagen_url=?, imagenes=?, resultado_id=?, autor_id=?, autor_nombre=?, coautor_id=?, coautor_nombre=?, destacado=?, publicado=?, estado_borrador=?, programado_para=?, slug_congelado=?, fecha_publicacion=?, updated_at=datetime('now'),
-            titulo_eu=?, subtitulo_eu=?, contenido_eu=?, titulo_ca=?, subtitulo_ca=?, contenido_ca=?, titulo_gl=?, subtitulo_gl=?, contenido_gl=?, titulo_en=?, subtitulo_en=?, contenido_en=?, ficha_tecnica=?
+            titulo_eu=?, subtitulo_eu=?, contenido_eu=?, titulo_ca=?, subtitulo_ca=?, contenido_ca=?, titulo_gl=?, subtitulo_gl=?, contenido_gl=?, titulo_en=?, subtitulo_en=?, contenido_en=?, ficha_tecnica=?, banner_urgente=?${bannerUrgenteHastaSQL !== null ? `, banner_urgente_hasta=${bannerUrgenteHastaSQL}` : ""}
            WHERE id=?`
         ).bind(
           slug, body.titulo, body.subtitulo || null, body.contenido, body.tipo || "noticia",
@@ -6736,7 +6808,7 @@ async function handlePrimary(request, env, ctx) {
           traducciones.titulo_ca, traducciones.subtitulo_ca, traducciones.contenido_ca,
           traducciones.titulo_gl, traducciones.subtitulo_gl, traducciones.contenido_gl,
           traducciones.titulo_en, traducciones.subtitulo_en, traducciones.contenido_en,
-          fichaTecnica, id
+          fichaTecnica, bannerUrgenteFinal, id
         ).run();
         await registrarRedirectSiCambia(env, id, articuloParaPermiso.slug, slug);
 

@@ -36,7 +36,7 @@ export function translateSql(sql, params = []) {
   // asignación) para decidir en un único paso, evitando el doble-paso
   // (frágil) de detectar y luego re-machear la misma expresión.
   out = out.replace(
-    /(,\s*|\bSET\s+)?\b((?:created_at|updated_at|cierra_en))(?!::date)\s*(>=|<=|>|<|=)\s*(CURRENT_TIMESTAMP\b|\(CURRENT_TIMESTAMP\s*\+\s*(?:\?::interval|INTERVAL\s*'[^']+')\))/gi,
+    /(,\s*|\bSET\s+)?\b((?:created_at|updated_at|cierra_en|banner_urgente_hasta))(?!::date)\s*(>=|<=|>|<|=)\s*(CURRENT_TIMESTAMP\b|\(CURRENT_TIMESTAMP\s*\+\s*(?:\?::interval|INTERVAL\s*'[^']+')\))/gi,
     (match, assignPrefix, col, op, rhs) => {
       const isAssignment = op === "=" && !!assignPrefix;
       if (isAssignment) return match; // "SET columna = ..." / ", columna = ...": no castear

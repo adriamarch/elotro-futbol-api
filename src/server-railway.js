@@ -70,6 +70,16 @@ const env = {
   // lectores, ver /api/readers/google en src/index.js). Mismo valor que
   // GOOGLE_CLIENT_ID en worker/wrangler.toml.
   GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
+  // Application (client) ID de la app de Azure para "Iniciar sesión con
+  // Microsoft" (lectores, ver /api/readers/microsoft en src/index.js).
+  // Mismo valor que MICROSOFT_CLIENT_ID en worker/wrangler.toml.
+  MICROSOFT_CLIENT_ID: process.env.MICROSOFT_CLIENT_ID,
+  // Client ID y Client Secret de la app de Discord para "Iniciar sesión
+  // con Discord" (lectores, ver /api/readers/discord/* en src/index.js).
+  // Mismos valores que DISCORD_CLIENT_ID/DISCORD_CLIENT_SECRET en
+  // worker/wrangler.toml.
+  DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID,
+  DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET,
   // Protege POST /api/internal/cron-respaldo (ver src/index.js): debe
   // coincidir con el valor puesto en el cron externo de Railway que
   // llama a este endpoint (cabecera X-Internal-Cron-Secret).

@@ -1532,6 +1532,63 @@ async function verificarGoogleIdToken(idToken, googleClientId) {
   return payload;
 }
 
+// ---------- Verificación del id_token de Microsoft (login de lectores) ----------
+// Ver el comentario largo en worker/src/index.js (Worker principal):
+// esta es la misma función, replicada aquí para que el failover a
+// Railway/Postgres soporte el mismo login con Microsoft sin depender
+// del principal estando vivo.
+let cacheMicrosoftJWKS = null;
+async function getMicrosoftJWK(kid, forzarRefresco = false) {
+  if (!cacheMicrosoftJWKS || forzarRefresco) {
+    const res = await fetch("https://login.microsoftonline.com/common/discovery/v2.0/keys");
+    if (!res.ok) throw new Error("No se han podido obtener las claves públicas de Microsoft");
+    const data = await res.json();
+    cacheMicrosoftJWKS = data.keys || [];
+  }
+  return cacheMicrosoftJWKS.find((k) => k.kid === kid) || null;
+}
+
+async function verificarMicrosoftIdToken(idToken, microsoftClientId) {
+  const parts = idToken.split(".");
+  if (parts.length !== 3) return null;
+  const [h, p, s] = parts;
+
+  const header = JSON.parse(b64urlDecodeTexto(h));
+  const payload = JSON.parse(b64urlDecodeTexto(p));
+
+  if (typeof payload.iss !== "string") return null;
+  if (!payload.iss.startsWith("https://login.microsoftonline.com/") || !payload.iss.endsWith("/v2.0")) return null;
+  if (payload.aud !== microsoftClientId) return null;
+  if (!payload.exp || Math.floor(Date.now() / 1000) > payload.exp) return null;
+  if (!payload.email && !payload.preferred_username) return null;
+
+  let jwk = await getMicrosoftJWK(header.kid);
+  if (!jwk) jwk = await getMicrosoftJWK(header.kid, true);
+  if (!jwk) return null;
+
+  const clavePublica = await crypto.subtle.importKey(
+    "jwk",
+    jwk,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+
+  const firmaBytes = Uint8Array.from(b64urlDecode(s), (c) => c.charCodeAt(0));
+  const datosFirmados = new TextEncoder().encode(`${h}.${p}`);
+  const valido = await crypto.subtle.verify(
+    "RSASSA-PKCS1-v1_5",
+    clavePublica,
+    firmaBytes,
+    datosFirmados
+  );
+  if (!valido) return null;
+
+  if (!payload.email && payload.preferred_username) payload.email = payload.preferred_username;
+
+  return payload;
+}
+
 // ---------- Cloudinary ----------
 // Sustituye a R2/Drive: los archivos de "Subir contenido" se guardan en
 // Cloudinary. Solo hacen falta 3 credenciales fijas (cloud name, api key,
@@ -4607,6 +4664,182 @@ async function handlePrimary(request, env, ctx) {
         });
       }
 
+      // ---------- Login/registro de lector con cuenta de Microsoft ----------
+      // Ver el comentario largo en worker/src/index.js (Worker
+      // principal) para la explicación completa del flujo. Réplica
+      // exacta aquí para que funcione también durante un failover.
+      if (path === "/api/readers/microsoft" && method === "POST") {
+        if (!env.MICROSOFT_CLIENT_ID) return json({ error: "El acceso con Microsoft no está configurado" }, 500);
+        const { credential } = await request.json();
+        if (!credential) return json({ error: "Falta el token de Microsoft" }, 400);
+
+        let datosMicrosoft;
+        try {
+          datosMicrosoft = await verificarMicrosoftIdToken(credential, env.MICROSOFT_CLIENT_ID);
+        } catch {
+          datosMicrosoft = null;
+        }
+        if (!datosMicrosoft) return json({ error: "No se ha podido verificar la cuenta de Microsoft" }, 401);
+        if (!datosMicrosoft.email) return json({ error: "Tu cuenta de Microsoft no tiene un correo asociado" }, 401);
+
+        const microsoftId = datosMicrosoft.oid || datosMicrosoft.sub;
+        const email = datosMicrosoft.email.toLowerCase();
+        const nombre = datosMicrosoft.name || email.split("@")[0];
+
+        let lector = await env.DB.prepare("SELECT * FROM readers WHERE microsoft_id = ? AND activo = 1").bind(microsoftId).first();
+
+        if (!lector) {
+          const porEmail = await env.DB.prepare("SELECT * FROM readers WHERE email = ? AND activo = 1").bind(email).first();
+          if (porEmail) {
+            await env.DB.prepare(
+              "UPDATE readers SET microsoft_id = ?, email_verificado = 1 WHERE id = ?"
+            ).bind(microsoftId, porEmail.id).run();
+            lector = { ...porEmail, microsoft_id: microsoftId, email_verificado: 1 };
+          } else {
+            // Mismo motivo que en el flujo de Google: se evita depender
+            // de que password_hash/salt permitan NULL con un hash de
+            // contraseña aleatoria que nadie puede reproducir.
+            const saltRelleno = randomSalt();
+            const arrRelleno = new Uint8Array(32);
+            crypto.getRandomValues(arrRelleno);
+            const passwordRelleno = [...arrRelleno].map((b) => b.toString(16).padStart(2, "0")).join("");
+            const hashRelleno = await hashPassword(passwordRelleno, saltRelleno);
+            const insertado = await env.DB.prepare(
+              `INSERT INTO readers (nombre, email, password_hash, salt, microsoft_id, email_verificado)
+               VALUES (?, ?, ?, ?, ?, 1) RETURNING id`
+            ).bind(nombre, email, hashRelleno, saltRelleno, microsoftId).first();
+            lector = { id: insertado.id, nombre, email, microsoft_id: microsoftId, email_verificado: 1 };
+          }
+        }
+
+        const token = await crearSesionLector(env, request, lector);
+        return json({
+          token,
+          reader: { id: lector.id, nombre: lector.nombre, email: lector.email, email_verificado: true, avatar_url: lector.avatar_url || null },
+        });
+      }
+
+      // ---------- Login/registro de lector con cuenta de Discord ----------
+      // Ver el comentario largo en worker/src/index.js (Worker
+      // principal) para la explicación completa del flujo OAuth 2.0 de
+      // Discord (redirect + code + canje server-side, a diferencia de
+      // Google/Microsoft). Réplica exacta aquí para que funcione
+      // también durante un failover.
+      if (path === "/api/readers/discord/iniciar" && method === "GET") {
+        if (!env.DISCORD_CLIENT_ID) return json({ error: "El acceso con Discord no está configurado" }, 500);
+
+        const state = randomSalt();
+        const volver = url.searchParams.get("volver") || "";
+        const redirectUri = `${SITIO_URL}/api/readers/discord/callback`;
+
+        const paramsDiscord = new URLSearchParams({
+          client_id: env.DISCORD_CLIENT_ID,
+          redirect_uri: redirectUri,
+          response_type: "code",
+          scope: "identify email",
+          state,
+        });
+
+        const headers = new Headers({ Location: `https://discord.com/api/oauth2/authorize?${paramsDiscord}` });
+        headers.append(
+          "Set-Cookie",
+          `eof_discord_state=${state}|${encodeURIComponent(volver)}; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax`
+        );
+        return new Response(null, { status: 302, headers });
+      }
+
+      if (path === "/api/readers/discord/callback" && method === "GET") {
+        const irConError = (mensaje) => Response.redirect(
+          `${SITIO_URL}/acceso.html?errorDiscord=${encodeURIComponent(mensaje)}`, 302
+        );
+
+        if (!env.DISCORD_CLIENT_ID || !env.DISCORD_CLIENT_SECRET) return irConError("El acceso con Discord no está configurado");
+
+        const code = url.searchParams.get("code");
+        const stateRecibido = url.searchParams.get("state");
+        if (!code || !stateRecibido) return irConError("Discord no ha devuelto los datos esperados");
+
+        const cookieCabecera = request.headers.get("Cookie") || "";
+        const cookieState = cookieCabecera.match(/eof_discord_state=([^;]+)/)?.[1];
+        if (!cookieState) return irConError("La sesión de inicio con Discord ha caducado, inténtalo de nuevo");
+        const [stateGuardado, volverGuardado] = decodeURIComponent(cookieState).split("|");
+        if (stateGuardado !== stateRecibido) return irConError("No se ha podido verificar el inicio de sesión con Discord");
+
+        const redirectUri = `${SITIO_URL}/api/readers/discord/callback`;
+
+        let tokenData;
+        try {
+          const resToken = await fetch("https://discord.com/api/oauth2/token", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+              client_id: env.DISCORD_CLIENT_ID,
+              client_secret: env.DISCORD_CLIENT_SECRET,
+              grant_type: "authorization_code",
+              code,
+              redirect_uri: redirectUri,
+            }),
+          });
+          if (!resToken.ok) throw new Error("token");
+          tokenData = await resToken.json();
+        } catch {
+          return irConError("No se ha podido verificar la cuenta de Discord");
+        }
+
+        let perfilDiscord;
+        try {
+          const resPerfil = await fetch("https://discord.com/api/users/@me", {
+            headers: { Authorization: `Bearer ${tokenData.access_token}` },
+          });
+          if (!resPerfil.ok) throw new Error("perfil");
+          perfilDiscord = await resPerfil.json();
+        } catch {
+          return irConError("No se ha podido obtener tu perfil de Discord");
+        }
+
+        if (!perfilDiscord.email) return irConError("Tu cuenta de Discord no tiene un correo verificado asociado");
+        if (perfilDiscord.verified === false) return irConError("Verifica primero tu correo en Discord antes de continuar");
+
+        const discordId = perfilDiscord.id;
+        const email = perfilDiscord.email.toLowerCase();
+        const nombre = perfilDiscord.global_name || perfilDiscord.username || email.split("@")[0];
+        const avatarUrl = perfilDiscord.avatar
+          ? `https://cdn.discordapp.com/avatars/${discordId}/${perfilDiscord.avatar}.png`
+          : null;
+
+        let lector = await env.DB.prepare("SELECT * FROM readers WHERE discord_id = ? AND activo = 1").bind(discordId).first();
+
+        if (!lector) {
+          const porEmail = await env.DB.prepare("SELECT * FROM readers WHERE email = ? AND activo = 1").bind(email).first();
+          if (porEmail) {
+            await env.DB.prepare(
+              "UPDATE readers SET discord_id = ?, email_verificado = 1, avatar_url = COALESCE(avatar_url, ?) WHERE id = ?"
+            ).bind(discordId, avatarUrl, porEmail.id).run();
+            lector = { ...porEmail, discord_id: discordId, email_verificado: 1 };
+          } else {
+            const saltRelleno = randomSalt();
+            const arrRelleno = new Uint8Array(32);
+            crypto.getRandomValues(arrRelleno);
+            const passwordRelleno = [...arrRelleno].map((b) => b.toString(16).padStart(2, "0")).join("");
+            const hashRelleno = await hashPassword(passwordRelleno, saltRelleno);
+            const insertado = await env.DB.prepare(
+              `INSERT INTO readers (nombre, email, password_hash, salt, discord_id, avatar_url, email_verificado)
+               VALUES (?, ?, ?, ?, ?, ?, 1) RETURNING id`
+            ).bind(nombre, email, hashRelleno, saltRelleno, discordId, avatarUrl).first();
+            lector = { id: insertado.id, nombre, email, discord_id: discordId, avatar_url: avatarUrl, email_verificado: 1 };
+          }
+        }
+
+        const token = await crearSesionLector(env, request, lector);
+
+        const destino = volverGuardado || "index.html";
+        const headers = new Headers({
+          Location: `${SITIO_URL}/${destino}${destino.includes("?") ? "&" : "?"}sesionDiscord=${token}`,
+        });
+        headers.append("Set-Cookie", "eof_discord_state=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax");
+        return new Response(null, { status: 302, headers });
+      }
+
       // ---------- Cerrar sesión de lector ----------
       if (path === "/api/readers/logout" && method === "POST") {
         const payload = await requireReaderAuth(request, env);
@@ -4620,7 +4853,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/readers/me" && method === "GET") {
         const payload = await requireReaderAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        const lector = await env.DB.prepare("SELECT id, nombre, email, email_verificado FROM readers WHERE id = ? AND activo = 1").bind(payload.rid).first();
+        const lector = await env.DB.prepare("SELECT id, nombre, email, email_verificado, avatar_url FROM readers WHERE id = ? AND activo = 1").bind(payload.rid).first();
         if (!lector) return json({ error: "No autorizado" }, 401);
         return json({ reader: { ...lector, email_verificado: !!lector.email_verificado } });
       }

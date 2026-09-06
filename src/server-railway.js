@@ -66,6 +66,10 @@ const env = {
   CLOUDINARY_API_KEY: process.env.CLOUDINARY_API_KEY,
   CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET,
   CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME,
+  // Client ID de OAuth de Google (login "Continuar con Google" de
+  // lectores, ver /api/readers/google en src/index.js). Mismo valor que
+  // GOOGLE_CLIENT_ID en worker/wrangler.toml.
+  GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
   // Protege POST /api/internal/cron-respaldo (ver src/index.js): debe
   // coincidir con el valor puesto en el cron externo de Railway que
   // llama a este endpoint (cabecera X-Internal-Cron-Secret).

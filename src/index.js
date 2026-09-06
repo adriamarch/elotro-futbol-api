@@ -1452,6 +1452,60 @@ async function crearSesionLector(env, request, reader) {
   );
 }
 
+// ---------- Verificación del id_token de Google (login de lectores) ----------
+// Ver el comentario largo en worker/src/index.js (Worker principal):
+// esta es la misma función, replicada aquí para que el failover a
+// Railway/Postgres soporte el mismo login con Google sin depender del
+// principal estando vivo.
+let cacheGoogleJWKS = null;
+async function getGoogleJWK(kid, forzarRefresco = false) {
+  if (!cacheGoogleJWKS || forzarRefresco) {
+    const res = await fetch("https://www.googleapis.com/oauth2/v3/certs");
+    if (!res.ok) throw new Error("No se han podido obtener las claves públicas de Google");
+    const data = await res.json();
+    cacheGoogleJWKS = data.keys || [];
+  }
+  return cacheGoogleJWKS.find((k) => k.kid === kid) || null;
+}
+
+async function verificarGoogleIdToken(idToken, googleClientId) {
+  const parts = idToken.split(".");
+  if (parts.length !== 3) return null;
+  const [h, p, s] = parts;
+
+  const header = JSON.parse(b64urlDecode(h));
+  const payload = JSON.parse(b64urlDecode(p));
+
+  if (payload.iss !== "https://accounts.google.com" && payload.iss !== "accounts.google.com") return null;
+  if (payload.aud !== googleClientId) return null;
+  if (!payload.exp || Math.floor(Date.now() / 1000) > payload.exp) return null;
+  if (!payload.email) return null;
+
+  let jwk = await getGoogleJWK(header.kid);
+  if (!jwk) jwk = await getGoogleJWK(header.kid, true);
+  if (!jwk) return null;
+
+  const clavePublica = await crypto.subtle.importKey(
+    "jwk",
+    jwk,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+
+  const firmaBytes = Uint8Array.from(b64urlDecode(s), (c) => c.charCodeAt(0));
+  const datosFirmados = new TextEncoder().encode(`${h}.${p}`);
+  const valido = await crypto.subtle.verify(
+    "RSASSA-PKCS1-v1_5",
+    clavePublica,
+    firmaBytes,
+    datosFirmados
+  );
+  if (!valido) return null;
+
+  return payload;
+}
+
 // ---------- Cloudinary ----------
 // Sustituye a R2/Drive: los archivos de "Subir contenido" se guardan en
 // Cloudinary. Solo hacen falta 3 credenciales fijas (cloud name, api key,
@@ -4467,6 +4521,63 @@ async function handlePrimary(request, env, ctx) {
         return json({
           token,
           reader: { id: lector.id, nombre: lector.nombre, email: lector.email, email_verificado: true },
+        });
+      }
+
+      // ---------- Login/registro de lector con cuenta de Google ----------
+      // Ver el comentario largo en worker/src/index.js (Worker
+      // principal) para la explicación completa del flujo. Réplica
+      // exacta aquí para que funcione también durante un failover.
+      if (path === "/api/readers/google" && method === "POST") {
+        if (!env.GOOGLE_CLIENT_ID) return json({ error: "El acceso con Google no está configurado" }, 500);
+        const { credential } = await request.json();
+        if (!credential) return json({ error: "Falta el token de Google" }, 400);
+
+        let datosGoogle;
+        try {
+          datosGoogle = await verificarGoogleIdToken(credential, env.GOOGLE_CLIENT_ID);
+        } catch {
+          datosGoogle = null;
+        }
+        if (!datosGoogle) return json({ error: "No se ha podido verificar la cuenta de Google" }, 401);
+        if (!datosGoogle.email_verified) return json({ error: "Tu cuenta de Google no tiene el correo verificado" }, 401);
+
+        const googleId = datosGoogle.sub;
+        const email = datosGoogle.email.toLowerCase();
+        const nombre = datosGoogle.name || email.split("@")[0];
+        const avatarUrl = datosGoogle.picture || null;
+
+        let lector = await env.DB.prepare("SELECT * FROM readers WHERE google_id = ? AND activo = 1").bind(googleId).first();
+
+        if (!lector) {
+          const porEmail = await env.DB.prepare("SELECT * FROM readers WHERE email = ? AND activo = 1").bind(email).first();
+          if (porEmail) {
+            await env.DB.prepare(
+              "UPDATE readers SET google_id = ?, email_verificado = 1, avatar_url = COALESCE(avatar_url, ?) WHERE id = ?"
+            ).bind(googleId, avatarUrl, porEmail.id).run();
+            lector = { ...porEmail, google_id: googleId, email_verificado: 1 };
+          } else {
+            // Mismo motivo que en worker/src/index.js: se evita depender
+            // de que password_hash/salt permitan NULL (para no obligar a
+            // tocar el esquema también en Postgres si no hace falta) con
+            // un hash de contraseña aleatoria que nadie puede reproducir.
+            const saltRelleno = randomSalt();
+            const arrRelleno = new Uint8Array(32);
+            crypto.getRandomValues(arrRelleno);
+            const passwordRelleno = [...arrRelleno].map((b) => b.toString(16).padStart(2, "0")).join("");
+            const hashRelleno = await hashPassword(passwordRelleno, saltRelleno);
+            const insertado = await env.DB.prepare(
+              `INSERT INTO readers (nombre, email, password_hash, salt, google_id, avatar_url, email_verificado)
+               VALUES (?, ?, ?, ?, ?, ?, 1) RETURNING id`
+            ).bind(nombre, email, hashRelleno, saltRelleno, googleId, avatarUrl).first();
+            lector = { id: insertado.id, nombre, email, google_id: googleId, avatar_url: avatarUrl, email_verificado: 1 };
+          }
+        }
+
+        const token = await crearSesionLector(env, request, lector);
+        return json({
+          token,
+          reader: { id: lector.id, nombre: lector.nombre, email: lector.email, email_verificado: true, avatar_url: lector.avatar_url || null },
         });
       }
 

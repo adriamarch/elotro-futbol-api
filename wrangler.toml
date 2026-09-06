@@ -48,7 +48,7 @@ CLOUDINARY_CLOUD_NAME = "vovompqx"
 # Client ID de OAuth de Google (login "Continuar con Google" de
 # lectores). Mismo valor que GOOGLE_CLIENT_ID en worker/wrangler.toml —
 # ver el comentario allí para cómo obtenerlo.
-GOOGLE_CLIENT_ID = "TU_GOOGLE_CLIENT_ID.apps.googleusercontent.com"
+GOOGLE_CLIENT_ID = "129689993263-2dtd5uu2r2bgo9vooohkjc4ia4gu7mkb.apps.googleusercontent.com"
 # Remitente que verás en los avisos por email (opcional; requiere que el
 # dominio esté verificado en Resend). Si no lo pones, se usa uno genérico.
 # RESEND_FROM = "El Otro Fútbol <notificaciones@tudominio.com>"

@@ -24,6 +24,5 @@ jobs:
       - name: Ejecutar cron de respaldo
         run: npm run cron:respaldo
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          # añade aquí cualquier otra variable real (no las de Railway) que use este script
+          CRON_RESPALDO_URL: ${{ secrets.CRON_RESPALDO_URL }}
+          INTERNAL_CRON_SECRET: ${{ secrets.INTERNAL_CRON_SECRET }}

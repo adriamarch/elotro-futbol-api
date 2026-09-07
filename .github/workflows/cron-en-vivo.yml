@@ -1,0 +1,30 @@
+name: cron-en-vivo
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}  # permite ejecutarlo manualmente desde GitHub para probar
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4  # menor que la frecuencia (5 min) para evitar solapes
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+          cache: 'npm'
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Ejecutar cron de respaldo
+        run: npm run cron:respaldo
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # añade aquí cualquier otra variable real (no las de Railway) que use este script

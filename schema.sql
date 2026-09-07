@@ -55,6 +55,8 @@ CREATE TABLE articles (
   contenido TEXT NOT NULL,
   tipo TEXT NOT NULL DEFAULT 'noticia', -- noticia, cronica, opinion, entrevista
   categoria TEXT NOT NULL DEFAULT 'hypermotion', -- hypermotion, primera_federacion, segunda_federacion, general
+  -- Categoría(s) adicional(es) de la noticia (ver worker/schema.sql).
+  categorias_adicionales TEXT,
   club TEXT,
   imagen_url TEXT,
   -- Fotos adicionales de la noticia/crónica, guardadas como un array JSON

@@ -1438,6 +1438,16 @@ async function verifyJWT(token, secret) {
   if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) return null;
   return payload;
 }
+// Ver el porqué completo en requireAuth: cubre el hueco entre que se crea
+// una sesión en D1 y que llega replicada a esta tabla "sessions" (este
+// Worker es el secundario/Railway; D1 sigue siendo la autoridad -- ver
+// sync/tables.mjs), sin el cual el failover automático PRIMARY->SECONDARY
+// podía devolver 403 en peticiones perfectamente legítimas justo tras un
+// login. 5 minutos = varias pasadas del scheduler de sync (~60s por
+// defecto) de margen, sin dejar la ventana abierta indefinidamente para
+// una sesión revocada de verdad.
+const TOLERANCIA_SESION_NO_REPLICADA_SEGUNDOS = 5 * 60;
+
 async function requireAuth(request, env, url) {
   const auth = request.headers.get("Authorization") || "";
   let token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
@@ -1458,18 +1468,24 @@ async function requireAuth(request, env, url) {
     const sesion = await env.DB.prepare(
       "SELECT id, last_seen_at FROM sessions WHERE id = ? AND user_id = ? AND revoked_at IS NULL"
     ).bind(payload.sid, payload.uid).first();
-    if (!sesion) return null;
-    // No bloqueamos la respuesta por esto: es solo para que la lista de
-    // "Mis sesiones" muestre cuándo se ha usado cada una por última vez.
-    // Throttle a 5 minutos: sin esto, cada request autenticado (que puede
-    // ser decenas por minuto en uso normal del panel) dispara un UPDATE,
-    // multiplicando innecesariamente las escrituras en D1 solo para un
-    // dato que no necesita esa precisión.
-    const yaReciente = sesion.last_seen_at &&
-      (Date.now() - new Date(sesion.last_seen_at.replace(" ", "T") + "Z").getTime()) < 5 * 60 * 1000;
-    if (!yaReciente) {
-      env.DB.prepare("UPDATE sessions SET last_seen_at = datetime('now') WHERE id = ?")
-        .bind(payload.sid).run().catch(() => {});
+    if (!sesion) {
+      // Ver requireAuth en worker/src/index.js (D1) para la explicación
+      // completa de esta tolerancia.
+      const emitidoHaceSegundos = payload.iat ? Math.floor(Date.now() / 1000) - payload.iat : Infinity;
+      if (emitidoHaceSegundos > TOLERANCIA_SESION_NO_REPLICADA_SEGUNDOS) return null;
+    } else {
+      // No bloqueamos la respuesta por esto: es solo para que la lista de
+      // "Mis sesiones" muestre cuándo se ha usado cada una por última vez.
+      // Throttle a 5 minutos: sin esto, cada request autenticado (que puede
+      // ser decenas por minuto en uso normal del panel) dispara un UPDATE,
+      // multiplicando innecesariamente las escrituras en D1 solo para un
+      // dato que no necesita esa precisión.
+      const yaReciente = sesion.last_seen_at &&
+        (Date.now() - new Date(sesion.last_seen_at.replace(" ", "T") + "Z").getTime()) < 5 * 60 * 1000;
+      if (!yaReciente) {
+        env.DB.prepare("UPDATE sessions SET last_seen_at = datetime('now') WHERE id = ?")
+          .bind(payload.sid).run().catch(() => {});
+      }
     }
   }
   return payload;
@@ -3387,6 +3403,222 @@ async function calcularPartidosMasSeguidosAnaliticas(env, desde, limit) {
      LIMIT ?`
   ).bind(limit).all();
   return { partidos: results || [] };
+}
+
+// ---------- Franja horaria con más tráfico ----------
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa. substr() es SQL estándar (Postgres lo soporta como alias de
+// substring), así que no necesita traducción en sql-compat.js.
+async function calcularHorasAnaliticas(env, desde) {
+  const { results } = await env.DB.prepare(
+    `SELECT CAST(substr(created_at, 12, 2) AS INTEGER) AS hora, COUNT(*) AS vistas
+     FROM article_views WHERE created_at >= ${desde}
+     GROUP BY hora ORDER BY hora ASC`
+  ).all();
+  const porHora = new Map((results || []).map((f) => [Number(f.hora), Number(f.vistas) || 0]));
+  const horas = [];
+  for (let h = 0; h < 24; h++) horas.push({ hora: h, vistas: porHora.get(h) || 0 });
+  return { horas };
+}
+
+// ---------- Rendimiento por tipo de artículo ----------
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
+async function calcularTiposAnaliticas(env, desde) {
+  const { results: vistasPorArticulo } = await env.DB.prepare(
+    `SELECT article_id, COUNT(*) AS vistas, COUNT(DISTINCT visitante_hash) AS visitantes
+     FROM article_views WHERE created_at >= ${desde}
+     GROUP BY article_id`
+  ).all();
+  if (!vistasPorArticulo || vistasPorArticulo.length === 0) return { tipos: [] };
+
+  const idsConVistas = vistasPorArticulo.map((v) => v.article_id);
+  const placeholders = idsConVistas.map(() => "?").join(",");
+  const { results: articulos } = await env.DB.prepare(
+    `SELECT id, tipo FROM articles WHERE id IN (${placeholders})`
+  ).bind(...idsConVistas).all();
+  if (!articulos || articulos.length === 0) return { tipos: [] };
+
+  const { results: lecturasPorArticulo } = await env.DB.prepare(
+    `SELECT article_id, AVG(segundos) AS tiempo_medio_segundos
+     FROM article_reading WHERE created_at >= ${desde} AND article_id IN (${placeholders})
+     GROUP BY article_id`
+  ).bind(...idsConVistas).all();
+
+  const vistasPorId = new Map(vistasPorArticulo.map((v) => [v.article_id, Number(v.vistas) || 0]));
+  const visitantesPorId = new Map(vistasPorArticulo.map((v) => [v.article_id, Number(v.visitantes) || 0]));
+  const lecturaPorId = new Map((lecturasPorArticulo || []).map((r) => [r.article_id, r.tiempo_medio_segundos]));
+
+  const porTipo = new Map();
+  for (const art of articulos) {
+    const tipo = art.tipo || "noticia";
+    const acumulado = porTipo.get(tipo) || { tipo, noticias: 0, vistas: 0, visitantes: 0, sumaTiempo: 0, conTiempo: 0 };
+    acumulado.noticias += 1;
+    acumulado.vistas += vistasPorId.get(art.id) || 0;
+    acumulado.visitantes += visitantesPorId.get(art.id) || 0;
+    const tiempo = lecturaPorId.get(art.id);
+    if (tiempo != null) { acumulado.sumaTiempo += tiempo; acumulado.conTiempo += 1; }
+    porTipo.set(tipo, acumulado);
+  }
+
+  const tipos = [...porTipo.values()]
+    .map((t) => ({
+      tipo: t.tipo,
+      noticias: t.noticias,
+      vistas: t.vistas,
+      visitantes: t.visitantes,
+      tiempo_medio_segundos: Math.round(t.conTiempo ? t.sumaTiempo / t.conTiempo : 0),
+    }))
+    .sort((a, b) => b.vistas - a.vistas);
+
+  return { tipos };
+}
+
+// ---------- Engagement por scroll ----------
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
+async function calcularEngagementScrollAnaliticas(env, desde) {
+  const fila = await env.DB.prepare(
+    `SELECT
+       COUNT(*) AS total,
+       SUM(CASE WHEN scroll_maximo >= 75 THEN 1 ELSE 0 END) AS t_75_100,
+       SUM(CASE WHEN scroll_maximo >= 50 AND scroll_maximo < 75 THEN 1 ELSE 0 END) AS t_50_75,
+       SUM(CASE WHEN scroll_maximo >= 25 AND scroll_maximo < 50 THEN 1 ELSE 0 END) AS t_25_50,
+       SUM(CASE WHEN scroll_maximo < 25 OR scroll_maximo IS NULL THEN 1 ELSE 0 END) AS t_0_25
+     FROM article_reading WHERE created_at >= ${desde}`
+  ).first();
+  return {
+    total: Number(fila?.total) || 0,
+    tramos: {
+      "75_100": Number(fila?.t_75_100) || 0,
+      "50_75": Number(fila?.t_50_75) || 0,
+      "25_50": Number(fila?.t_25_50) || 0,
+      "0_25": Number(fila?.t_0_25) || 0,
+    },
+  };
+}
+
+// ---------- Vistas últimas 24 horas ----------
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa. datetime('now', '-1 days') lo traduce sql-compat.js a
+// (CURRENT_TIMESTAMP + INTERVAL '-1 days').
+async function calcularUltimas24hAnaliticas(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT substr(created_at, 1, 13) AS hora_cubo, COUNT(*) AS vistas
+     FROM article_views
+     WHERE created_at >= datetime('now', '-1 days')
+     GROUP BY hora_cubo ORDER BY hora_cubo ASC`
+  ).all();
+  const porCubo = new Map((results || []).map((f) => [f.hora_cubo, Number(f.vistas) || 0]));
+
+  const horas = [];
+  const ahora = new Date();
+  for (let i = 23; i >= 0; i--) {
+    const fecha = new Date(ahora.getTime() - i * 3600 * 1000);
+    const cubo = fecha.toISOString().slice(0, 13); // "YYYY-MM-DDTHH"
+    const cuboEspacio = cubo.replace("T", " ");
+    horas.push({ hora: `${cubo}:00`, vistas: porCubo.get(cuboEspacio) || porCubo.get(cubo) || 0 });
+  }
+  return { horas };
+}
+
+// ---------- Buscador de noticia por titular ----------
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
+async function calcularBuscarNoticiaAnaliticas(env, desde, q) {
+  const { results } = await env.DB.prepare(
+    `SELECT a.id, a.slug, a.titulo, a.tipo, a.categoria, a.autor_nombre,
+            COUNT(v.id) AS vistas,
+            COUNT(DISTINCT v.visitante_hash) AS visitantes,
+            AVG(r.segundos) AS tiempo_medio_segundos,
+            AVG(r.scroll_maximo) AS scroll_medio
+     FROM articles a
+     LEFT JOIN article_views v ON v.article_id = a.id AND v.created_at >= ${desde}
+     LEFT JOIN article_reading r ON r.article_id = a.id AND r.created_at >= ${desde}
+     WHERE a.titulo LIKE ?
+     GROUP BY a.id
+     ORDER BY vistas DESC
+     LIMIT 20`
+  ).bind(`%${q}%`).all();
+  return {
+    noticias: (results || []).map((n) => ({
+      ...n,
+      vistas: Number(n.vistas) || 0,
+      visitantes: Number(n.visitantes) || 0,
+      tiempo_medio_segundos: Math.round(n.tiempo_medio_segundos || 0),
+      scroll_medio: Math.round(n.scroll_medio || 0),
+    })),
+  };
+}
+
+// ---------- Rendimiento por categoría ----------
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
+async function calcularCategoriasAnaliticas(env, desde) {
+  const { results: vistasPorArticulo } = await env.DB.prepare(
+    `SELECT article_id, COUNT(*) AS vistas, COUNT(DISTINCT visitante_hash) AS visitantes
+     FROM article_views WHERE created_at >= ${desde}
+     GROUP BY article_id`
+  ).all();
+  if (!vistasPorArticulo || vistasPorArticulo.length === 0) return { categorias: [] };
+
+  const idsConVistas = vistasPorArticulo.map((v) => v.article_id);
+  const placeholders = idsConVistas.map(() => "?").join(",");
+  const { results: articulos } = await env.DB.prepare(
+    `SELECT id, categoria FROM articles WHERE id IN (${placeholders})`
+  ).bind(...idsConVistas).all();
+  if (!articulos || articulos.length === 0) return { categorias: [] };
+
+  const vistasPorId = new Map(vistasPorArticulo.map((v) => [v.article_id, Number(v.vistas) || 0]));
+  const visitantesPorId = new Map(vistasPorArticulo.map((v) => [v.article_id, Number(v.visitantes) || 0]));
+
+  const porCategoria = new Map();
+  for (const art of articulos) {
+    const categoria = art.categoria || "general";
+    const acumulado = porCategoria.get(categoria) || { categoria, noticias: 0, vistas: 0, visitantes: 0 };
+    acumulado.noticias += 1;
+    acumulado.vistas += vistasPorId.get(art.id) || 0;
+    acumulado.visitantes += visitantesPorId.get(art.id) || 0;
+    porCategoria.set(categoria, acumulado);
+  }
+
+  const categorias = [...porCategoria.values()].sort((a, b) => b.vistas - a.vistas);
+  return { categorias };
+}
+
+// ---------- Lectores nuevos vs. recurrentes ----------
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
+async function calcularRecurrenciaAnaliticas(env, desde) {
+  const { results } = await env.DB.prepare(
+    `SELECT visitante_hash, COUNT(DISTINCT date(created_at)) AS dias_distintos
+     FROM article_views WHERE created_at >= ${desde}
+     GROUP BY visitante_hash`
+  ).all();
+  let nuevos = 0;
+  let recurrentes = 0;
+  for (const fila of results || []) {
+    if (Number(fila.dias_distintos) > 1) recurrentes += 1;
+    else nuevos += 1;
+  }
+  return { nuevos, recurrentes };
+}
+
+// ---------- Borrado de datos de tracking ----------
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
+async function borrarDatosAnaliticas(env, { todo, dias }) {
+  if (todo) {
+    const fila = await env.DB.prepare(`SELECT COUNT(*) AS n FROM article_views`).first();
+    await env.DB.prepare(`DELETE FROM article_views`).run();
+    return { filas_borradas: Number(fila?.n) || 0 };
+  }
+  const desde = `datetime('now', '-${dias} days')`;
+  const fila = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM article_views WHERE created_at >= ${desde}`
+  ).first();
+  await env.DB.prepare(`DELETE FROM article_views WHERE created_at >= ${desde}`).run();
+  return { filas_borradas: Number(fila?.n) || 0 };
 }
 
 export default {
@@ -8596,7 +8828,78 @@ async function handlePrimary(request, env, ctx) {
           return json(datos);
         }
 
+        // ---------- Franja horaria con más tráfico ----------
+        if (path === "/api/admin/analiticas/horas") {
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularHorasAnaliticas(env, desde)
+          );
+          return json(datos);
+        }
+
+        // ---------- Rendimiento por tipo de artículo ----------
+        if (path === "/api/admin/analiticas/tipos") {
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularTiposAnaliticas(env, desde)
+          );
+          return json(datos);
+        }
+
+        // ---------- Engagement por scroll ----------
+        if (path === "/api/admin/analiticas/engagement-scroll") {
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularEngagementScrollAnaliticas(env, desde)
+          );
+          return json(datos);
+        }
+
+        // ---------- Vistas últimas 24 horas ----------
+        if (path === "/api/admin/analiticas/ultimas-24h") {
+          const { datos } = await conCacheKV(env, `analiticas-cache:${path}`, 60, () =>
+            calcularUltimas24hAnaliticas(env)
+          );
+          return json(datos);
+        }
+
+        // ---------- Buscador de noticia por titular ----------
+        if (path === "/api/admin/analiticas/buscar-noticia") {
+          const q = (url.searchParams.get("q") || "").trim();
+          if (!q) return json({ noticias: [] });
+          const datos = await calcularBuscarNoticiaAnaliticas(env, desde, q);
+          return json(datos);
+        }
+
+        // ---------- Rendimiento por categoría ----------
+        if (path === "/api/admin/analiticas/categorias") {
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularCategoriasAnaliticas(env, desde)
+          );
+          return json(datos);
+        }
+
+        // ---------- Lectores nuevos vs. recurrentes ----------
+        if (path === "/api/admin/analiticas/recurrencia") {
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularRecurrenciaAnaliticas(env, desde)
+          );
+          return json(datos);
+        }
+
         return json({ error: "Ruta de analíticas no encontrada" }, 404);
+      }
+
+      // ---------- Borrado de datos de tracking (destructivo) ----------
+      // Ver la versión gemela en worker/src/index.js (D1) para la
+      // explicación completa.
+      if (path === "/api/admin/analiticas/datos" && method === "DELETE") {
+        const payload = await requireAuth(request, env, url);
+        if (!payload || payload.rol !== "admin") return json({ error: "Solo un administrador puede borrar las analíticas" }, 403);
+
+        const todo = url.searchParams.get("todo") === "1";
+        let dias = parseInt(url.searchParams.get("dias") || "28", 10);
+        if (!Number.isFinite(dias) || dias <= 0) dias = 28;
+
+        const datos = await borrarDatosAnaliticas(env, { todo, dias });
+        return json(datos);
       }
 
 

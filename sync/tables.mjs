@@ -163,6 +163,23 @@ export const TABLES = [
     syncMode: "authoritative",
   },
   {
+    // Predicciones de lectores (porras) por partido. Tiene updated_at
+    // real (se toca al resolver puntos_obtenidos/resultado_acierto
+    // cuando el partido finaliza, ver resolverPorrasPendientes() en
+    // worker/src/index.js) -> changeStrategy "updated_at". Puede perder
+    // filas por ON DELETE CASCADE desde DOS padres distintos (readers o
+    // results), no solo uno, así que deleteDetection (comparación de
+    // IDs) en vez de cascadeDeleteFrom (pensado para un único padre,
+    // ver article_slug_redirects más abajo). Requiere la tabla creada
+    // en Postgres por la migración 021 (db/migrations/021_porras_y_categorias_fijas.sql).
+    name: "porras",
+    pk: ["id"],
+    order: 10.5,
+    changeStrategy: "updated_at",
+    cursorColumn: "updated_at",
+    deleteDetection: true,
+  },
+  {
     name: "club_info",
     pk: ["club"],
     order: 11,

@@ -44,7 +44,24 @@ import {
   eliminarFila,
   obtenerIdsPostgresPaginado,
   reconciliarFilasPorOriginWriteId,
+  desacoplarUsuarioHuerfano,
+  desacoplarResultadoHuerfano,
 } from "./pg-writer.mjs";
+
+// Antes de borrar una fila huérfana (existe en Postgres pero ya no en D1)
+// hay que desacoplar las FKs que otras tablas de Postgres tienen apuntando
+// a ella, igual que hace reconciliarTablaAutoritativa (pg-writer.mjs) y que
+// worker/src/index.js hace en D1 antes de borrar. Sin esto, el DELETE falla
+// por violación de clave foránea (fk_.._autor, fk_sessions_user, etc.) y la
+// tabla entera queda marcada "con error" -bloqueando en cascada a sus tablas
+// hijas vía DEPENDENCIAS_FK- de forma indefinida, pasada tras pasada.
+async function desacoplarHuerfanoSiAplica(client, table, pkValues) {
+  if (table === "users") {
+    await desacoplarUsuarioHuerfano(client, pkValues[0]);
+  } else if (table === "results") {
+    await desacoplarResultadoHuerfano(client, pkValues[0]);
+  }
+}
 import { conReintentos } from "./retry.mjs";
 import {
   nuevoRunId,
@@ -290,17 +307,29 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
         for (const row of paginaPG) {
           const key = String(row[pk[0]]);
           if (!idsVistosEnD1.has(key)) {
+            const pkValues = [row[pk[0]]];
             try {
-              await conReintentos(() => eliminarFila(client, name, pk, [row[pk[0]]]));
+              await conReintentos(
+                async () => {
+                  await desacoplarHuerfanoSiAplica(client, name, pkValues);
+                  return eliminarFila(client, name, pk, pkValues);
+                },
+                {
+                  onRetry: ({ intento, error }) =>
+                    console.warn(`[${name}] reintento borrado huérfano ${key} (${intento}): ${error.message}`),
+                }
+              );
               detalle.deleted++;
             } catch (error) {
               detalle.errors.push(`Borrado ${key}: ${error.message}`);
+              console.error(`[${name}] no se pudo borrar el huérfano ${key}:`, error.message);
             }
           }
         }
       });
     } catch (error) {
       detalle.errors.push(`Detección de borrados (autoritativa): ${error.message}`);
+      console.error(`[${name}] ERROR en detección de borrados (autoritativa):`, error.message);
     }
 
     if (ultimoCursorValor && ultimoCursorValor !== cursor?.last_synced_at) {
@@ -465,8 +494,18 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
         for (const row of paginaPG) {
           const key = pkKey(row, pk);
           if (!idsD1.has(key)) {
+            const pkValues = pkValuesFromRow(row, pk);
             try {
-              await conReintentos(() => eliminarFila(client, name, pk, pkValuesFromRow(row, pk)));
+              await conReintentos(
+                async () => {
+                  await desacoplarHuerfanoSiAplica(client, name, pkValues);
+                  return eliminarFila(client, name, pk, pkValues);
+                },
+                {
+                  onRetry: ({ intento, error }) =>
+                    console.warn(`[${name}] reintento borrado huérfano ${key} (${intento}): ${error.message}`),
+                }
+              );
               detalle.deleted++;
               await client.query(
                 `INSERT INTO sync_deletions (table_name, record_id, run_id) VALUES ($1, $2, $3);`,
@@ -474,12 +513,14 @@ async function sincronizarTabla(client, tableConfig, { runId }) {
               );
             } catch (error) {
               detalle.errors.push(`Borrado ${key}: ${error.message}`);
+              console.error(`[${name}] no se pudo borrar el huérfano ${key}:`, error.message);
             }
           }
         }
       });
     } catch (error) {
       detalle.errors.push(`Detección de borrados: ${error.message}`);
+      console.error(`[${name}] ERROR en detección de borrados:`, error.message);
     }
   }
 

@@ -333,11 +333,11 @@ export async function reconciliarFilasPorOriginWriteId(client, table, filas, pri
  * alineaciones/comments en cascada por DEPENDENCIAS_FK (tables.mjs) en
  * todas las pasadas siguientes, indefinidamente.
  */
-async function desacoplarResultadoHuerfano(client, resultId) {
+export async function desacoplarResultadoHuerfano(client, resultId) {
   await client.query('UPDATE articles SET resultado_id = NULL WHERE resultado_id = $1', [resultId]);
 }
 
-async function desacoplarUsuarioHuerfano(client, userId) {
+export async function desacoplarUsuarioHuerfano(client, userId) {
   // SET NULL: mismas columnas que D1, más las exclusivas de Postgres.
   await client.query('UPDATE articles SET autor_id = NULL WHERE autor_id = $1', [userId]);
   await client.query('UPDATE articles SET coautor_id = NULL WHERE coautor_id = $1', [userId]);

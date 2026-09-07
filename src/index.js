@@ -1,5 +1,5 @@
 // ElOtroFútbol - Worker API
-// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/comments/:id/vote, /api/comments/:id/report, /api/admin/comments, /api/admin/comments/reported, /api/club-info, /api/admin/club-info, /api/track/view, /api/track/reading, /api/admin/analiticas/*, /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml
+// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/comments/:id/vote, /api/comments/:id/report, /api/admin/comments, /api/admin/comments/reported, /api/club-info, /api/admin/club-info, /api/track/view, /api/track/reading, /api/track/result-view, /api/admin/analiticas/* (resumen, mas-leidas, fuentes, autores, tiempo-lectura, idiomas, partidos-seguidos, gsc), /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml
 
 // Escapa los caracteres especiales de XML para que un título o slug con
 // "&", "<", ">", comillas, etc. no rompa el XML del sitemap.
@@ -1294,6 +1294,132 @@ async function signHS256(data, secret) {
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
   return b64url(String.fromCharCode(...new Uint8Array(sig)));
 }
+
+// ---------- Firma RS256 + Search Console ----------
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa de todo este bloque (JWT Bearer de cuenta de servicio de
+// Google, RFC 7523). Duplicado aquí para que el panel de analíticas
+// también funcione si el failover pone a este worker (Railway) a
+// atender las lecturas (ver apiFetch()/circuit breaker en
+// public/js/config.js).
+async function signRS256(data, clavePrivadaPem) {
+  const pem = clavePrivadaPem
+    .replace(/-----BEGIN PRIVATE KEY-----/, "")
+    .replace(/-----END PRIVATE KEY-----/, "")
+    .replace(/\s+/g, "");
+  const der = Uint8Array.from(atob(pem), (c) => c.charCodeAt(0));
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    der,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(data));
+  return b64url(String.fromCharCode(...new Uint8Array(sig)));
+}
+
+async function obtenerTokenGoogleServiceAccount(env) {
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const claim = {
+    iss: env.GSC_SERVICE_ACCOUNT_EMAIL,
+    scope: "https://www.googleapis.com/auth/webmasters.readonly",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+  };
+  const clavePrivada = env.GSC_SERVICE_ACCOUNT_KEY.replace(/\\n/g, "\n");
+  const sinFirmar = `${b64urlJSON(header)}.${b64urlJSON(claim)}`;
+  const jwt = `${sinFirmar}.${await signRS256(sinFirmar, clavePrivada)}`;
+
+  const resp = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: jwt,
+    }),
+  });
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok || !data || !data.access_token) {
+    throw new Error((data && (data.error_description || data.error)) || `Google devolvió ${resp.status} al pedir el token`);
+  }
+  return data.access_token;
+}
+
+async function calcularGscAnaliticas(env, dias) {
+  if (!env.GSC_SERVICE_ACCOUNT_EMAIL || !env.GSC_SERVICE_ACCOUNT_KEY || !env.GSC_SITE_URL) {
+    return { conectado: false };
+  }
+
+  try {
+    const accessToken = await obtenerTokenGoogleServiceAccount(env);
+
+    const hoy = new Date();
+    const fin = new Date(hoy);
+    fin.setDate(fin.getDate() - 2);
+    const inicio = new Date(fin);
+    inicio.setDate(inicio.getDate() - dias);
+    const aFecha = (d) => d.toISOString().slice(0, 10);
+
+    const pedirGsc = async (dimensions, rowLimit) => {
+      const resp = await fetch(
+        `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(env.GSC_SITE_URL)}/searchAnalytics/query`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+          body: JSON.stringify({
+            startDate: aFecha(inicio),
+            endDate: aFecha(fin),
+            dimensions,
+            rowLimit,
+          }),
+        }
+      );
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        throw new Error((data && data.error && data.error.message) || `Google devolvió ${resp.status}`);
+      }
+      return data.rows || [];
+    };
+
+    const [filasDiarias, filasConsultas] = await Promise.all([
+      pedirGsc(["date"], 1000),
+      pedirGsc(["query"], 15),
+    ]);
+
+    const totalClics = filasDiarias.reduce((s, f) => s + (f.clicks || 0), 0);
+    const totalImpresiones = filasDiarias.reduce((s, f) => s + (f.impressions || 0), 0);
+    const posicionPonderada = filasDiarias.reduce((s, f) => s + (f.position || 0) * (f.impressions || 0), 0);
+
+    return {
+      conectado: true,
+      totales: {
+        clics: totalClics,
+        impresiones: totalImpresiones,
+        ctr: totalImpresiones ? Math.round((totalClics / totalImpresiones) * 1000) / 10 : 0,
+        posicion: totalImpresiones ? Math.round((posicionPonderada / totalImpresiones) * 10) / 10 : 0,
+      },
+      serie: filasDiarias.map((f) => ({
+        fecha: f.keys[0],
+        clics: f.clicks || 0,
+        impresiones: f.impressions || 0,
+      })),
+      consultas: filasConsultas.map((f) => ({
+        consulta: f.keys[0],
+        clics: f.clicks || 0,
+        impresiones: f.impressions || 0,
+        ctr: Math.round((f.ctr || 0) * 1000) / 10,
+        posicion: Math.round((f.position || 0) * 10) / 10,
+      })),
+    };
+  } catch (err) {
+    console.error("[analiticas/gsc] fallo consultando Search Console:", err);
+    return { conectado: true, error: err.message || "Error desconocido consultando Search Console" };
+  }
+}
+
 async function createJWT(payload, secret, expiresInSec = 60 * 60 * 12) {
   const header = { alg: "HS256", typ: "JWT" };
   const now = Math.floor(Date.now() / 1000);
@@ -1654,6 +1780,25 @@ function clasificarDispositivo(userAgent) {
   if (/iPad|Tablet/i.test(ua)) return "tablet";
   if (/Mobi|iPhone|Android/i.test(ua)) return "movil";
   return "escritorio";
+}
+
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa: bots/crawlers/herramientas SEO que sí ejecutan JavaScript y
+// disparaban analiticas-tracking.js igual que un lector real, inflando
+// "páginas vistas".
+const PATRONES_USER_AGENT_BOT = [
+  "bot", "spider", "crawl", "slurp", "headless", "phantomjs", "puppeteer",
+  "playwright", "selenium", "lighthouse", "pagespeed", "gptbot", "ccbot",
+  "bytespider", "ahrefsbot", "semrushbot", "mj12bot", "dotbot", "petalbot",
+  "facebookexternalhit", "discordbot", "telegrambot", "whatsapp", "slackbot",
+  "vkshare", "pinterest", "embedly", "quora link preview", "linkedinbot",
+  "screaming frog", "seokicks", "uptimerobot", "monitor", "curl", "wget",
+  "python-requests", "axios", "postmanruntime", "insomnia",
+];
+function esUserAgentBot(userAgent) {
+  const ua = (userAgent || "").toLowerCase();
+  if (!ua) return true;
+  return PATRONES_USER_AGENT_BOT.some((p) => ua.includes(p));
 }
 
 // Sube un archivo a Cloudinary sin ninguna transformación (se conserva la
@@ -3202,6 +3347,46 @@ async function calcularTiempoLecturaAnaliticas(env, desde) {
       scroll_medio: Math.round(c.scroll_medio || 0),
     })),
   };
+}
+
+// ---------- Idiomas más usados al leer una noticia ----------
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
+const NOMBRES_IDIOMA = { es: "Castellano", eu: "Euskera", ca: "Català", gl: "Galego", en: "English" };
+async function calcularIdiomasAnaliticas(env, desde) {
+  const { results } = await env.DB.prepare(
+    `SELECT idioma, COUNT(*) AS vistas
+     FROM article_views WHERE created_at >= ${desde}
+     GROUP BY idioma ORDER BY vistas DESC`
+  ).all();
+  const total = (results || []).reduce((suma, fila) => suma + (Number(fila.vistas) || 0), 0);
+  return {
+    idiomas: (results || []).map((fila) => ({
+      idioma: fila.idioma,
+      nombre: NOMBRES_IDIOMA[fila.idioma] || fila.idioma,
+      vistas: Number(fila.vistas) || 0,
+      porcentaje: total ? Math.round(((Number(fila.vistas) || 0) / total) * 1000) / 10 : 0,
+    })),
+  };
+}
+
+// ---------- Partidos más seguidos (minuto a minuto) ----------
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
+async function calcularPartidosMasSeguidosAnaliticas(env, desde, limit) {
+  const { results } = await env.DB.prepare(
+    `SELECT r.id, r.competicion, r.grupo, r.jornada, r.equipo_local, r.equipo_visitante,
+            r.goles_local, r.goles_visitante, r.estado, r.fecha_partido,
+            COUNT(v.id) AS vistas,
+            COUNT(DISTINCT v.visitante_hash) AS visitantes
+     FROM result_views v
+     JOIN results r ON r.id = v.result_id
+     WHERE v.created_at >= ${desde}
+     GROUP BY r.id
+     ORDER BY vistas DESC
+     LIMIT ?`
+  ).bind(limit).all();
+  return { partidos: results || [] };
 }
 
 export default {
@@ -6774,6 +6959,12 @@ async function handlePrimary(request, env, ctx) {
         const slugOId = typeof body.slug === "string" ? body.slug : "";
         if (!slugOId) return json({ error: "Falta el slug de la noticia" }, 400);
 
+        // Ver la explicación completa en worker/src/index.js (D1): bots
+        // que ejecutan JS inflaban "páginas vistas".
+        if (esUserAgentBot(request.headers.get("User-Agent"))) {
+          return new Response(null, { status: 204 });
+        }
+
         const articulo = await env.DB.prepare(
           "SELECT id FROM articles WHERE (slug = ?1 OR id = ?2) AND publicado = 1"
         ).bind(slugOId, isNaN(slugOId) ? -1 : parseInt(slugOId)).first();
@@ -6782,17 +6973,42 @@ async function handlePrimary(request, env, ctx) {
         const visitanteHash = await hashVisitante(request, env);
         const { fuente, dominio } = clasificarFuenteTrafico(request.headers.get("Referer"), SITIO_URL);
         const dispositivo = clasificarDispositivo(request.headers.get("User-Agent"));
+        const IDIOMAS_VALIDOS = ["es", "eu", "ca", "gl", "en"];
+        const idioma = IDIOMAS_VALIDOS.includes(body.idioma) ? body.idioma : "es";
 
         const inserted = await env.DB.prepare(
-          `INSERT INTO article_views (article_id, visitante_hash, fuente, referer_dominio, dispositivo)
-           VALUES (?, ?, ?, ?, ?) RETURNING id`
-        ).bind(articulo.id, visitanteHash, fuente, dominio, dispositivo).first();
+          `INSERT INTO article_views (article_id, visitante_hash, fuente, referer_dominio, dispositivo, idioma)
+           VALUES (?, ?, ?, ?, ?, ?) RETURNING id`
+        ).bind(articulo.id, visitanteHash, fuente, dominio, dispositivo, idioma).first();
 
         // El id de la vista se devuelve para que el beacon de tiempo de
         // lectura (más abajo) lo referencie al salir de la página; así
         // cada fila de article_reading queda ligada a la vista exacta
         // que la originó, no solo al artículo.
         return json({ ok: true, view_id: inserted.id });
+      }
+
+      // ---------- Tracking: vista de un partido (minuto-a-minuto) ----------
+      // Ver la versión gemela en worker/src/index.js (D1) para la
+      // explicación completa.
+      if (path === "/api/track/result-view" && method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const resultId = parseInt(body.result_id, 10);
+        if (!resultId) return json({ error: "Falta el id del partido" }, 400);
+
+        if (esUserAgentBot(request.headers.get("User-Agent"))) {
+          return new Response(null, { status: 204 });
+        }
+
+        const partido = await env.DB.prepare("SELECT id FROM results WHERE id = ?").bind(resultId).first();
+        if (!partido) return json({ error: "Partido no encontrado" }, 404);
+
+        const visitanteHash = await hashVisitante(request, env);
+        await env.DB.prepare(
+          `INSERT INTO result_views (result_id, visitante_hash) VALUES (?, ?)`
+        ).bind(resultId, visitanteHash).run();
+
+        return json({ ok: true });
       }
 
       // ---------- Tracking: cerrar una vista con el tiempo de lectura ----------
@@ -8351,6 +8567,31 @@ async function handlePrimary(request, env, ctx) {
         if (path === "/api/admin/analiticas/tiempo-lectura") {
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
             calcularTiempoLecturaAnaliticas(env, desde)
+          );
+          return json(datos);
+        }
+
+        // ---------- Idiomas más usados al leer una noticia ----------
+        if (path === "/api/admin/analiticas/idiomas") {
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularIdiomasAnaliticas(env, desde)
+          );
+          return json(datos);
+        }
+
+        // ---------- Partidos más seguidos ----------
+        if (path === "/api/admin/analiticas/partidos-seguidos") {
+          const limit = Math.min(parseInt(url.searchParams.get("limit") || "10", 10), 50);
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularPartidosMasSeguidosAnaliticas(env, desde, limit)
+          );
+          return json(datos);
+        }
+
+        // ---------- Search Console (Google) ----------
+        if (path === "/api/admin/analiticas/gsc") {
+          const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
+            calcularGscAnaliticas(env, dias)
           );
           return json(datos);
         }

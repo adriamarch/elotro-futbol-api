@@ -993,6 +993,7 @@ function categoriaLabelEmail(cat) {
     general: "General",
     amistoso: "Amistoso",
     arbitraje: "Arbitraje",
+    jurisdiccion: "Jurisdicción deportiva",
   };
   return CATEGORIAS[cat] || cat || "";
 }

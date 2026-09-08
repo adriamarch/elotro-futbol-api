@@ -4271,7 +4271,8 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
     // sostenida en el primario, se salta el intento y se va directo a
     // Railway, en vez de sumar un intento fallido al primario en CADA
     // petición mientras dura el problema.
-    if (await circuitoEstaAbierto(env, method, path)) {
+    const circuitoInfo = await circuitoEstaAbierto(env, method, path);
+    if (circuitoInfo.abierto) {
       return await fetchRailway(
         request,
         path,
@@ -4306,7 +4307,7 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         // hace con ctx.waitUntil porque no es algo que deba retrasar la
         // respuesta al usuario -es limpieza de estado, no parte de la
         // respuesta en sí-.
-        ctx.waitUntil(circuitoRegistrarExitoPrimario(env, method, path));
+        ctx.waitUntil(circuitoRegistrarExitoPrimario(env, method, path, circuitoInfo.habiaRegistro));
 
         const headers = new Headers(
           primaryResponse.headers
@@ -4577,6 +4578,25 @@ const CIRCUITO_FALLOS_PARA_ABRIR = 5;
 const CIRCUITO_ABIERTO_MS = 20_000;
 const CIRCUITO_KV_PREFIX = "circuito:";
 
+// Caché en memoria del isolate (no en KV) del último resultado "circuito
+// cerrado, sin registro" para cada ruta+método, con vida muy corta. Un
+// mismo isolate de Cloudflare Workers atiende muchas peticiones seguidas
+// mientras está caliente, y la inmensa mayoría son a las mismas rutas de
+// siempre (home, artículo, resultados...) con el circuito cerrado casi
+// siempre. Sin este caché, cada una de esas peticiones hace su propio
+// get() a KV aunque la respuesta vaya a ser la misma que hace 200ms.
+// Con un TTL de un par de segundos no se pierde capacidad de reacción
+// real (abrir el circuito sigue tardando como mucho eso de más en
+// notarse) pero se evita repetir la misma lectura de KV muchísimas veces
+// por segundo en tráfico alto. Solo se cachea el caso "cerrado y sin
+// registro" (el 99% de las veces): en cuanto haya CUALQUIER registro en
+// KV para una ruta (fallos acumulados, o circuito abierto) se deja de
+// usar este caché para esa ruta y se consulta KV en cada petición, para
+// no arriesgarse a servir un "cerrado" cacheado mientras el circuito
+// real ya está abierto.
+const CIRCUITO_CACHE_ISOLATE_TTL_MS = 2000;
+const circuitoCacheIsolate = new Map();
+
 function normalizarRutaParaCircuito(path) {
   // Los IDs numéricos varían por petición pero deben compartir contador
   // (/api/articles/123, /api/articles/456 -> /api/articles/:id). Sin
@@ -4589,25 +4609,53 @@ function claveCircuito(method, path) {
   return `${CIRCUITO_KV_PREFIX}${method}:${normalizarRutaParaCircuito(path)}`;
 }
 
+// Devuelve { abierto, habiaRegistro }: "abierto" es lo que ya se usaba
+// para decidir si saltar al failover; "habiaRegistro" indica si existía
+// CUALQUIER entrada en KV para esta ruta+método (esté abierta o solo con
+// fallos acumulados sin llegar a abrir). Se usa para evitar un DELETE de
+// KV innecesario en cada petición exitosa (ver circuitoRegistrarExitoPrimario
+// más abajo): en el caso normal (ruta sana, sin fallos previos) no hay
+// nada que limpiar, así que no hace falta la escritura. Antes se
+// llamaba a delete() en TODAS las peticiones con éxito -es decir,
+// prácticamente todo el tráfico del sitio, al pasar este worker por
+// delante de cada petición- aunque el 99% de las veces no había ninguna
+// clave que borrar; cada delete() cuenta como una operación de
+// escritura en KV igual que un put(), así que esto por sí solo disparaba
+// el consumo de KV muy por encima de lo necesario.
 async function circuitoEstaAbierto(env, method, path) {
-  if (!env.ELOTROFUTBOL_KV) return false;
+  if (!env.ELOTROFUTBOL_KV) return { abierto: false, habiaRegistro: false };
+  const clave = claveCircuito(method, path);
+  const cacheado = circuitoCacheIsolate.get(clave);
+  if (cacheado && Date.now() < cacheado.expiraEn) {
+    return { abierto: false, habiaRegistro: false };
+  }
   try {
-    const valor = await env.ELOTROFUTBOL_KV.get(claveCircuito(method, path));
-    if (!valor) return false;
+    const valor = await env.ELOTROFUTBOL_KV.get(clave);
+    if (!valor) {
+      circuitoCacheIsolate.set(clave, { expiraEn: Date.now() + CIRCUITO_CACHE_ISOLATE_TTL_MS });
+      return { abierto: false, habiaRegistro: false };
+    }
     const datos = JSON.parse(valor);
-    return typeof datos.abiertoHasta === "number" && Date.now() < datos.abiertoHasta;
+    const abierto = typeof datos.abiertoHasta === "number" && Date.now() < datos.abiertoHasta;
+    return { abierto, habiaRegistro: true };
   } catch (error) {
     // No dejar que un fallo leyendo KV bloquee la petición: se comporta
     // como si el circuito estuviera cerrado (intenta primario, como
     // siempre se ha hecho).
     console.warn("[circuito] no se pudo leer estado, se asume cerrado:", error.message);
-    return false;
+    return { abierto: false, habiaRegistro: false };
   }
 }
 
 async function circuitoRegistrarFalloPrimario(env, method, path) {
   if (!env.ELOTROFUTBOL_KV) return;
   const clave = claveCircuito(method, path);
+  // Invalida el caché en memoria del isolate: a partir de ahora esta
+  // ruta sí tiene un registro real en KV (fallos acumulados o circuito
+  // abierto), así que las próximas peticiones deben volver a consultar
+  // KV en cada una, no servir el "cerrado" cacheado (ver
+  // circuitoEstaAbierto y el comentario junto a CIRCUITO_CACHE_ISOLATE_TTL_MS).
+  circuitoCacheIsolate.delete(clave);
   try {
     const actual = await env.ELOTROFUTBOL_KV.get(clave);
     const datos = actual ? JSON.parse(actual) : { fallos: 0, abiertoHasta: 0 };
@@ -4642,8 +4690,13 @@ async function circuitoRegistrarFalloPrimario(env, method, path) {
   }
 }
 
-async function circuitoRegistrarExitoPrimario(env, method, path) {
-  if (!env.ELOTROFUTBOL_KV) return;
+// Solo borra la clave si de verdad existía (habiaRegistro=true), para no
+// gastar una escritura de KV en el caso normal (ruta sana, nunca ha
+// fallado, no hay nada que limpiar) -- ver el comentario en
+// circuitoEstaAbierto. Antes se llamaba siempre, sin comprobar antes si
+// hacía falta.
+async function circuitoRegistrarExitoPrimario(env, method, path, habiaRegistro) {
+  if (!env.ELOTROFUTBOL_KV || !habiaRegistro) return;
   const clave = claveCircuito(method, path);
   try {
     // Un éxito limpia el contador de fallos por completo (no hace falta

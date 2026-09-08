@@ -1187,6 +1187,74 @@ function validarEquipos(valorRecibido) {
   return { equipos: limpios };
 }
 
+// ---------- Club(es) de un artículo (previas/crónicas con 2 clubes) ----
+// Igual patrón que parsearEquipos()/validarEquipos() (equipo de un
+// usuario): la columna "club" de articles sigue siendo TEXT, pero puede
+// contener o bien un único nombre de club en texto plano (caso normal:
+// noticia/análisis/opinión/entrevista, o previa/crónica antes de este
+// cambio), o un array JSON de exactamente 2 clubes en texto (p. ej.
+// '["Real Madrid","FC Barcelona"]'), usado cuando una previa o crónica
+// se vincula a un resultado y por tanto habla de ambos equipos del
+// partido. parsearClubArticulo() distingue ambos casos para quien
+// necesite leer con qué club(es) se relaciona un artículo.
+function parsearClubArticulo(valor) {
+  if (!valor) return [];
+  try {
+    const parsed = JSON.parse(valor);
+    if (Array.isArray(parsed)) return parsed.filter((c) => typeof c === "string" && c.trim()).map((c) => c.trim());
+  } catch {
+    // No es JSON: es el caso normal de club único en texto plano.
+  }
+  if (typeof valor === "string" && valor.trim()) return [valor.trim()];
+  return [];
+}
+// Versión legible de "club" para mostrar en emails/notificaciones: un
+// club único se muestra tal cual, y los 2 clubes de una previa/crónica
+// vinculada se muestran unidos por " - " (p. ej. "Real Madrid - FC
+// Barcelona"), en vez del texto crudo del array JSON.
+function clubArticuloLegible(valorClub) {
+  const clubes = parsearClubArticulo(valorClub);
+  return clubes.join(" - ");
+}
+// Construye el valor a guardar en la columna "club" a partir de los dos
+// equipos de un resultado vinculado (previa/crónica). Siempre devuelve
+// el array JSON de 2 clubes, incluso si por algún motivo vinieran
+// iguales o vacíos (se filtran los vacíos antes de guardar).
+function clubArticuloDesdeResultado(equipoLocal, equipoVisitante) {
+  const clubes = [equipoLocal, equipoVisitante]
+    .filter((c) => typeof c === "string" && c.trim())
+    .map((c) => c.trim());
+  return clubes.length ? JSON.stringify(clubes) : null;
+}
+// Resuelve el valor final a guardar en "club" para un artículo, según su
+// tipo. Para "previa" y "cronica" el club ya no lo elige el redactor a
+// mano en el panel (ver Fase 2): se deriva siempre de los dos equipos
+// del resultado vinculado, así que hace falta un resultado_id válido y
+// con ambos equipos. Para el resto de tipos (noticia, análisis, opinión,
+// entrevista) el comportamiento no cambia: se guarda tal cual el club
+// que venga en el body (un único nombre, o vacío/null para "General").
+// Devuelve { error } si es previa/crónica sin resultado vinculado, o
+// { club } con el valor final (string simple, o el array JSON de 2
+// clubes) listo para el INSERT/UPDATE.
+async function resolverClubArticulo(env, tipo, resultadoId, clubBody) {
+  if (tipo !== "previa" && tipo !== "cronica") {
+    return { club: clubBody || null };
+  }
+  if (!resultadoId) {
+    return { error: "Una previa o crónica debe tener un resultado vinculado para poder guardarse (el club se toma automáticamente de los dos equipos del partido)." };
+  }
+  const resultado = await env.DB.prepare("SELECT equipo_local, equipo_visitante FROM results WHERE id = ?")
+    .bind(resultadoId).first();
+  if (!resultado) {
+    return { error: "El resultado vinculado ya no existe. Elige de nuevo el partido." };
+  }
+  const club = clubArticuloDesdeResultado(resultado.equipo_local, resultado.equipo_visitante);
+  if (!club) {
+    return { error: "El resultado vinculado no tiene los dos equipos definidos." };
+  }
+  return { club };
+}
+
 // ---------- "Última hora": PIN de 4 dígitos único y compartido ----------
 // Permite a cualquier redactor publicar directamente (sin pasar por
 // borrador) una noticia/crónica/opinión/entrevista puntual y urgente.
@@ -6838,7 +6906,18 @@ async function handlePrimary(request, env, ctx) {
         }
         if (slugExacto) { query += " AND slug = ?"; binds.push(slugExacto); }
         if (categoria) { query += " AND categoria = ?"; binds.push(categoria); }
-        if (club) { query += " AND club = ?"; binds.push(club); }
+        // "club" puede ser un único nombre en texto plano (caso normal) o
+        // un array JSON de 2 clubes en texto (previa/crónica vinculada a
+        // un resultado, ver resolverClubArticulo): se busca coincidencia
+        // exacta del valor completo (club único que es justo ese) o el
+        // nombre apareciendo como elemento del array JSON. Se usan
+        // comillas dobles alrededor del nombre buscado para que el LIKE
+        // sobre el array (p. ej. '["Real Madrid","FC Barcelona"]') no dé
+        // falsos positivos con un club cuyo nombre sea substring de otro.
+        if (club) {
+          query += " AND (club = ? OR club LIKE ?)";
+          binds.push(club, `%"${club}"%`);
+        }
         if (tipo) { query += " AND tipo = ?"; binds.push(tipo); }
         if (autorId) { query += " AND autor_id = ?"; binds.push(parseInt(autorId, 10)); }
         if (destacado === "1") { query += " AND destacado = 1"; }
@@ -6953,6 +7032,13 @@ async function handlePrimary(request, env, ctx) {
         }
         const resultadoId = body.resultado_id ? parseInt(body.resultado_id, 10) : null;
 
+        // Club(es) del artículo: para previa/crónica se derivan siempre
+        // del resultado vinculado (ambos equipos del partido), no del
+        // selector de club del panel (ver resolverClubArticulo). Para el
+        // resto de tipos no cambia nada.
+        const { error: errorClub, club: clubFinal } = await resolverClubArticulo(env, body.tipo, resultadoId, body.club);
+        if (errorClub) return json({ error: errorClub }, 400);
+
         // Autor de la noticia: por defecto quien la está subiendo, pero se
         // puede elegir a otra persona (p. ej. cuando quien sube la noticia
         // no es quien la ha redactado). Se busca siempre en la tabla de
@@ -7010,7 +7096,7 @@ async function handlePrimary(request, env, ctx) {
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${calcularBannerUrgenteHasta(activarBanner)})`
         ).bind(
           slug, body.titulo, body.subtitulo || null, body.contenido,
-          body.tipo || "noticia", body.categoria || "hypermotion", body.club || null,
+          body.tipo || "noticia", body.categoria || "hypermotion", clubFinal,
           imagenPortada, imagenes.length ? JSON.stringify(imagenes) : null, resultadoId,
           autorId, autorNombre, coautorId, coautorNombre,
           body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, slugCongelado,
@@ -7466,7 +7552,15 @@ async function handlePrimary(request, env, ctx) {
         // lo que ya tenía la noticia, para que una edición que no los
         // toca (p. ej. solo corregir el título) no los borre.
         const categoriaFinal = body.categoria !== undefined ? body.categoria : (articuloParaPermiso.categoria || "hypermotion");
-        const clubFinal = body.club !== undefined ? body.club : articuloParaPermiso.club;
+        // Club: para previa/crónica se deriva siempre del resultado
+        // vinculado (ver resolverClubArticulo), usando el tipo y el
+        // resultado_id finales de esta edición.
+        const resultadoIdFinal = body.resultado_id !== undefined ? resultadoId : articuloParaPermiso.resultado_id;
+        const { error: errorClub, club: clubFinal } = await resolverClubArticulo(
+          env, tipoFinal, resultadoIdFinal,
+          body.club !== undefined ? body.club : articuloParaPermiso.club
+        );
+        if (errorClub) return json({ error: errorClub }, 400);
         let fichaTecnica = articuloParaPermiso.ficha_tecnica || null;
         if (Object.prototype.hasOwnProperty.call(body, "ficha_tecnica")) {
           fichaTecnica = (tipoFinal === "cronica" && body.ficha_tecnica && Object.keys(body.ficha_tecnica).length)

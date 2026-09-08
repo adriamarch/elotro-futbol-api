@@ -1832,6 +1832,20 @@ async function hashVisitante(request, env) {
   return sha1Hex(`${ip}|${ua}|${dia}|${env.JWT_SECRET || ""}`);
 }
 
+// Hash no reversible de IP + User-Agent, SIN el día (a diferencia de
+// hashVisitante de arriba). Sirve únicamente para "lectores nuevos vs.
+// recurrentes" (ver calcularRecurrenciaAnaliticas): como no cambia de
+// un día a otro, agrupar por esta columna y contar días distintos con
+// vistas SÍ permite detectar si la misma persona ha vuelto en más de
+// un día dentro del rango. No se usa para nada más (visitas únicas por
+// artículo, fuentes, etc. siguen usando visitante_hash, que sí cambia
+// cada día a propósito para no inflar esas cifras con recargas).
+async function hashVisitanteEstable(request, env) {
+  const ip = request.headers.get("CF-Connecting-IP") || "0.0.0.0";
+  const ua = request.headers.get("User-Agent") || "";
+  return sha1Hex(`estable|${ip}|${ua}|${env.JWT_SECRET || ""}`);
+}
+
 // Clasifica el tráfico a partir de la cabecera Referer, igual que hace
 // GA4 con sus canales por defecto: directo (sin referer o referer del
 // propio dominio con origin distinto, ver más abajo), buscador, redes
@@ -3358,43 +3372,34 @@ async function calcularFuentesAnaliticas(env, desde) {
 }
 
 async function calcularAutoresAnaliticas(env, desde) {
-  // Reescrita para evitar el "fan-out" de un doble JOIN (articles x
-  // article_views x article_reading): antes, un artículo con muchas
-  // vistas Y muchas lecturas multiplicaba filas (vistas × lecturas) antes
-  // de agregar, disparando las "rows read" muy por encima del volumen
-  // real de eventos. Ahora cada tabla de eventos se agrega por separado
-  // (ya filtrada por fecha, aprovechando el índice compuesto
-  // idx_article_views_created_article / idx_article_reading_created_article)
-  // y solo al final se cruzan los tres resultados, ya reducidos, por
-  // autor.
+  // Ver la versión gemela en worker/src/index.js (D1) para la
+  // explicación completa: se quita el "WHERE id IN (?,?,?...)" con un
+  // parámetro por artículo (rompía el límite de 100 parámetros
+  // bindeados de D1 con tráfico real) en favor de un JOIN. Vistas y
+  // lecturas se siguen agregando por separado para evitar el fan-out de
+  // un doble JOIN (articles x article_views x article_reading).
   const { results: vistasPorArticulo } = await env.DB.prepare(
-    `SELECT article_id, COUNT(*) AS vistas
-     FROM article_views WHERE created_at >= ${desde}
-     GROUP BY article_id`
+    `SELECT a.id, a.autor_nombre, COUNT(v.id) AS vistas
+     FROM article_views v
+     JOIN articles a ON a.id = v.article_id
+     WHERE v.created_at >= ${desde} AND a.autor_nombre IS NOT NULL
+     GROUP BY a.id, a.autor_nombre`
   ).all();
   if (!vistasPorArticulo || vistasPorArticulo.length === 0) return { autores: [] };
 
-  const idsConVistas = vistasPorArticulo.map((v) => v.article_id);
-  const placeholders = idsConVistas.map(() => "?").join(",");
-  const { results: articulos } = await env.DB.prepare(
-    `SELECT id, autor_nombre FROM articles WHERE id IN (${placeholders}) AND autor_nombre IS NOT NULL`
-  ).bind(...idsConVistas).all();
-  if (!articulos || articulos.length === 0) return { autores: [] };
-
   const { results: lecturasPorArticulo } = await env.DB.prepare(
     `SELECT article_id, AVG(segundos) AS tiempo_medio_segundos
-     FROM article_reading WHERE created_at >= ${desde} AND article_id IN (${placeholders})
+     FROM article_reading WHERE created_at >= ${desde}
      GROUP BY article_id`
-  ).bind(...idsConVistas).all();
+  ).all();
 
-  const vistasPorId = new Map(vistasPorArticulo.map((v) => [v.article_id, v.vistas]));
   const lecturaPorId = new Map((lecturasPorArticulo || []).map((r) => [r.article_id, r.tiempo_medio_segundos]));
 
   const porAutor = new Map();
-  for (const art of articulos) {
+  for (const art of vistasPorArticulo) {
     const acumulado = porAutor.get(art.autor_nombre) || { autor: art.autor_nombre, noticias: 0, vistas: 0, sumaTiempo: 0, conTiempo: 0 };
     acumulado.noticias += 1;
-    acumulado.vistas += vistasPorId.get(art.id) || 0;
+    acumulado.vistas += Number(art.vistas) || 0;
     const tiempo = lecturaPorId.get(art.id);
     if (tiempo != null) { acumulado.sumaTiempo += tiempo; acumulado.conTiempo += 1; }
     porAutor.set(art.autor_nombre, acumulado);
@@ -3493,37 +3498,35 @@ async function calcularHorasAnaliticas(env, desde) {
 // Ver la versión gemela en worker/src/index.js (D1) para la explicación
 // completa.
 async function calcularTiposAnaliticas(env, desde) {
+  // Mismo fix que calcularCategoriasAnaliticas/calcularAutoresAnaliticas
+  // (ver la versión gemela en worker/src/index.js, D1, para la
+  // explicación completa): sin "WHERE id IN (?,?,?...)" dinámico.
   const { results: vistasPorArticulo } = await env.DB.prepare(
-    `SELECT article_id, COUNT(*) AS vistas, COUNT(DISTINCT visitante_hash) AS visitantes
-     FROM article_views WHERE created_at >= ${desde}
-     GROUP BY article_id`
+    `SELECT a.id, a.tipo,
+            COUNT(v.id) AS vistas,
+            COUNT(DISTINCT v.visitante_hash) AS visitantes
+     FROM article_views v
+     JOIN articles a ON a.id = v.article_id
+     WHERE v.created_at >= ${desde}
+     GROUP BY a.id, a.tipo`
   ).all();
   if (!vistasPorArticulo || vistasPorArticulo.length === 0) return { tipos: [] };
 
-  const idsConVistas = vistasPorArticulo.map((v) => v.article_id);
-  const placeholders = idsConVistas.map(() => "?").join(",");
-  const { results: articulos } = await env.DB.prepare(
-    `SELECT id, tipo FROM articles WHERE id IN (${placeholders})`
-  ).bind(...idsConVistas).all();
-  if (!articulos || articulos.length === 0) return { tipos: [] };
-
   const { results: lecturasPorArticulo } = await env.DB.prepare(
     `SELECT article_id, AVG(segundos) AS tiempo_medio_segundos
-     FROM article_reading WHERE created_at >= ${desde} AND article_id IN (${placeholders})
+     FROM article_reading WHERE created_at >= ${desde}
      GROUP BY article_id`
-  ).bind(...idsConVistas).all();
+  ).all();
 
-  const vistasPorId = new Map(vistasPorArticulo.map((v) => [v.article_id, Number(v.vistas) || 0]));
-  const visitantesPorId = new Map(vistasPorArticulo.map((v) => [v.article_id, Number(v.visitantes) || 0]));
   const lecturaPorId = new Map((lecturasPorArticulo || []).map((r) => [r.article_id, r.tiempo_medio_segundos]));
 
   const porTipo = new Map();
-  for (const art of articulos) {
+  for (const art of vistasPorArticulo) {
     const tipo = art.tipo || "noticia";
     const acumulado = porTipo.get(tipo) || { tipo, noticias: 0, vistas: 0, visitantes: 0, sumaTiempo: 0, conTiempo: 0 };
     acumulado.noticias += 1;
-    acumulado.vistas += vistasPorId.get(art.id) || 0;
-    acumulado.visitantes += visitantesPorId.get(art.id) || 0;
+    acumulado.vistas += Number(art.vistas) || 0;
+    acumulado.visitantes += Number(art.visitantes) || 0;
     const tiempo = lecturaPorId.get(art.id);
     if (tiempo != null) { acumulado.sumaTiempo += tiempo; acumulado.conTiempo += 1; }
     porTipo.set(tipo, acumulado);
@@ -3621,47 +3624,40 @@ async function calcularBuscarNoticiaAnaliticas(env, desde, q) {
 
 // ---------- Rendimiento por categoría ----------
 // Ver la versión gemela en worker/src/index.js (D1) para la explicación
-// completa.
+// completa: se quita el "WHERE id IN (?,?,?...)" con un parámetro por
+// artículo (rompía el límite de 100 parámetros bindeados de D1 con
+// tráfico real) en favor de un único JOIN.
 async function calcularCategoriasAnaliticas(env, desde) {
-  const { results: vistasPorArticulo } = await env.DB.prepare(
-    `SELECT article_id, COUNT(*) AS vistas, COUNT(DISTINCT visitante_hash) AS visitantes
-     FROM article_views WHERE created_at >= ${desde}
-     GROUP BY article_id`
+  const { results } = await env.DB.prepare(
+    `SELECT a.categoria,
+            COUNT(v.id) AS vistas,
+            COUNT(DISTINCT v.visitante_hash) AS visitantes,
+            COUNT(DISTINCT a.id) AS noticias
+     FROM article_views v
+     JOIN articles a ON a.id = v.article_id
+     WHERE v.created_at >= ${desde}
+     GROUP BY a.categoria
+     ORDER BY vistas DESC`
   ).all();
-  if (!vistasPorArticulo || vistasPorArticulo.length === 0) return { categorias: [] };
 
-  const idsConVistas = vistasPorArticulo.map((v) => v.article_id);
-  const placeholders = idsConVistas.map(() => "?").join(",");
-  const { results: articulos } = await env.DB.prepare(
-    `SELECT id, categoria FROM articles WHERE id IN (${placeholders})`
-  ).bind(...idsConVistas).all();
-  if (!articulos || articulos.length === 0) return { categorias: [] };
-
-  const vistasPorId = new Map(vistasPorArticulo.map((v) => [v.article_id, Number(v.vistas) || 0]));
-  const visitantesPorId = new Map(vistasPorArticulo.map((v) => [v.article_id, Number(v.visitantes) || 0]));
-
-  const porCategoria = new Map();
-  for (const art of articulos) {
-    const categoria = art.categoria || "general";
-    const acumulado = porCategoria.get(categoria) || { categoria, noticias: 0, vistas: 0, visitantes: 0 };
-    acumulado.noticias += 1;
-    acumulado.vistas += vistasPorId.get(art.id) || 0;
-    acumulado.visitantes += visitantesPorId.get(art.id) || 0;
-    porCategoria.set(categoria, acumulado);
-  }
-
-  const categorias = [...porCategoria.values()].sort((a, b) => b.vistas - a.vistas);
+  const categorias = (results || []).map((c) => ({
+    categoria: c.categoria || "general",
+    noticias: Number(c.noticias) || 0,
+    vistas: Number(c.vistas) || 0,
+    visitantes: Number(c.visitantes) || 0,
+  }));
   return { categorias };
 }
 
 // ---------- Lectores nuevos vs. recurrentes ----------
 // Ver la versión gemela en worker/src/index.js (D1) para la explicación
-// completa.
+// completa: visitante_hash no sirve para esto (incluye el día a
+// propósito), se usa visitante_estable en su lugar.
 async function calcularRecurrenciaAnaliticas(env, desde) {
   const { results } = await env.DB.prepare(
-    `SELECT visitante_hash, COUNT(DISTINCT date(created_at)) AS dias_distintos
-     FROM article_views WHERE created_at >= ${desde}
-     GROUP BY visitante_hash`
+    `SELECT visitante_estable, COUNT(DISTINCT date(created_at)) AS dias_distintos
+     FROM article_views WHERE created_at >= ${desde} AND visitante_estable IS NOT NULL
+     GROUP BY visitante_estable`
   ).all();
   let nuevos = 0;
   let recurrentes = 0;
@@ -7342,15 +7338,16 @@ async function handlePrimary(request, env, ctx) {
         if (!articulo) return json({ error: "Noticia no encontrada" }, 404);
 
         const visitanteHash = await hashVisitante(request, env);
+        const visitanteEstable = await hashVisitanteEstable(request, env);
         const { fuente, dominio } = clasificarFuenteTrafico(request.headers.get("Referer"), SITIO_URL);
         const dispositivo = clasificarDispositivo(request.headers.get("User-Agent"));
         const IDIOMAS_VALIDOS = ["es", "eu", "ca", "gl", "en"];
         const idioma = IDIOMAS_VALIDOS.includes(body.idioma) ? body.idioma : "es";
 
         const inserted = await env.DB.prepare(
-          `INSERT INTO article_views (article_id, visitante_hash, fuente, referer_dominio, dispositivo, idioma)
-           VALUES (?, ?, ?, ?, ?, ?) RETURNING id`
-        ).bind(articulo.id, visitanteHash, fuente, dominio, dispositivo, idioma).first();
+          `INSERT INTO article_views (article_id, visitante_hash, visitante_estable, fuente, referer_dominio, dispositivo, idioma)
+           VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id`
+        ).bind(articulo.id, visitanteHash, visitanteEstable, fuente, dominio, dispositivo, idioma).first();
 
         // El id de la vista se devuelve para que el beacon de tiempo de
         // lectura (más abajo) lo referencie al salir de la página; así

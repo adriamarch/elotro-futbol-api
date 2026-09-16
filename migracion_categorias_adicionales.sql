@@ -1,0 +1,21 @@
+-- Migración: categoría(s) adicional(es) por noticia.
+--
+-- Añade la columna "categorias_adicionales" a "articles": junto a la
+-- categoría principal de siempre ("categoria", que sigue siendo la que
+-- se usa para construir el link de la noticia, /futbol/[categoria]/slug,
+-- y la única que puede filtrarse en categoria.html), una noticia puede
+-- llevar hasta 4 categorías adicionales como simples etiquetas
+-- informativas, guardadas como un array JSON en texto (p. ej.
+-- '["amistoso","general"]'). NULL o '[]' si no tiene ninguna (el caso
+-- normal, y el único posible hasta ahora).
+--
+-- Igual que con "categorias_fijas" (ver
+-- migracion_categorias_fijas_redactor.sql), un redactor con categoría(s)
+-- fija(s) asignada(s) solo puede elegir categorías adicionales dentro de
+-- esas mismas categorías fijas (el backend lo valida siempre, ver
+-- POST/PUT /api/articles).
+--
+-- Ejecutar con wrangler:
+--   wrangler d1 execute elotrofutbol --remote --file=./worker/migracion_categorias_adicionales.sql
+
+ALTER TABLE articles ADD COLUMN categorias_adicionales TEXT;

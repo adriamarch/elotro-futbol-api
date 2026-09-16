@@ -1,0 +1,12 @@
+{
+  "scripts": {
+    "predeploy": "node check-deploy.js",
+    "deploy": "wrangler deploy --config wrangler.toml"
+  },
+  "devDependencies": {
+    "wrangler": "^4.123.0"
+  },
+  "dependencies": {
+    "pg": "^8.23.0"
+  }
+}

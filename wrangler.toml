@@ -1,0 +1,229 @@
+name = "elotrofutbol-api"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+# Necesario para que el driver "pg" (node-postgres) funcione dentro del
+# Worker al conectar con PostgreSQL a través de Hyperdrive.
+compatibility_flags = ["nodejs_compat"]
+
+# Con workers_dev = true, el workers.dev subdomain
+# (elotrofutbol-api.*.workers.dev) queda activo A LA VEZ que las rutas de
+# dominio propio de más abajo (api.elotrofutbol.media/*): no son
+# excluyentes, ambas URLs sirven el mismo Worker en paralelo. Sin esta
+# línea, Cloudflare infiere workers_dev = false automáticamente en cada
+# deploy en cuanto hay algún [[routes]] configurado (como los de más
+# abajo) -- así es como el workers.dev subdomain se estaba desactivando
+# solo cada vez que se ejecutaba "wrangler deploy", sin que nadie lo
+# tocara a mano. La API pública en producción debe seguir usando el
+# dominio propio (api.elotrofutbol.media, ver public/js/config.js), que
+# no depende de esta configuración; workers.dev queda como URL adicional
+# de repuesto/pruebas.
+workers_dev = true
+# Fijado explícitamente porque el dashboard ya lo tenía en "false"; sin
+# esta línea, wrangler asume "true" por defecto y lo detecta como una
+# diferencia más a la hora de hacer deploy.
+preview_urls = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "elotrofutbol"
+database_id = "76e6a888-9c42-42e7-a95a-46674dc502f6"
+
+# El worker respondía hasta ahora en
+# elotrofutbol-api.adriamarch2010.workers.dev (el workers.dev subdomain
+# de la cuenta), pero ese subdominio se ha demostrado inestable: se ha
+# desactivado solo más de una vez sin que nadie lo tocara, dejando la API
+# entera inalcanzable con un 404 de Cloudflare hasta reactivarlo a mano
+# en el dashboard. Cloudflare además recomienda no depender de él para
+# producción ("intended for personal or hobby projects that aren't
+# business-critical"). Por eso TODA la API se expone también bajo un
+# dominio propio, api.elotrofutbol.media, con esta ruta: un dominio
+# gestionado por nosotros no se desactiva solo por una configuración de
+# cuenta ajena a este proyecto. El frontend (public/js/config.js) ya
+# apunta a este dominio como API_URL.
+#
+# Requiere que elotrofutbol.media esté en esta misma cuenta de Cloudflare
+# (zona gestionada por Cloudflare DNS/proxy) y que exista un registro DNS
+# (proxied, tipo A o CNAME "fantasma") para el subdominio "api". Ver
+# README para el paso a paso completo.
+[[routes]]
+pattern = "api.elotrofutbol.media/*"
+zone_name = "elotrofutbol.media"
+
+# Ruta exacta al dominio raíz (sin /*), que ya existía configurada a mano
+# en el dashboard de Cloudflare además de la de arriba. Se deja aquí
+# también, en el código, para que "wrangler deploy" no la detecte como
+# diferencia y ofrezca sobrescribir (borrar) la configuración remota.
+[[routes]]
+pattern = "api.elotrofutbol.media"
+zone_name = "elotrofutbol.media"
+
+# El worker responde normalmente en elotrofutbol-api.adriamarch2010.workers.dev,
+# un dominio distinto al del sitio (elotrofutbol.media). Un sitemap listado
+# en robots.txt tiene que servirse desde el MISMO dominio que ese
+# robots.txt (elotrofutbol.media), o Google no lo acepta como propio del
+# sitio. Esta ruta expone SOLO esa única URL del worker en el dominio
+# público, sin mover el resto de la API ahí.
+#
+# Requiere que elotrofutbol.media esté en esta misma cuenta de Cloudflare
+# (zona gestionada por Cloudflare DNS/proxy). Si el dominio se gestiona en
+# otro sitio, ver la alternativa en FASE-sitemap-noticias.md.
+[[routes]]
+pattern = "elotrofutbol.media/sitemap-noticias.xml"
+zone_name = "elotrofutbol.media"
+
+# PostgreSQL (Railway), nueva base de datos principal, a través de
+# Cloudflare Hyperdrive. D1 (arriba) se mantiene intacta como respaldo
+# durante toda la migración: no se toca ni se elimina.
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "40361ea3b25f492fb83d3a7eed3d50b4"
+# KV para el cortacircuitos de cuota D1 y la caché de analíticas (ver
+# CORTACIRCUITOS_D1 más abajo). Créalo con:
+#   wrangler kv namespace create ELOTROFUTBOL_KV
+# y pega aquí el id que te devuelva.
+[[kv_namespaces]]
+binding = "ELOTROFUTBOL_KV"
+id = "53f976fdf8ef4a9e9af1737725e794cf"
+
+# Disparador programado: cada minuto revisa si hay noticias programadas
+# (ver "programado_para" en articles y "scheduled" en src/index.js) que ya
+# tengan que publicarse solas. Un minuto de margen es suficiente para que
+# una noticia "programada para las 20:00" salga puntual sin recargar el
+# Worker con ejecuciones más frecuentes.
+[triggers]
+crons = ["* * * * *"]
+
+# Cloudflare Workers permite subir archivos grandes, pero por defecto el
+# límite de tamaño de request en el plan gratuito es 100 MB. Si subís vídeos
+# más pesados que eso, necesitaréis el plan de pago de Workers (o subir en
+# trozos). Ver README para más detalle.
+
+# Cuenta de Cloudinary donde se guardan las fotos y vídeos que suben los
+# redactores desde "Subir contenido" (el cloud name no es un dato sensible,
+# por eso va como variable normal y no como secreto).
+[vars]
+CLOUDINARY_CLOUD_NAME = "vovompqx"
+# Client ID de OAuth de Google (login "Continuar con Google" de
+# lectores, ver /api/readers/google en src/index.js). No es un secreto:
+# el mismo valor va también en public/js/lector-auth.js, servido tal
+# cual al navegador. Sácalo en https://console.cloud.google.com
+# (APIs y servicios > Credenciales > Crear credenciales > ID de cliente
+# de OAuth, tipo "Aplicación web"), añadiendo elotrofutbol.media como
+# origen de JavaScript autorizado.
+GOOGLE_CLIENT_ID = "129689993263-2dtd5uu2r2bgo9vooohkjc4ia4gu7mkb.apps.googleusercontent.com"
+# Application (client) ID de la app registrada en Azure para "Iniciar
+# sesión con Microsoft" (lectores, ver /api/readers/microsoft en
+# src/index.js). Tampoco es un secreto: el mismo valor va también en
+# public/js/lector-auth.js. Sácalo en https://portal.azure.com
+# (Microsoft Entra ID > Registros de aplicaciones > Nuevo registro,
+# tipo de cuenta "Cuentas en cualquier directorio organizativo y
+# cuentas personales de Microsoft", con elotrofutbol.media como URI de
+# redirección de tipo "Web" o "SPA" según el flujo que uses en el
+# frontend). Registrar la app y usar Sign in with Microsoft es gratis.
+MICROSOFT_CLIENT_ID = "b277667e-e92d-49d2-821b-d7c36bf9a1cb"
+# Client ID y Client Secret de la app de Discord para "Iniciar sesión
+# con Discord" (lectores, ver /api/readers/discord/iniciar y
+# /api/readers/discord/callback en src/index.js). A diferencia de
+# GOOGLE_CLIENT_ID/MICROSOFT_CLIENT_ID, aquí SÍ hay un secreto real
+# (DISCORD_CLIENT_SECRET): jamás debe ir al frontend, solo se usa aquí
+# en el servidor para canjear el "code" por un token. Sácalos en
+# https://discord.com/developers/applications (New Application > OAuth2),
+# añadiendo https://elotrofutbol.media/api/readers/discord/callback
+# como Redirect URI. Crear la app y usar OAuth2 es gratis y sin
+# aprobación previa.
+DISCORD_CLIENT_ID = "1546272810253680751"
+DISCORD_CLIENT_SECRET = "GyOOC8vBwCuHxBaZhbNHNMIo9D13iBqn"
+# Client ID y Client Secret de la app de X (antigua Twitter) para
+# "Iniciar sesión con X" (lectores, ver /api/readers/x/iniciar y
+# /api/readers/x/callback en src/index.js). Igual que con Discord, aquí
+# SÍ hay un secreto real (X_CLIENT_SECRET): jamás debe ir al frontend.
+# Sácalos en https://developer.x.com/en/portal/dashboard (crear una app,
+# activar "User authentication settings" con OAuth 2.0, tipo "Web App"),
+# añadiendo https://elotrofutbol.media/api/readers/x/callback como
+# Callback URI / Redirect URL. El tier "Free" es suficiente para este
+# flujo de login.
+#
+# NO declarar X_CLIENT_ID / X_CLIENT_SECRET aquí como [vars]: van como
+# secrets reales (wrangler secret put X_CLIENT_ID / X_CLIENT_SECRET),
+# nunca en texto plano en este archivo versionado. Si hace falta
+# rellenarlos, usar esos comandos, no estas líneas.
+# URL pública del servicio de Railway (respaldo/secundario) usada por
+# fetchRailway() en src/index.js para hacer failover cuando el primario
+# (D1) falla. Antes el código usaba `RAILWAY_URL` sin definirla en
+# ningún sitio -> ReferenceError: RAILWAY_URL is not defined en cuanto
+# se intentaba el failover. Mismo valor que API_URL_SECUNDARIA_POR_DEFECTO
+# en public/js/config.js.
+RAILWAY_URL = "https://elotro-futbol-api-production.up.railway.app"
+# Modo mantenimiento temporal (ver "MODO MANTENIMIENTO TEMPORAL" en
+# src/index.js). Pon "true" para activar la pantalla de mantenimiento en
+# TODA la web y la API (menos /api/internal/*), o "false"/borra la línea
+# para desactivarla. Se puede cambiar también desde el dashboard de
+# Cloudflare (Settings > Variables) sin necesidad de "wrangler deploy".
+#
+# IMPORTANTE: se activó el 1-sep-2026 "hasta medianoche" por la cuota
+# diaria de lecturas de D1 agotada, y se quedó puesta a "true" sin que
+# nadie la desactivara -- así ha seguido bloqueando la API entera (con
+# 503 en todas las rutas) varios días después de que la cuota ya se
+# hubiera restablecido. Como esta respuesta de mantenimiento no llevaba
+# cabeceras CORS (ver fix en src/index.js), el navegador la reportaba
+# como "bloqueado por CORS" en vez de mostrar el 503 real, lo que hacía
+# muy difícil ver que la causa era este flag y no un fallo intermitente
+# de verdad. Combinado con el circuit breaker del frontend (que hace
+# failover a Railway cuando la primaria falla, pero vuelve a probarla
+# cada 30s), el resultado era errático: mientras el circuito estaba
+# abierto todo funcionaba vía Railway, pero cada intento de volver a la
+# primaria chocaba con este modo mantenimiento y volvía a fallar -- de
+# ahí que la clasificación (y otras páginas) "a veces fueran y a veces
+# no", según en qué momento exacto del ciclo de 30s se cargara la página.
+# Se desactiva aquí; volver a activarlo SOLO si la cuota de D1 se agota
+# de verdad, y no olvidarse de quitarlo en cuanto se resuelva.
+MAINTENANCE_MODE = "false"
+# Texto libre y opcional que se muestra en la página ("Volvemos sobre
+# las ..."). Déjalo vacío o bórralo para que no se muestre esa frase.
+MAINTENANCE_HASTA = "00:00 (medianoche, hora peninsular española)"
+# Remitente que verás en los avisos por email (opcional; requiere que el
+# dominio esté verificado en Resend). Si no lo pones, se usa uno genérico.
+# RESEND_FROM = "El Otro Fútbol <notificaciones@tudominio.com>"
+
+# Define los secretos con (ver README, sección "Cloudinary"):
+# wrangler secret put JWT_SECRET
+# wrangler secret put CLOUDINARY_API_KEY
+# wrangler secret put CLOUDINARY_API_SECRET
+# wrangler secret put INTERNAL_SYNC_SECRET
+#   (mismo valor que INTERNAL_SYNC_SECRET en las variables de entorno del
+#   servicio de Railway -- protege /api/internal/drain-pending-writes,
+#   que Railway llama para reproducir contra D1 las escrituras hechas en
+#   la secundaria durante un failover. Ver worker-secondary/db/migrations/
+#   003_pending_writes.sql y worker-secondary/sync/drain.mjs.)
+#
+# Aviso por email a elotrofutbolmedio@gmail.com cada vez que se sube una
+# foto/vídeo o se publica una crónica/noticia. Usa Resend (resend.com,
+# tiene plan gratuito). Crea una cuenta, saca tu API key y ejecuta:
+# wrangler secret put RESEND_API_KEY
+
+# ---------- Search Console (tarjeta "Search Console" del panel de
+# analíticas, public/panel-analiticas.html) ----------
+# Sin estos tres valores, la tarjeta se queda en "Sin conectar" (no es
+# un error: /api/admin/analiticas/gsc devuelve { conectado:false } y el
+# panel lo pinta como aviso neutro). Con ellos, el Worker pide los datos
+# reales a la API de Search Console con una cuenta de servicio.
+#
+# 1) En https://console.cloud.google.com, crea (o reutiliza) un
+#    proyecto, activa la "Google Search Console API" y crea una cuenta
+#    de servicio (IAM y administración -> Cuentas de servicio). Genera
+#    una clave JSON y descárgala: dentro tiene "client_email" y
+#    "private_key".
+# 2) En https://search.google.com/search-console, entra en la propiedad
+#    del sitio -> Configuración -> Usuarios y permisos -> Añadir usuario,
+#    y da acceso "Restringido" (con lectura basta) al "client_email" de
+#    esa cuenta de servicio.
+# 3) Define los dos secretos con el contenido del JSON descargado:
+#      wrangler secret put GSC_SERVICE_ACCOUNT_EMAIL
+#        (pega el valor de "client_email")
+#      wrangler secret put GSC_SERVICE_ACCOUNT_KEY
+#        (pega el valor de "private_key" TAL CUAL, con los \n literales
+#        que trae el JSON -- el Worker ya los convierte a saltos de
+#        línea reales antes de firmar)
+# 4) Añade la variable (no es secreta) con la propiedad EXACTA tal y
+#    como aparece en Search Console, por ejemplo:
+GSC_SITE_URL = "sc-domain:elotrofutbol.media"

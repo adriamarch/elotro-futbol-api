@@ -1,0 +1,44 @@
+-- Migración: redactores "sin equipo, con categoría(s) fija(s)".
+--
+-- Sustituye a migracion_categoria_fija_redactor.sql (esa versión guardaba
+-- una única categoría en texto plano; esta guarda un ARRAY JSON, igual
+-- patrón que la columna "equipo", porque un redactor de este tipo puede
+-- tener asignada más de una categoría fija a la vez -- p. ej. Arbitraje
+-- y, el día que exista, Jurisdicción -- y elegir entre ellas al publicar,
+-- ninguna otra.
+--
+-- Si ya ejecutaste migracion_categoria_fija_redactor.sql (columna
+-- "categoria_fija" en singular) en esta base de datos, ejecuta primero
+-- el bloque de abajo para migrar los datos existentes antes de borrar la
+-- columna vieja. Si es una base de datos nueva o esa migración anterior
+-- nunca llegó a ejecutarse, basta con el ALTER TABLE de "categorias_fijas".
+--
+-- Un redactor con "categorias_fijas" no vacío:
+--   - No tiene equipo (equipo se ignora/vacía para estos usuarios).
+--   - Solo puede publicar noticias/crónicas/artículos en alguna de esas
+--     categorías (el backend lo valida siempre, ver POST/PUT /api/articles).
+--   - Si solo tiene una categoría asignada, en la práctica funciona como
+--     una categoría fija única (el selector solo le ofrece esa opción).
+--   - Esta restricción NO aplica a resultados (partidos): este tipo de
+--     redactor no publica resultados.
+--
+-- Si "categorias_fijas" es NULL o un array vacío (el caso normal, valor
+-- por defecto), el redactor sigue funcionando exactamente igual que
+-- hasta ahora: puede elegir cualquier categoría y tener equipo(s)
+-- asignado(s).
+--
+-- Ejecutar con wrangler:
+--   wrangler d1 execute elotrofutbol --remote --file=./worker/migracion_categorias_fijas_redactor.sql
+
+ALTER TABLE users ADD COLUMN categorias_fijas TEXT;
+
+-- Si venías de la migración anterior (columna "categoria_fija" en
+-- singular) y quieres migrar los datos ya guardados, descomenta esta
+-- línea (SQLite no permite hacerlo condicionalmente en un solo script):
+--
+-- UPDATE users SET categorias_fijas = '["' || categoria_fija || '"]' WHERE categoria_fija IS NOT NULL AND categoria_fija != '';
+--
+-- Y, una vez migrado el dato, si quieres eliminar la columna vieja
+-- (opcional, D1/SQLite reciente soporta DROP COLUMN):
+--
+-- ALTER TABLE users DROP COLUMN categoria_fija;

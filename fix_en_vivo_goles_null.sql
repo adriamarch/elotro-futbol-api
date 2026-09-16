@@ -1,0 +1,1 @@
+UPDATE results SET goles_local = COALESCE(goles_local, 0), goles_visitante = COALESCE(goles_visitante, 0) WHERE estado = 'en_juego' AND (goles_local IS NULL OR goles_visitante IS NULL);

@@ -1,0 +1,50 @@
+
+// ---------- Sesiones de lectores (cuentas públicas, ver readers/reader_sessions) ----------
+// Mismo patrón que requireAuth/crearSesion de arriba, pero con su propio
+// payload de JWT (lleva "rid" en vez de "uid") para que un token de
+// lector nunca pueda confundirse con uno de redactor/admin ni colarse
+// en una ruta protegida del panel.
+async function requireReaderAuth(request, env) {
+  const auth = request.headers.get("Authorization") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return null;
+  const payload = await verifyJWT(token, env.JWT_SECRET);
+  if (!payload || !payload.rid) return null;
+  if (payload.sid) {
+    const sesion = await env.DB.prepare(
+      "SELECT id FROM reader_sessions WHERE id = ? AND reader_id = ? AND revoked_at IS NULL"
+    ).bind(payload.sid, payload.rid).first();
+    if (!sesion) return null;
+    env.DB.prepare("UPDATE reader_sessions SET last_seen_at = datetime('now') WHERE id = ?")
+      .bind(payload.sid).run().catch(() => {});
+  }
+  return payload;
+}
+
+async function crearSesionLector(env, request, reader) {
+  const userAgent = request.headers.get("User-Agent") || null;
+  const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || null;
+
+  const existente = await env.DB.prepare(
+    `SELECT id FROM reader_sessions WHERE reader_id = ? AND user_agent IS ? AND revoked_at IS NULL
+     ORDER BY last_seen_at DESC LIMIT 1`
+  ).bind(reader.id, userAgent).first();
+
+  let id;
+  if (existente) {
+    id = existente.id;
+    await env.DB.prepare(
+      `UPDATE reader_sessions SET ip = ?, last_seen_at = datetime('now') WHERE id = ?`
+    ).bind(ip, id).run();
+  } else {
+    id = generarIdSesion();
+    await env.DB.prepare(
+      `INSERT INTO reader_sessions (id, reader_id, user_agent, ip) VALUES (?, ?, ?, ?)`
+    ).bind(id, reader.id, userAgent, ip).run();
+  }
+
+  return createJWT(
+    { rid: reader.id, nombre: reader.nombre, email: reader.email, sid: id },
+    env.JWT_SECRET
+  );
+}

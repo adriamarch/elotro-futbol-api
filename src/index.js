@@ -36,6 +36,63 @@ function aSqliteDatetimeUTC(fecha) {
   return fecha.toISOString().slice(0, 19).replace("T", " ");
 }
 
+// Valida y normaliza el rango "fecha_preferencia_desde"/"...hasta" que
+// puede mandar un redactor, opcionalmente, al marcar su borrador como
+// "terminado" (ver estado_borrador): una sugerencia de en qué días (y,
+// opcionalmente, a qué hora) le gustaría que se publicase la noticia,
+// puramente informativa para quien la revise. Solo se guardan si "body"
+// no es null (el llamador ya ha comprobado que el borrador se está
+// marcando como "terminado": si no, se descartan sin más, ver más abajo
+// dónde se llama a esta función).
+// Formato: "YYYY-MM-DD" (fecha simple, sin hora, "todo el día" -
+// compatible con lo guardado antes de añadir la hora) o
+// "YYYY-MM-DDTHH:MM" (con hora opcional, la que manda un
+// <input type="datetime-local"> del panel). Se valida con una expresión
+// regular estricta en vez de fiarse de "new Date(...)", que aceptaría
+// cosas ambiguas.
+// Reglas:
+//  - Las dos son opcionales; se puede mandar solo "desde" (sin límite
+//    superior), o ninguna de las dos.
+//  - Si se manda "hasta" sin "desde", se descarta "hasta" (no tiene
+//    sentido un rango solo con límite superior).
+//  - Si "hasta" es anterior (o igual) a "desde", se descarta "hasta"
+//    (rango invertido: se conserva "desde" igualmente, no se rechaza
+//    todo el guardado del artículo por esto). La comparación es de
+//    texto (mismo formato, mismo orden cronológico), salvo que solo una
+//    de las dos lleve hora: entonces se compara solo la parte de fecha,
+//    para no descartar por ejemplo "hasta" = mismo día con hora si
+//    "desde" es ese mismo día sin hora.
+function normalizarPreferenciaFechas(body) {
+  const esValida = (v) => typeof v === "string"
+    && /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$/.test(v)
+    && !Number.isNaN(new Date(`${v.includes("T") ? v : v + "T00:00"}:00Z`).getTime());
+  if (!body) return { desde: null, hasta: null };
+  const desde = esValida(body.fecha_preferencia_desde) ? body.fecha_preferencia_desde : null;
+  let hasta = esValida(body.fecha_preferencia_hasta) ? body.fecha_preferencia_hasta : null;
+  if (!desde) hasta = null;
+  else if (hasta) {
+    const soloFecha = (v) => v.slice(0, 10);
+    const comparable = (v) => (v.includes("T") && desde.includes("T")) ? v : soloFecha(v);
+    if (comparable(hasta) <= comparable(desde)) hasta = null;
+  }
+  return { desde, hasta };
+}
+
+// Formatea el rango { desde, hasta } de normalizarPreferenciaFechas como
+// texto legible en español (DD/MM/AAAA o DD/MM/AAAA a las HH:MM) para
+// el email que avisa a la redacción de que un borrador está
+// "terminado". Devuelve null si no hay preferencia (no se añade nada al
+// email en ese caso).
+function formatearPreferenciaFechasEmail({ desde, hasta } = {}) {
+  if (!desde) return null;
+  const legible = (v) => {
+    const [fecha, hora] = v.split("T");
+    const [a, m, d] = fecha.split("-");
+    return hora ? `${d}/${m}/${a} a las ${hora}` : `${d}/${m}/${a}`;
+  };
+  return hasta ? `entre el ${legible(desde)} y el ${legible(hasta)}` : `a partir del ${legible(desde)}`;
+}
+
 // Convierte una fecha guardada por SQLite o un ISO string al formato
 // RFC-822 que exige la especificación RSS 2.0 para <pubDate>
 // (p.ej. "Tue, 18 Aug 2026 10:00:00 GMT"). Si no hay fecha o no se
@@ -144,7 +201,7 @@ function cors(resp, origin) {
     // otra.
     resp.headers.set("Vary", "Origin");
   }
-  resp.headers.set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  resp.headers.set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   resp.headers.set("Access-Control-Allow-Headers", "Content-Type,Authorization");
   // Sin esto, el JavaScript del navegador no puede leer estas cabeceras
   // aunque viajen en la respuesta: por defecto, fetch() en un origen
@@ -2082,6 +2139,110 @@ async function requireAuth(request, env, url) {
   return payload;
 }
 
+// ---------- Colaboradores: roles y permisos ----------
+// Un "colaborador" es cualquier cuenta de users.rol distinta de lector:
+// 'admin', 'redactor' o 'fotografo'. Este bloque centraliza en un solo
+// sitio qué puede hacer cada rol, para no tener que repetir
+// "payload.rol !== 'admin'" (u otras comparaciones sueltas) por todo el
+// archivo cada vez que se añade o se matiza un permiso.
+//
+// IMPORTANTE: de momento este bloque solo AÑADE helpers; no cambia
+// ningún comportamiento existente todavía. Los endpoints se migran a
+// usar estas funciones en fases posteriores, endpoint a endpoint, para
+// poder revisar cada cambio de permisos por separado.
+const ROLES_VALIDOS = ["admin", "redactor", "fotografo"];
+
+// Normaliza un rol recibido del cliente (p. ej. al crear/editar un
+// usuario): si no es uno de los tres válidos, cae a 'redactor' como
+// hacía el código anterior (mantiene el comportamiento por defecto de
+// siempre; antes solo existían 'admin' y 'redactor' así que cualquier
+// valor no-admin caía en redactor).
+function normalizarRolColaborador(rol) {
+  return ROLES_VALIDOS.includes(rol) ? rol : "redactor";
+}
+
+function esAdmin(payload) {
+  return !!payload && payload.rol === "admin";
+}
+
+function esRedactor(payload) {
+  return !!payload && payload.rol === "redactor";
+}
+
+function esFotografo(payload) {
+  return !!payload && payload.rol === "fotografo";
+}
+
+// Noticias, crónicas, artículos de opinión, entrevistas, resultados,
+// minuto a minuto, "Última hora", etc.: contenido editorial de toda la
+// vida. Admin y redactor pueden acceder (con los matices de nivel/
+// autoría ya existentes en cada endpoint); fotógrafo NO.
+function puedeGestionarContenidoEditorial(payload) {
+  return esAdmin(payload) || esRedactor(payload);
+}
+
+// Galería/imágenes: tabla "media" y (fases siguientes) galería de
+// partido. Admin y fotógrafo pueden subir/gestionar; redactor puede
+// consultar para adjuntar a sus noticias pero no sube como fotógrafo
+// (esto se termina de definir en el Bloque B, ver plan de fases).
+function puedeGestionarGaleria(payload) {
+  return esAdmin(payload) || esFotografo(payload);
+}
+
+// ---------- Bloque B, Fase 12: adjuntar galería/imágenes sueltas a una noticia ----------
+// Tabla puente "article_media" (ver migracion_article_media.sql): guarda,
+// para cada noticia/crónica, qué imágenes de "media" se han vinculado
+// como galería adicional (aparte de "imagenes", que son las fotos
+// insertadas dentro del propio cuerpo del texto — ver normalizarImagenes).
+// Se admite mandar la selección de dos formas, que se pueden combinar:
+//  - body.galeria_resultado_id: vuelca TODA la galería de ese partido
+//    (match_gallery) en el momento de guardar, en su mismo orden.
+//  - body.media_ids: lista de ids de "media" sueltos, elegidos a mano en
+//    el banco general (no necesariamente ligados a ningún partido).
+// Se resuelve a una lista final de media_ids (sin duplicados, en el
+// orden en que deben aparecer) y se sustituye por completo la fila de
+// article_media de esta noticia: es más simple que calcular altas/bajas
+// y aquí el volumen por noticia es pequeño (unas pocas decenas de fotos
+// como mucho), así que no compensa la complejidad de un diff.
+async function sincronizarArticleMedia(env, articleId, body) {
+  if (!Object.prototype.hasOwnProperty.call(body, "media_ids") && !Object.prototype.hasOwnProperty.call(body, "galeria_resultado_id")) {
+    // Ninguno de los dos campos viene en el body: no se toca la galería
+    // ya guardada (permite editar la noticia sin mandar siempre la
+    // galería completa, igual que el resto de campos opcionales del PUT).
+    return;
+  }
+  const idsFinales = [];
+  const vistos = new Set();
+  const agregar = (id) => {
+    const n = parseInt(id, 10);
+    if (Number.isInteger(n) && !vistos.has(n)) { vistos.add(n); idsFinales.push(n); }
+  };
+
+  if (body.galeria_resultado_id) {
+    const resultId = parseInt(body.galeria_resultado_id, 10);
+    if (Number.isInteger(resultId)) {
+      const { results: galeriaPartido } = await env.DB.prepare(
+        "SELECT media_id FROM match_gallery WHERE result_id = ? ORDER BY orden ASC, created_at ASC"
+      ).bind(resultId).all();
+      galeriaPartido.forEach((g) => agregar(g.media_id));
+    }
+  }
+  if (Array.isArray(body.media_ids)) {
+    body.media_ids.forEach((id) => agregar(id));
+  }
+
+  await env.DB.prepare("DELETE FROM article_media WHERE article_id = ?").bind(articleId).run();
+  for (let i = 0; i < idsFinales.length; i++) {
+    // Un id de media que ya no exista (borrado mientras tanto) se ignora
+    // en vez de romper el guardado de la noticia entera.
+    try {
+      await env.DB.prepare(
+        "INSERT INTO article_media (article_id, media_id, orden) VALUES (?, ?, ?)"
+      ).bind(articleId, idsFinales[i], i).run();
+    } catch (err) { /* media_id inexistente: se ignora esta fila */ }
+  }
+}
+
 // ---------- Sesiones (dispositivos con la sesión iniciada) ----------
 function generarIdSesion() {
   const arr = new Uint8Array(24);
@@ -2894,6 +3055,31 @@ async function slugUnico(env, titulo, idPropio) {
   }
 }
 
+// Devuelve (generándolo si hace falta) el slug de la galería pública de
+// un partido: "real-valladolid-lugo-2026-03-10" o, si ya existe otro
+// partido igual esa fecha (o sin fecha), con un sufijo numérico o de
+// timestamp para desempatar, igual que slugUnico() con los artículos.
+// Se genera la primera vez que el partido recibe una foto de galería
+// (ver POST /api/media) y a partir de ahí ya no cambia, aunque cambien
+// los nombres de los equipos: es un enlace que se puede compartir.
+async function slugPartidoUnico(env, resultado) {
+  if (resultado.slug) return resultado.slug;
+  const fecha = (resultado.fecha_partido || "").slice(0, 10);
+  let base = slugify(`${resultado.equipo_local} ${resultado.equipo_visitante} ${fecha}`);
+  if (!base) base = `partido-${resultado.id}`;
+  let slug = base;
+  let intento = 0;
+  while (true) {
+    const choca = await env.DB.prepare("SELECT id FROM results WHERE slug = ? AND id != ?")
+      .bind(slug, resultado.id).first();
+    if (!choca) break;
+    intento++;
+    slug = `${base}-${intento > 1 ? intento : Date.now().toString().slice(-5)}`;
+  }
+  await env.DB.prepare("UPDATE results SET slug = ? WHERE id = ?").bind(slug, resultado.id).run();
+  return slug;
+}
+
 // Al guardar un artículo cuyo slug ha cambiado (porque todavía no está
 // "congelado", ver slug_congelado en schema.sql), guarda el slug antiguo
 // en article_slug_redirects para que quien entre con el enlace viejo se
@@ -3230,16 +3416,45 @@ async function iniciarPartidosProgramadosCuyaHoraHaLlegado(env) {
   //     retrasado se quedaba en "retrasado" para siempre por mucho que
   //     pasara su nueva hora -- el redactor tenía que arrancarlo a mano
   //     porque nada volvía a comprobar esta columna una vez guardada.
-  const { results: candidatosProgramados } = await env.DB.prepare(
-    `SELECT id, fecha_partido FROM results
-     WHERE estado = 'programado' AND fecha_partido IS NOT NULL
-       AND length(fecha_partido) = 16` // "YYYY-MM-DDTHH:MM": solo si se conoce la hora, no solo la fecha
-  ).all();
-  const { results: candidatosRetrasados } = await env.DB.prepare(
-    `SELECT id, fecha_partido_retrasado AS fecha_partido FROM results
-     WHERE estado = 'retrasado' AND fecha_partido_retrasado IS NOT NULL
-       AND length(fecha_partido_retrasado) = 16`
-  ).all();
+  //
+  // Toda la función va envuelta en try/catch, y CADA partido dentro del
+  // bucle también por separado: antes, si D1 fallaba (timeout, cuota,
+  // error transitorio) al leer los candidatos o al arrancar UN partido
+  // concreto, la excepción se propagaba sin capturar. Como esta función
+  // se llama desde "scheduled" con ctx.waitUntil(...) y sin ningún
+  // try/catch alrededor, ese fallo simplemente desaparecía sin dejar
+  // rastro en los logs, y -si el bucle ya había arrancado- todos los
+  // partidos que venían DETRÁS del que falló en ese mismo array se
+  // quedaban también sin arrancar ese minuto, aunque su hora ya hubiera
+  // pasado. Como el cron vuelve a pasar al minuto siguiente, casi
+  // siempre se recuperaba solo en la siguiente pasada -- pero eso es
+  // justo lo que se estaba viendo: partidos que arrancan "a veces sí, a
+  // veces no, sin patrón claro" (depende de en qué partido concreto, o
+  // en qué consulta, caía el fallo transitorio de D1 ese minuto). Con
+  // cada partido aislado en su propio try/catch, un fallo puntual con
+  // UNO no impide que los demás arranquen en la misma pasada, y además
+  // queda logueado para poder ver en el dashboard de Cloudflare (Logs)
+  // si D1 está fallando de verdad y por qué.
+  let candidatosProgramados = [];
+  let candidatosRetrasados = [];
+  try {
+    ({ results: candidatosProgramados = [] } = await env.DB.prepare(
+      `SELECT id, fecha_partido FROM results
+       WHERE estado = 'programado' AND fecha_partido IS NOT NULL
+         AND length(fecha_partido) = 16` // "YYYY-MM-DDTHH:MM": solo si se conoce la hora, no solo la fecha
+    ).all());
+  } catch (err) {
+    console.error("[arranque automático] fallo leyendo partidos 'programado':", err.message);
+  }
+  try {
+    ({ results: candidatosRetrasados = [] } = await env.DB.prepare(
+      `SELECT id, fecha_partido_retrasado AS fecha_partido FROM results
+       WHERE estado = 'retrasado' AND fecha_partido_retrasado IS NOT NULL
+         AND length(fecha_partido_retrasado) = 16`
+    ).all());
+  } catch (err) {
+    console.error("[arranque automático] fallo leyendo partidos 'retrasado':", err.message);
+  }
   const candidatos = [...candidatosProgramados, ...candidatosRetrasados];
   const ahoraSqlite = aSqliteDatetimeUTC(new Date());
   const pendientes = candidatos.filter((p) => {
@@ -3247,19 +3462,27 @@ async function iniciarPartidosProgramadosCuyaHoraHaLlegado(env) {
     return inicioUtc !== null && inicioUtc <= ahoraSqlite;
   });
   for (const partido of pendientes) {
-    await iniciarCronometroPartido(env, partido.id, 0);
-    // Comprobación defensiva por si, justo en el minuto en que pasa el
-    // cron, el redactor ha pulsado "Iniciar partido" a mano casi a la
-    // vez: sin esto podían colarse dos "Comienza el partido" para el
-    // mismo encuentro (ver también la comprobación gemela en el POST de
-    // /eventos, que cubre el caso opuesto: cron primero, botón después).
-    const yaTieneInicio = await env.DB.prepare(
-      "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = 'inicio_partido' LIMIT 1"
-    ).bind(partido.id).first();
-    if (yaTieneInicio) continue;
-    await env.DB.prepare(
-      `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden) VALUES (?, 'inicio_partido', 'ninguno', 0, 0)`
-    ).bind(partido.id).run();
+    try {
+      await iniciarCronometroPartido(env, partido.id, 0);
+      // Comprobación defensiva por si, justo en el minuto en que pasa el
+      // cron, el redactor ha pulsado "Iniciar partido" a mano casi a la
+      // vez: sin esto podían colarse dos "Comienza el partido" para el
+      // mismo encuentro (ver también la comprobación gemela en el POST de
+      // /eventos, que cubre el caso opuesto: cron primero, botón después).
+      const yaTieneInicio = await env.DB.prepare(
+        "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = 'inicio_partido' LIMIT 1"
+      ).bind(partido.id).first();
+      if (yaTieneInicio) continue;
+      await env.DB.prepare(
+        `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden) VALUES (?, 'inicio_partido', 'ninguno', 0, 0)`
+      ).bind(partido.id).run();
+    } catch (err) {
+      // No se relanza: se deja que el bucle siga con el resto de
+      // partidos pendientes, y este en concreto se reintentará solo en
+      // la siguiente pasada del cron (un minuto después), porque sigue
+      // en estado 'programado'/'retrasado' con su hora ya cumplida.
+      console.error(`[arranque automático] fallo arrancando el partido ${partido.id}:`, err.message);
+    }
   }
 }
 
@@ -3282,11 +3505,16 @@ const MINUTO_DESCANSO_AUTOMATICO = 45;
 // partidos con el cronómetro corriendo (no pausado): si ya está
 // pausado es que alguien ya ha pitado algo (descanso, hidratación...)
 // y no hay que tocarlo.
-async function crearDescansoAutomaticoAlMinuto45(env) {
-  const { results: partidos } = await env.DB.prepare(
+async function crearDescansoAutomaticoAlMinuto45(env, partidosEnJuego) {
+  // partidosEnJuego (opcional): lista ya cargada por el cron (ver
+  // "scheduled" -- se pide UNA sola vez por minuto en vez de que cada
+  // una de las 4 funciones que miran 'en_juego' repita la misma
+  // consulta a D1). Si no se pasa (llamada suelta, no desde el cron),
+  // se sigue consultando aquí como antes.
+  const partidos = (partidosEnJuego ?? (await env.DB.prepare(
     `SELECT id, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos
      FROM results WHERE estado = 'en_juego' AND cronometro_pausado_en IS NULL`
-  ).all();
+  ).all()).results).filter((p) => p.cronometro_pausado_en === null || p.cronometro_pausado_en === undefined);
   if (!partidos.length) return;
 
   for (const partido of partidos) {
@@ -3335,11 +3563,13 @@ const MINUTO_REGISTRADO_FIN_AUTOMATICO = 90;
 // propio aviso. Además marca finalizado_no_cubierto = 1 para que el
 // panel de admin pinte el aviso "FINALIZADO NO CUBIERTO" en la tabla de
 // Resultados (ver pintarListaResultados en admin.js).
-async function crearFinPartidoAutomaticoAlMinuto90(env) {
-  const { results: partidos } = await env.DB.prepare(
+async function crearFinPartidoAutomaticoAlMinuto90(env, partidosEnJuego) {
+  // partidosEnJuego (opcional): ver comentario gemelo en
+  // crearDescansoAutomaticoAlMinuto45.
+  const partidos = (partidosEnJuego ?? (await env.DB.prepare(
     `SELECT id, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos
      FROM results WHERE estado = 'en_juego' AND cronometro_pausado_en IS NULL`
-  ).all();
+  ).all()).results).filter((p) => p.cronometro_pausado_en === null || p.cronometro_pausado_en === undefined);
   if (!partidos.length) return;
 
   for (const partido of partidos) {
@@ -3385,17 +3615,41 @@ async function crearFinPartidoAutomaticoAlMinuto90(env) {
 //      el último evento de tipo pausa) desde hace más de
 //      UMBRAL_DESCANSO_SIN_REANUDAR minutos: el redactor no ha pulsado
 //      "Iniciar 2ª parte".
-// Se manda como máximo un aviso por email por cada mitad del partido
-// (al autor del partido, con copia a EMAIL_NOTIFICACIONES si no tiene
-// correo): uno para la 1ª parte y otro, independiente, para la 2ª. Se
-// guarda en aviso_desatendido_mitad qué mitades ya han avisado, para no
-// repetirlo cada minuto (el cron pasa cada minuto) ni tampoco varias
-// veces dentro de la misma mitad si hay algún toque suelto de por medio
-// -- así se evita mandar una "petada" de correos seguidos por un solo
-// partido desatendido.
+//
+// AVISOS EN LOTE (digest) -- por qué ya no se manda un email por partido:
+// el plan gratuito de Resend limita a 100 emails al día. Antes se
+// mandaba un correo por partido y mitad (al redactor + copia a admin) y,
+// como este cron corre en los DOS backends (D1 y Postgres), un sábado
+// con ~15 partidos sin cubrir bastaba para agotar el cupo y dejar sin
+// aviso al resto de notificaciones del sitio (recuperar contraseña,
+// comentarios, boletín...). Ahora el cron solo DETECTA: cada partido
+// desatendido (una vez por mitad, igual que antes) se apunta en la
+// tabla avisos_desatendidos_cola, y un único email consolidado a la
+// cuenta de notificaciones se manda cuando se cumple CUALQUIERA de
+// estas dos condiciones:
+//   - la cola llega a AVISOS_DESATENDIDOS_LOTE partidos (por defecto 20), o
+//   - el aviso más antiguo de la cola lleva esperando más de
+//     AVISOS_DESATENDIDOS_ESPERA_MAX_MIN minutos (por defecto 30): así
+//     un único partido abandonado no se queda horas sin avisar solo
+//     porque nadie más se haya descuidado.
+// Con eso, el peor caso pasa de 4 emails por partido (x2 backends) a
+// 1 email por cada 20 partidos (o 1 cada 30 min como mucho).
+//
+// La cola vive en su PROPIA tabla (ver migracion_avisos_desatendidos_cola.sql
+// y db/migrations/026_...) y NO en `settings`: el sincronizador D1 ->
+// PostgreSQL trata `settings` como tabla autoritativa y borraría la cola
+// de Railway en cada pasada (cada 60 s). Cada backend lleva la suya, sin
+// sincronizar, igual que cada uno ejecuta ya su propio cron.
 const UMBRAL_PRIMERA_PARTE_SIN_DESCANSO = 55; // minutos
 const UMBRAL_SEGUNDA_PARTE_SIN_FINAL = 100; // minutos (aprox. 2ª parte + prórroga larga)
 const UMBRAL_DESCANSO_SIN_REANUDAR = 25; // minutos parado en el descanso
+
+const AVISOS_DESATENDIDOS_LOTE = 20; // partidos acumulados que disparan el email
+const AVISOS_DESATENDIDOS_ESPERA_MAX_MIN = 30; // minutos máx. que espera el aviso más antiguo
+// Tope de filas que se listan dentro del email (el resto se resume en
+// una línea "y N más") para que un lote enorme no genere un correo
+// gigante ni se recorte en el cliente de correo.
+const AVISOS_DESATENDIDOS_MAX_FILAS_EMAIL = 40;
 
 // Umbral de partido "colgado": el cronómetro lleva corriendo días sin que
 // nadie lo haya cerrado (bug, redactor que se fue de vacaciones, servidor
@@ -3408,14 +3662,20 @@ const UMBRAL_DESCANSO_SIN_REANUDAR = 25; // minutos parado en el descanso
 // de aparecer como "en directo" en la web sin tocar nada del frontend.
 // Sigue siendo consultable desde el panel de admin (que si no filtra por
 // estado, lo trae igual) para que un admin lo revise y lo corrija a mano.
+// NOTA: este aviso NO va por lotes a propósito: es un caso muy raro y
+// grave (ya se ha ocultado el partido de la web) que no debe esperar.
 const UMBRAL_PARTIDO_COLGADO = 2000; // minutos
 
-async function marcarPartidosColgados(env, ctx) {
-  const { results: partidos } = await env.DB.prepare(
+async function marcarPartidosColgados(env, ctx, partidosEnJuego) {
+  // partidosEnJuego (opcional): ver comentario en
+  // crearDescansoAutomaticoAlMinuto45; aquí no se filtra por
+  // cronometro_pausado_en porque un partido colgado puede seguir
+  // corriendo o no, da igual para este chequeo.
+  const partidos = partidosEnJuego ?? (await env.DB.prepare(
     `SELECT id, competicion, jornada, equipo_local, equipo_visitante, autor_id, autor_nombre,
             inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos
      FROM results WHERE estado = 'en_juego'`
-  ).all();
+  ).all()).results;
   if (!partidos.length) return [];
 
   const idsColgados = [];
@@ -3486,19 +3746,92 @@ function minutoEnVivoServidor(resultado) {
   return Math.max(0, Math.floor((Date.now() - inicioMs) / 60000) + ajuste);
 }
 
-async function revisarPartidosDesatendidos(env, ctx) {
+// Lee la cola de avisos pendientes (tabla avisos_desatendidos_cola).
+// Devuelve siempre un array. encolado_ms se pasa por Number(): el driver
+// "pg" devuelve los BIGINT de Postgres como string (no como número, a
+// diferencia de D1), y una comparación o un Math.min sobre strings
+// fallaría en silencio solo en Railway.
+async function leerColaAvisosDesatendidos(env) {
+  const { results } = await env.DB.prepare(
+    "SELECT resultado_id, partido, jornada, redactor, motivo_corto, encolado_ms FROM avisos_desatendidos_cola ORDER BY encolado_ms ASC"
+  ).all();
+  return (results || []).map((f) => ({
+    id: f.resultado_id,
+    partido: f.partido,
+    jornada: f.jornada,
+    redactor: f.redactor,
+    motivoCorto: f.motivo_corto,
+    encoladoMs: Number(f.encolado_ms),
+  }));
+}
+
+// Manda UN solo email con todos los partidos de la cola. Devuelve true
+// si había algo que enviar.
+async function enviarDigestAvisosDesatendidos(env, cola, motivoEnvio) {
+  if (!cola.length) return false;
+
+  const visibles = cola.slice(0, AVISOS_DESATENDIDOS_MAX_FILAS_EMAIL);
+  const ocultos = cola.length - visibles.length;
+  const enlaceLista = `${SITIO_URL}/admin/resultados.html`;
+
+  const filas = visibles.map((a) => ({
+    etiqueta: `Jornada ${a.jornada}`,
+    valor: `${a.partido} — ${a.redactor || "sin asignar"} (${a.motivoCorto})`,
+  }));
+  if (ocultos > 0) filas.push({ etiqueta: "…", valor: `y ${ocultos} partidos más (revisa el panel)` });
+
+  const titulo = cola.length === 1
+    ? "1 partido posiblemente sin cubrir"
+    : `${cola.length} partidos posiblemente sin cubrir`;
+  const parrafo = motivoEnvio === "lote"
+    ? `Se han acumulado ${cola.length} partidos en los que el cronómetro parece desatendido.`
+    : `Estos partidos llevan un rato con el cronómetro desatendido y siguen sin resolverse.`;
+
+  const lineasTexto = visibles
+    .map((a) => `- ${a.partido} (jornada ${a.jornada}) — ${a.redactor || "sin asignar"}: ${a.motivoCorto}\n  ${SITIO_URL}/admin/minuto-a-minuto.html?id=${a.id}`)
+    .join("\n");
+
+  await enviarEmailNotificacion(env, {
+    asunto: `⚠️ ${titulo}`,
+    texto: `${parrafo}\n\n${lineasTexto}${ocultos > 0 ? `\n\n…y ${ocultos} partidos más.` : ""}\n\nRevisa el panel: ${enlaceLista}`,
+    html: plantillaEmail({
+      etiqueta: "Aviso automático",
+      titulo,
+      parrafo,
+      filas,
+      boton: { texto: "Abrir el panel", url: enlaceLista },
+    }),
+  }, { destinatario: EMAIL_NOTIFICACIONES });
+  return true;
+}
+
+// Detecta partidos desatendidos y los apunta en la cola (una vez por
+// mitad, como siempre). El email ya NO sale desde aquí partido a
+// partido: lo manda enviarDigestAvisosDesatendidos cuando toca (ver el
+// bloque de comentarios "AVISOS EN LOTE" más arriba).
+async function revisarPartidosDesatendidos(env, ctx, partidosEnJuego) {
   // Los partidos ya marcados como 'colgado' (ver marcarPartidosColgados,
   // que corre justo antes en el cron) se excluyen aquí para no duplicar
   // avisos: ese caso ya manda su propio email, más urgente, y ya no
   // está en estado 'en_juego' de todas formas.
-  const { results: partidos } = await env.DB.prepare(
+  //
+  // partidosEnJuego (opcional): lista ya cargada por el cron (ver
+  // "scheduled"). OJO: si viene de fuera puede faltarle
+  // aviso_desatendido_mitad si el llamador cargó una versión reducida;
+  // por eso el cron carga siempre la consulta "completa" (con todas las
+  // columnas que hacen falta aquí) y se la pasa también a
+  // marcarPartidosColgados, que solo usa un subconjunto de ellas.
+  const partidos = partidosEnJuego ?? (await env.DB.prepare(
     `SELECT id, competicion, jornada, equipo_local, equipo_visitante, autor_id, autor_nombre,
             inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos,
             aviso_desatendido_mitad
      FROM results WHERE estado = 'en_juego'`
-  ).all();
-  if (!partidos.length) return;
+  ).all()).results;
 
+  // Aunque no haya partidos en juego hay que mirar la cola igualmente:
+  // puede haber avisos pendientes de un partido que ya terminó, y su
+  // temporizador de espera máxima debe seguir corriendo para que se
+  // envíen. Por eso ya no hay un "return" temprano aquí.
   for (const partido of partidos) {
     const corriendo = partido.cronometro_pausado_en === null || partido.cronometro_pausado_en === undefined;
     const minuto = minutoEnVivoServidor(partido);
@@ -3510,9 +3843,11 @@ async function revisarPartidosDesatendidos(env, ctx) {
     // y luego, tras retomarlo, vuelve a quedarse desatendido en la 2ª,
     // puede avisar de nuevo esa segunda vez en lugar de quedarse callado.
     let motivo = null;
+    let motivoCorto = null;
     let mitad = null;
     if (corriendo && minuto >= UMBRAL_SEGUNDA_PARTE_SIN_FINAL) {
       motivo = `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya registrado el final del partido.`;
+      motivoCorto = `min. ${minuto} sin final`;
       mitad = "segunda";
     } else if (corriendo && minuto >= UMBRAL_PRIMERA_PARTE_SIN_DESCANSO) {
       const yaHuboDescanso = await env.DB.prepare(
@@ -3520,11 +3855,13 @@ async function revisarPartidosDesatendidos(env, ctx) {
       ).bind(partido.id).first();
       if (!yaHuboDescanso) {
         motivo = `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya pitado el descanso.`;
+        motivoCorto = `min. ${minuto} sin descanso`;
         mitad = "primera";
       } else {
         // Ya hubo descanso pero el cronómetro sigue corriendo por encima
         // del umbral de la 1ª parte: en realidad ya estamos en la 2ª.
         motivo = `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya registrado el final del partido.`;
+        motivoCorto = `min. ${minuto} sin final`;
         mitad = "segunda";
       }
     } else if (!corriendo) {
@@ -3537,6 +3874,7 @@ async function revisarPartidosDesatendidos(env, ctx) {
         const minutosParado = isNaN(desdeMs) ? 0 : Math.floor((Date.now() - desdeMs) / 60000);
         if (minutosParado >= UMBRAL_DESCANSO_SIN_REANUDAR) {
           motivo = `El partido lleva parado en el descanso ${minutosParado} minutos sin que se haya iniciado la 2ª parte.`;
+          motivoCorto = `${minutosParado} min parado en el descanso`;
           // El descanso es la frontera entre mitades: se cuenta como
           // aviso de la 1ª parte (es el cierre pendiente de esa mitad).
           mitad = "primera";
@@ -3556,51 +3894,70 @@ async function revisarPartidosDesatendidos(env, ctx) {
     }
     if (mitadesAvisadas.includes(mitad)) continue; // ya avisado en esta mitad, no se repite
 
+    // Se marca la mitad como avisada YA (igual que antes, aunque el email
+    // salga más tarde en el lote): así el mismo partido no se vuelve a
+    // apuntar en la cola en el siguiente minuto del cron.
     const nuevoValor = [...new Set([...mitadesAvisadas, mitad])].join("_");
     await env.DB.prepare("UPDATE results SET aviso_desatendido_mitad = ? WHERE id = ?").bind(nuevoValor, partido.id).run();
 
-    let destinatario = EMAIL_NOTIFICACIONES;
-    if (partido.autor_id) {
-      const autor = await env.DB.prepare("SELECT email FROM users WHERE id = ?").bind(partido.autor_id).first();
-      if (autor?.email) destinatario = autor.email;
-    }
-    const nombrePartido = `${partido.equipo_local} - ${partido.equipo_visitante}`;
-    const enlacePanel = `${SITIO_URL}/admin/minuto-a-minuto.html?id=${partido.id}`;
-
-    const enviar = enviarEmailNotificacion(env, {
-      asunto: `⚠️ Partido posiblemente sin cubrir: ${nombrePartido}`,
-      texto: `${motivo}\n\nPartido: ${nombrePartido} (jornada ${partido.jornada})\nRedactor asignado: ${partido.autor_nombre || "sin asignar"}\n\nRevisa el panel de Minuto a Minuto: ${enlacePanel}`,
-      html: plantillaEmail({
-        etiqueta: "Aviso automático",
-        titulo: "Partido posiblemente sin cubrir",
-        parrafo: motivo,
-        filas: [
-          { etiqueta: "Partido", valor: nombrePartido },
-          { etiqueta: "Jornada", valor: String(partido.jornada) },
-          { etiqueta: "Redactor", valor: partido.autor_nombre || "Sin asignar" },
-        ],
-        boton: { texto: "Abrir Minuto a Minuto", url: enlacePanel },
-      }),
-    }, { destinatario });
-
-    // Si el aviso va al autor, se manda también copia a la cuenta
-    // general de notificaciones para que un admin pueda intervenir
-    // aunque el redactor no vea el correo a tiempo.
-    if (destinatario !== EMAIL_NOTIFICACIONES) {
-      ctx.waitUntil(enviar);
-      ctx.waitUntil(enviarEmailNotificacion(env, {
-        asunto: `⚠️ Partido posiblemente sin cubrir: ${nombrePartido}`,
-        texto: `${motivo}\n\nPartido: ${nombrePartido} (jornada ${partido.jornada})\nRedactor asignado: ${partido.autor_nombre || "sin asignar"}\n\nRevisa el panel de Minuto a Minuto: ${enlacePanel}`,
-      }, { destinatario: EMAIL_NOTIFICACIONES }));
-    } else {
-      ctx.waitUntil(enviar);
-    }
+    // INSERT ... ON CONFLICT: si el mismo partido ya estaba en la cola
+    // (p. ej. se reinició y volvió a desatenderse antes de enviarse el
+    // lote), se sustituye su fila en lugar de duplicarla.
+    await env.DB.prepare(
+      `INSERT INTO avisos_desatendidos_cola (resultado_id, partido, jornada, redactor, motivo_corto, encolado_ms)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(resultado_id) DO UPDATE SET partido = excluded.partido, jornada = excluded.jornada,
+         redactor = excluded.redactor, motivo_corto = excluded.motivo_corto, encolado_ms = excluded.encolado_ms`
+    ).bind(
+      partido.id, `${partido.equipo_local} - ${partido.equipo_visitante}`, partido.jornada,
+      partido.autor_nombre || null, motivoCorto, Date.now()
+    ).run();
 
     await registrarActividad(env, null, { uid: null, nombre: "Vigilancia de partidos", rol: "sistema" }, {
       accion: "aviso_partido_desatendido", entidad: "resultado", entidad_id: partido.id,
-      descripcion: `Aviso automático: ${nombrePartido} — ${motivo}`,
+      descripcion: `Aviso automático (en cola para el resumen): ${partido.equipo_local} - ${partido.equipo_visitante} — ${motivo}`,
     });
   }
+
+  const cola = await leerColaAvisosDesatendidos(env);
+  if (!cola.length) return;
+
+  // ¿Toca enviar el resumen? Si ya hay un lote completo, o si el aviso
+  // más antiguo (la cola viene ordenada por encolado_ms ASC) lleva
+  // esperando más de AVISOS_DESATENDIDOS_ESPERA_MAX_MIN. Un encolado_ms
+  // ilegible (NaN) cuenta como "ya lleva mucho": mejor avisar de más una
+  // vez que dejar un aviso atascado para siempre.
+  const esperaMin = Number.isFinite(cola[0].encoladoMs) ? (Date.now() - cola[0].encoladoMs) / 60000 : Infinity;
+  const loteCompleto = cola.length >= AVISOS_DESATENDIDOS_LOTE;
+  const esperaAgotada = esperaMin >= AVISOS_DESATENDIDOS_ESPERA_MAX_MIN;
+  if (!loteCompleto && !esperaAgotada) return;
+
+  // Se vacía la cola ANTES de enviar, y solo las filas que se van a
+  // enviar (por id, no un DELETE global): si el envío falla a medias no
+  // se reenvía el mismo lote cada minuto quemando cuota -el peor
+  // resultado posible aquí sería justo el que se quiere evitar-, y un
+  // partido que se apunte mientras tanto (el cron es concurrente entre
+  // ctx.waitUntil) no se borra sin haberse enviado. Un aviso perdido por
+  // un fallo puntual de Resend es preferible a un bucle de reintentos
+  // que agote el cupo diario.
+  //
+  // Se trocea en lotes de 90 ids: D1/SQLite tiene un límite de 100
+  // parámetros bind por consulta (mismo criterio que
+  // contarPublicacionesPorTipoDeVarios). Con AVISOS_DESATENDIDOS_LOTE = 20
+  // rara vez habrá tantos, pero si la espera máxima acumula más de 100
+  // partidos (una jornada entera sin nadie cubriendo) un DELETE de una
+  // sola vez fallaría con "too many SQL variables" y, al no borrarse la
+  // cola, el mismo aviso se reenviaría CADA MINUTO: justo el bucle de
+  // emails que este sistema existe para evitar.
+  const ids = cola.map((a) => a.id);
+  const LOTE_BORRADO = 90;
+  for (let inicio = 0; inicio < ids.length; inicio += LOTE_BORRADO) {
+    const lote = ids.slice(inicio, inicio + LOTE_BORRADO);
+    await env.DB.prepare(
+      `DELETE FROM avisos_desatendidos_cola WHERE resultado_id IN (${lote.map(() => "?").join(",")})`
+    ).bind(...lote).run();
+  }
+  await enviarDigestAvisosDesatendidos(env, cola, loteCompleto ? "lote" : "espera");
 }
 
 async function publicarArticulosProgramados(env) {
@@ -5072,13 +5429,58 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
   async scheduled(event, env, ctx) {
     ctx.waitUntil(publicarArticulosProgramados(env));
     ctx.waitUntil(iniciarPartidosProgramadosCuyaHoraHaLlegado(env));
-    ctx.waitUntil(crearDescansoAutomaticoAlMinuto45(env));
-    ctx.waitUntil(crearFinPartidoAutomaticoAlMinuto90(env));
-    // marcarPartidosColgados va ANTES de revisarPartidosDesatendidos:
-    // pasa a 'colgado' los partidos con más de 2000' corriendo, para que
-    // ya no aparezcan como 'en_juego' cuando se ejecute la revisión de
-    // "desatendido" justo después y no se dupliquen los avisos.
-    ctx.waitUntil(marcarPartidosColgados(env, ctx).then(() => revisarPartidosDesatendidos(env, ctx)));
+
+    // Reducción de CPU del cron (corre cada minuto, 1440 veces/día):
+    // antes crearDescansoAutomaticoAlMinuto45, crearFinPartidoAutomaticoAlMinuto90,
+    // marcarPartidosColgados y revisarPartidosDesatendidos hacían CADA
+    // UNA su propio SELECT ... WHERE estado = 'en_juego' contra D1 en
+    // cada tick, aunque casi siempre esa tabla está vacía (no hay
+    // partidos en directo la mayor parte del día). Se sustituyen esas 4
+    // consultas por 1 sola aquí, y se le pasa el resultado a las 4
+    // funciones para que no repitan la lectura. Si esa única consulta
+    // sale vacía, ni siquiera se llaman las 3 que solo tienen sentido
+    // con partidos en juego (revisarPartidosDesatendidos sigue
+    // llamándose igual, porque también drena la cola de avisos
+    // pendientes aunque no haya nada 'en_juego' ahora mismo).
+    ctx.waitUntil((async () => {
+      let partidosEnJuego = [];
+      try {
+        const { results } = await env.DB.prepare(
+          `SELECT id, competicion, jornada, equipo_local, equipo_visitante, autor_id, autor_nombre,
+                  inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos,
+                  aviso_desatendido_mitad
+           FROM results WHERE estado = 'en_juego'`
+        ).all();
+        partidosEnJuego = results || [];
+      } catch (err) {
+        console.log("Error leyendo partidos en_juego para el cron:", err.message);
+      }
+
+      if (partidosEnJuego.length) {
+        const corriendo = partidosEnJuego.filter(
+          (p) => p.cronometro_pausado_en === null || p.cronometro_pausado_en === undefined
+        );
+        await crearDescansoAutomaticoAlMinuto45(env, corriendo);
+        await crearFinPartidoAutomaticoAlMinuto90(env, corriendo);
+      }
+
+      // marcarPartidosColgados va ANTES de revisarPartidosDesatendidos:
+      // pasa a 'colgado' los partidos con más de 2000' corriendo, para
+      // que ya no aparezcan como 'en_juego' cuando se ejecute la
+      // revisión de "desatendido" justo después y no se dupliquen los
+      // avisos. Como marcarPartidosColgados puede cambiar el estado en
+      // D1, revisarPartidosDesatendidos vuelve a mirar por sí misma qué
+      // sigue 'en_juego' de verdad en vez de reutilizar la lista de
+      // arriba, salvo cuando esa lista ya estaba vacía (nada que colgar).
+      const idsColgados = partidosEnJuego.length
+        ? await marcarPartidosColgados(env, ctx, partidosEnJuego)
+        : [];
+      const partidosParaDesatendidos = idsColgados.length
+        ? undefined // hubo cambios de estado: que revisarPartidosDesatendidos relea D1
+        : partidosEnJuego;
+      await revisarPartidosDesatendidos(env, ctx, partidosParaDesatendidos);
+    })());
+
     ctx.waitUntil(enviarBoletinSemanalSiToca(env));
     // Comprobación de cuota de D1 (ver "ALERTA DE CUOTA DIARIA DE D1"
     // más abajo). Se autolimita a una vez por hora internamente, así
@@ -5331,7 +5733,7 @@ async function fetchRailway(
     }
     headers.set(
       "Access-Control-Allow-Methods",
-      "GET,POST,PUT,DELETE,OPTIONS"
+      "GET,POST,PUT,PATCH,DELETE,OPTIONS"
     );
     headers.set(
       "Access-Control-Allow-Headers",
@@ -7225,7 +7627,7 @@ async function handlePrimary(request, env, ctx) {
         const passwordInicial = body.password && body.password.length >= 8 ? body.password : generatePassword();
         const salt = randomSalt();
         const hash = await hashPassword(passwordInicial, salt);
-        const rol = body.rol === "admin" ? "admin" : "redactor";
+        const rol = normalizarRolColaborador(body.rol);
 
         // Categoría(s) fija(s) (redactor "sin equipo, con categoría
         // fija", p. ej. Arbitraje): si se asigna alguna, este redactor
@@ -7301,6 +7703,13 @@ async function handlePrimary(request, env, ctx) {
         if (user.rol === "admin") {
           return json({ error: "Los administradores están siempre en el nivel máximo y no se puede editar su nivel mientras tengan ese rol" }, 400);
         }
+        // El sistema de niveles mide la confianza para publicar contenido
+        // editorial sin revisión (ver publicarSinRevision): un fotógrafo
+        // no publica noticias ni crónicas, así que no tiene sentido darle
+        // un nivel de redactor.
+        if (esFotografo(user)) {
+          return json({ error: "El nivel de colaborador no aplica a un fotógrafo" }, 400);
+        }
 
         const body = await request.json().catch(() => ({}));
         const nuevoNivel = parseInt(body.nivel);
@@ -7362,6 +7771,12 @@ async function handlePrimary(request, env, ctx) {
         if (id === payload.uid && body.rol && body.rol !== "admin") {
           return json({ error: "No puedes quitarte a ti mismo el rol de administrador" }, 400);
         }
+        // Si se le va a quitar el rol de admin a este usuario (o se le
+        // asigna cualquier otro rol) y era el nivel máximo solo por ser
+        // admin, al pasar a redactor/fotógrafo su nivel real es el que
+        // ya tuviera guardado (por defecto 1); esto ya lo resuelve
+        // obtenerNivelUsuario/construirProgresoNivel leyendo `nivel` de
+        // la fila, así que no hace falta tocar nada más aquí.
         if (id === payload.uid && body.activo === false) {
           return json({ error: "No puedes desactivar tu propia cuenta" }, 400);
         }
@@ -7393,7 +7808,7 @@ async function handlePrimary(request, env, ctx) {
           `UPDATE users SET nombre = ?, rol = ?, activo = ?, email = ?, equipo = ?, categorias_fijas = ? WHERE id = ?`
         ).bind(
           body.nombre !== undefined ? body.nombre : user.nombre,
-          body.rol === "admin" || body.rol === "redactor" ? body.rol : user.rol,
+          body.rol !== undefined ? normalizarRolColaborador(body.rol) : user.rol,
           body.activo === undefined ? user.activo : (body.activo ? 1 : 0),
           body.email !== undefined ? (body.email ? body.email.trim() : null) : user.email,
           equipoActualizado,
@@ -7467,12 +7882,56 @@ async function handlePrimary(request, env, ctx) {
         const titulo = (form.get("titulo") || "").toString().trim();
         const descripcion = (form.get("descripcion") || "").toString().trim();
         const club = (form.get("club") || "").toString().trim();
+        // Vinculación automática a la galería del partido (ver Fase 1 del
+        // rediseño): si se manda resultId, esta foto/vídeo se enlaza sola
+        // a match_gallery al terminar de subirse, sin pasar por el paso
+        // aparte de "Galería de partido". "equipo" indica de cuál de los
+        // dos equipos del partido es (para las pestañas de la galería
+        // pública); puede ir vacío si es una foto general del partido.
+        const resultIdRaw = (form.get("resultId") || "").toString().trim();
+        const resultId = resultIdRaw ? parseInt(resultIdRaw) : null;
+        let equipoGaleria = (form.get("equipo") || "").toString().trim().toLowerCase();
+        if (equipoGaleria !== "local" && equipoGaleria !== "visitante") equipoGaleria = null;
+        // Portada elegida por quien sube el vídeo (segundo exacto del que
+        // se extrae el fotograma de portada en la galería). Opcional: si
+        // no se manda, se sigue usando el segundo 1 por defecto.
+        const portadaSegundoRaw = (form.get("portadaSegundo") || "").toString().trim();
+        let portadaSegundo = null;
+        if (portadaSegundoRaw !== "") {
+          const num = Number(portadaSegundoRaw);
+          if (Number.isFinite(num) && num >= 0) portadaSegundo = num;
+        }
+        // Punto de foco espacial del fotograma de portada del vídeo (qué
+        // parte de la imagen no se debe recortar nunca), mismo formato
+        // "50% 50%" que ya usan las fotos de contenido. Opcional: si no
+        // se manda, se sigue centrando como hasta ahora.
+        const portadaFocoRaw = (form.get("portadaFoco") || "").toString().trim();
+        const portadaFoco = /^\d{1,3}%\s\d{1,3}%$/.test(portadaFocoRaw) ? portadaFocoRaw : null;
+        // Visibilidad elegida por quien sube el contenido: "publico" (por
+        // defecto, aparece en las galerías del sitio) o "privado" (queda
+        // solo en la mediateca del panel, nunca se expone en ningún
+        // endpoint público). Cualquier valor que no sea "privado" exacto
+        // se trata como público, para no dejar nada oculto por error.
+        const visibilidadRaw = (form.get("visibilidad") || "").toString().trim().toLowerCase();
+        const visibilidad = visibilidadRaw === "privado" ? "privado" : "publico";
 
         if (!file || typeof file === "string") return json({ error: "Falta el archivo" }, 400);
         if (!titulo) return json({ error: "Falta el título" }, 400);
         if (titulo.length > 200) return json({ error: "El título es demasiado largo (máximo 200 caracteres)" }, 400);
         if (descripcion.length > 2000) return json({ error: "La descripción es demasiado larga (máximo 2000 caracteres)" }, 400);
         if (file.size === 0) return json({ error: "El archivo está vacío" }, 400);
+
+        // Si se ha pedido vincular a un partido, se comprueba que existe
+        // ANTES de subir nada a Cloudinary: así, si el id es inválido, se
+        // avisa al momento en vez de subir el archivo para nada.
+        let resultadoGaleria = null;
+        if (resultId) {
+          if (!Number.isInteger(resultId)) return json({ error: "El partido elegido no es válido" }, 400);
+          resultadoGaleria = await env.DB.prepare(
+            "SELECT id, equipo_local, equipo_visitante, fecha_partido, slug FROM results WHERE id = ?"
+          ).bind(resultId).first();
+          if (!resultadoGaleria) return json({ error: "El partido elegido ya no existe" }, 404);
+        }
 
         // Antes de gastar tiempo y ancho de banda subiendo el archivo a
         // Cloudinary, calculamos su hash y comprobamos si ya existe algo
@@ -7522,7 +7981,18 @@ async function handlePrimary(request, env, ctx) {
           if (err.esValidacion) return json({ error: err.message }, 400);
           return json({ error: "No se pudo subir el archivo a Cloudinary. Comprueba tu conexión e inténtalo de nuevo.", detail: err.message }, 502);
         }
-        const esFoto = esImagenPermitida(file.type) || ((!file.type || file.type === "application/octet-stream") && extensionImagenPermitida(file.name));
+        // Cloudinary analiza el archivo de verdad (no solo el nombre o el
+        // MIME que mande el navegador) y devuelve resourceType ("image" o
+        // "video"): es la fuente más fiable de qué es en realidad el
+        // archivo, así que se usa como base. Antes se recalculaba "a mano"
+        // a partir de file.type/extensión, lo que podía guardar "foto"
+        // para un vídeo si el navegador mandaba un MIME vacío o genérico
+        // (típico en algunos móviles con .mov/.mkv). El cálculo manual se
+        // deja solo como último recurso, por si Cloudinary devolviera algo
+        // inesperado.
+        const esFoto = subida.resourceType
+          ? subida.resourceType === "image"
+          : (esImagenPermitida(file.type) || ((!file.type || file.type === "application/octet-stream") && extensionImagenPermitida(file.name)));
 
         // hash_archivo es una columna añadida por una migración manual
         // que hay que ejecutar aparte: si no se ha aplicado en esta base
@@ -7532,20 +8002,74 @@ async function handlePrimary(request, env, ctx) {
         // específicamente porque la columna no existe (mensaje de
         // SQLite o de PostgreSQL, según cuál esté detrás de env.DB aquí),
         // se reintenta sin ella.
+        let mediaInsertado;
         try {
-          await env.DB.prepare(
-            `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          mediaInsertado = await env.DB.prepare(
+            `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo, portada_segundo, portada_foco, visibilidad)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(
             subida.publicId, subida.resourceType, subida.url,
             titulo, descripcion || null, esFoto ? "foto" : "video",
-            file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo
+            file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo,
+            esFoto ? null : portadaSegundo, esFoto ? null : portadaFoco, visibilidad
           ).run();
         } catch (err) {
+          // visibilidad es una columna añadida por una migración manual
+          // (migracion_media_visibilidad.sql): si no se ha ejecutado
+          // todavía en esta base de datos, se reintenta sin ella (el
+          // contenido queda con el valor por defecto de la columna,
+          // "publico", hasta que se aplique la migración).
+          const esColumnaVisibilidadFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /visibilidad/i.test(err.message || "");
+          const esColumnaPortadaFocoFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /portada_foco/i.test(err.message || "");
+          const esColumnaPortadaFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /portada_segundo/i.test(err.message || "");
           const esColumnaFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /hash_archivo/i.test(err.message || "");
-          if (esColumnaFaltante) {
+          if (esColumnaVisibilidadFaltante) {
             try {
-              await env.DB.prepare(
+              mediaInsertado = await env.DB.prepare(
+                `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo, portada_segundo, portada_foco)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ).bind(
+                subida.publicId, subida.resourceType, subida.url,
+                titulo, descripcion || null, esFoto ? "foto" : "video",
+                file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo,
+                esFoto ? null : portadaSegundo, esFoto ? null : portadaFoco
+              ).run();
+            } catch (err2) {
+              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType));
+              return json({ error: "No se pudo guardar el archivo. Inténtalo de nuevo.", detail: err2.message }, 500);
+            }
+          } else if (esColumnaPortadaFocoFaltante) {
+            try {
+              mediaInsertado = await env.DB.prepare(
+                `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo, portada_segundo)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ).bind(
+                subida.publicId, subida.resourceType, subida.url,
+                titulo, descripcion || null, esFoto ? "foto" : "video",
+                file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo,
+                esFoto ? null : portadaSegundo
+              ).run();
+            } catch (err2) {
+              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType));
+              return json({ error: "No se pudo guardar el archivo. Inténtalo de nuevo.", detail: err2.message }, 500);
+            }
+          } else if (esColumnaPortadaFaltante) {
+            try {
+              mediaInsertado = await env.DB.prepare(
+                `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ).bind(
+                subida.publicId, subida.resourceType, subida.url,
+                titulo, descripcion || null, esFoto ? "foto" : "video",
+                file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo
+              ).run();
+            } catch (err2) {
+              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType));
+              return json({ error: "No se pudo guardar el archivo. Inténtalo de nuevo.", detail: err2.message }, 500);
+            }
+          } else if (esColumnaFaltante) {
+            try {
+              mediaInsertado = await env.DB.prepare(
                 `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
               ).bind(
@@ -7571,6 +8095,27 @@ async function handlePrimary(request, env, ctx) {
           }
         }
 
+        // Vinculación automática a la galería del partido elegido: se
+        // intenta como un paso "extra" que no debe tirar abajo la subida
+        // si algo falla (el archivo y su fila en "media" ya están
+        // guardados de todas formas; el redactor siempre puede vincularlo
+        // luego a mano desde "Galería de partido").
+        let galeriaPartidoSlug = null;
+        if (resultadoGaleria && mediaInsertado?.meta?.last_row_id) {
+          try {
+            const maxOrdenFila = await env.DB.prepare(
+              "SELECT COALESCE(MAX(orden), -1) AS max_orden FROM match_gallery WHERE result_id = ?"
+            ).bind(resultadoGaleria.id).first();
+            const siguienteOrden = (maxOrdenFila?.max_orden ?? -1) + 1;
+            await env.DB.prepare(
+              `INSERT INTO match_gallery (result_id, media_id, orden, vinculado_por_id, equipo) VALUES (?, ?, ?, ?, ?)`
+            ).bind(resultadoGaleria.id, mediaInsertado.meta.last_row_id, siguienteOrden, payload.uid, equipoGaleria).run();
+            galeriaPartidoSlug = await slugPartidoUnico(env, resultadoGaleria);
+          } catch (err) {
+            console.error("No se pudo vincular automáticamente la foto a la galería del partido:", err.message);
+          }
+        }
+
         ctx.waitUntil(enviarEmailNotificacion(env, {
           asunto: `Nuevo ${esFoto ? "foto" : "vídeo"} subido: ${titulo}`,
           texto: `${payload.nombre} ha subido "${titulo}" (${esFoto ? "foto" : "vídeo"}) a ELOTROFÚTBOLTV.${club ? `\nClub: ${club}` : ""}${descripcion ? `\nDescripción: ${descripcion}` : ""}\n\nEntra en el panel de administración para verlo y descargarlo.`,
@@ -7591,7 +8136,7 @@ async function handlePrimary(request, env, ctx) {
           descripcion: `Ha subido ${esFoto ? "una foto" : "un vídeo"}: "${titulo}"`,
         }));
 
-        return json({ ok: true });
+        return json({ ok: true, galeriaPartidoSlug });
       }
 
       // ---------- SUBIR IMAGEN SUELTA (foto de perfil, fotos de una noticia...) ----------
@@ -7623,34 +8168,217 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/media" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        const base = "SELECT id, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, created_at FROM media";
-        const { results } = payload.rol === "admin"
-          ? await env.DB.prepare(`${base} ORDER BY created_at DESC`).all()
-          : await env.DB.prepare(`${base} WHERE autor_id = ? ORDER BY created_at DESC`).bind(payload.uid).all();
-        return json({ media: results });
+        const base = "SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.nombre_archivo, m.content_type, m.tamano_bytes, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre, m.club, m.created_at, m.portada_segundo, m.portada_foco, m.visibilidad FROM media m LEFT JOIN users u ON u.id = m.autor_id";
+        const baseSinFoco = "SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.nombre_archivo, m.content_type, m.tamano_bytes, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre, m.club, m.created_at, m.portada_segundo FROM media m LEFT JOIN users u ON u.id = m.autor_id";
+        const baseSinPortada = "SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.nombre_archivo, m.content_type, m.tamano_bytes, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre, m.club, m.created_at FROM media m LEFT JOIN users u ON u.id = m.autor_id";
+        let resultadoMedia;
+        try {
+          resultadoMedia = payload.rol === "admin"
+            ? await env.DB.prepare(`${base} ORDER BY m.created_at DESC`).all()
+            : await env.DB.prepare(`${base} WHERE m.autor_id = ? ORDER BY m.created_at DESC`).bind(payload.uid).all();
+        } catch (err) {
+          // portada_segundo / portada_foco son columnas añadidas por
+          // migraciones manuales: si aún no se han ejecutado en esta base
+          // de datos, se reintenta sin ellas en vez de romper el listado.
+          try {
+            resultadoMedia = payload.rol === "admin"
+              ? await env.DB.prepare(`${baseSinFoco} ORDER BY m.created_at DESC`).all()
+              : await env.DB.prepare(`${baseSinFoco} WHERE m.autor_id = ? ORDER BY m.created_at DESC`).bind(payload.uid).all();
+          } catch (err2) {
+            resultadoMedia = payload.rol === "admin"
+              ? await env.DB.prepare(`${baseSinPortada} ORDER BY m.created_at DESC`).all()
+              : await env.DB.prepare(`${baseSinPortada} WHERE m.autor_id = ? ORDER BY m.created_at DESC`).bind(payload.uid).all();
+          }
+        }
+        const filas = resultadoMedia.results;
+        // Se añade a cada foto/vídeo, si tiene, el partido al que está
+        // vinculada en match_gallery (result_id + nombres de equipos +
+        // de cuál de los dos es), para que el modal "Editar contenido"
+        // pueda mostrar y permitir cambiar ese vínculo en vez de solo el
+        // campo "club" de texto libre. Se hace con una sola consulta
+        // aparte (en vez de un JOIN en la de arriba) para no complicar
+        // los reintentos por columnas que puedan faltar.
+        if (filas.length) {
+          try {
+            const { results: enlaces } = await env.DB.prepare(
+              `SELECT mg.id AS enlace_id, mg.media_id, mg.equipo, mg.result_id,
+                      r.equipo_local, r.equipo_visitante, r.slug
+               FROM match_gallery mg
+               JOIN results r ON r.id = mg.result_id
+               WHERE mg.media_id IN (${filas.map(() => "?").join(",")})`
+            ).bind(...filas.map((f) => f.id)).all();
+            const porMediaId = new Map(enlaces.map((e) => [e.media_id, e]));
+            // El slug de un partido se genera "bajo demanda" (puede que un
+            // partido con galería todavía no lo tenga si nadie ha abierto
+            // aún su enlace público): se calcula aquí una sola vez por
+            // partido distinto, para que el botón "Compartir" de la
+            // mediateca tenga siempre una URL válida.
+            const resultadosSinSlug = new Map();
+            for (const e of enlaces) {
+              if (!e.slug && !resultadosSinSlug.has(e.result_id)) resultadosSinSlug.set(e.result_id, e);
+            }
+            for (const e of resultadosSinSlug.values()) {
+              const slugGenerado = await slugPartidoUnico(env, { id: e.result_id, equipo_local: e.equipo_local, equipo_visitante: e.equipo_visitante, fecha_partido: null, slug: null });
+              for (const otro of enlaces) if (otro.result_id === e.result_id) otro.slug = slugGenerado;
+            }
+            for (const f of filas) {
+              const e = porMediaId.get(f.id);
+              if (e) {
+                f.match_gallery_id = e.enlace_id;
+                f.resultado_id = e.result_id;
+                f.equipo_galeria = e.equipo || null;
+                f.resultado_equipo_local = e.equipo_local;
+                f.resultado_equipo_visitante = e.equipo_visitante;
+                f.resultado_slug = e.slug || null;
+                f.galeria_url = e.slug ? `${SITIO_URL}/galeria/${e.slug}` : null;
+              }
+            }
+          } catch (err) {
+            console.error("No se pudo cargar el partido vinculado de cada media (se continúa sin ese dato):", err.message);
+          }
+        }
+        return json({ media: filas });
       }
 
       // ---------- MEDIA: editar título/club/descripción ----------
-      // Solo puede editar un archivo la persona que lo subió (comparando
-      // autor_id con el usuario autenticado); no se puede sustituir el
-      // archivo en sí, solo sus datos.
+      // Puede editar un archivo la persona que lo subió (comparando
+      // autor_id con el usuario autenticado), o un admin sobre
+      // cualquier archivo aunque sea de otra persona; no se puede
+      // sustituir el archivo en sí, solo sus datos.
       if (mediaMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const id = parseInt(mediaMatch[1]);
-        const registro = await env.DB.prepare("SELECT autor_id FROM media WHERE id = ?").bind(id).first();
+        const registro = await env.DB.prepare("SELECT autor_id, tipo FROM media WHERE id = ?").bind(id).first();
         if (!registro) return json({ error: "No encontrado" }, 404);
-        if (registro.autor_id !== payload.uid) {
+        if (payload.rol !== "admin" && registro.autor_id !== payload.uid) {
           return json({ error: "Solo la persona que subió este contenido puede editarlo" }, 403);
         }
         const body = await request.json();
         const titulo = (body.titulo || "").toString().trim();
         if (!titulo) return json({ error: "Falta el título" }, 400);
         const descripcion = (body.descripcion || "").toString().trim();
+        // "club" (texto libre) y el vínculo a un partido (match_gallery)
+        // son mutuamente excluyentes: si se manda resultId, el club se
+        // ignora aquí (igual que al subir, ver /api/media POST), porque
+        // el equipo ya se deduce del propio partido vinculado.
         const club = (body.club || "").toString().trim();
-        await env.DB.prepare(
-          "UPDATE media SET titulo = ?, descripcion = ?, club = ? WHERE id = ?"
-        ).bind(titulo, descripcion || null, club || null, id).run();
+        const resultIdRaw = body.resultId === undefined || body.resultId === null ? "" : body.resultId.toString().trim();
+        const resultId = resultIdRaw ? parseInt(resultIdRaw) : null;
+        let equipoGaleria = (body.equipo || "").toString().trim().toLowerCase();
+        if (equipoGaleria !== "local" && equipoGaleria !== "visitante") equipoGaleria = null;
+        if (resultId !== null && !Number.isInteger(resultId)) {
+          return json({ error: "El partido elegido no es válido" }, 400);
+        }
+        // portadaSegundo: el instante (en segundos) del vídeo que se usa
+        // como fotograma de portada en la galería de contenido subido.
+        // Solo tiene sentido para vídeos; en fotos se ignora.
+        let portadaSegundo = null;
+        if (registro.tipo === "video" && body.portadaSegundo !== undefined && body.portadaSegundo !== null && body.portadaSegundo !== "") {
+          const num = Number(body.portadaSegundo);
+          if (Number.isFinite(num) && num >= 0) portadaSegundo = num;
+        }
+        // portadaFoco: qué punto de la miniatura no se debe recortar nunca
+        // (mismo formato "50% 50%" que el resto de fotos del sitio). Para
+        // vídeos es el punto del fotograma de portada; para fotos, el
+        // punto de la propia imagen. Se guarda en la misma columna en
+        // ambos casos: el campo llega como "portadaFoco" o "imagenFoco"
+        // según el tipo, pero es el mismo dato.
+        const focoRaw = registro.tipo === "video" ? body.portadaFoco : body.imagenFoco;
+        let portadaFoco = null;
+        if (typeof focoRaw === "string" && /^\d{1,3}%\s\d{1,3}%$/.test(focoRaw.trim())) {
+          portadaFoco = focoRaw.trim();
+        }
+        // Si se vincula a un partido, el club de texto libre se anula (el
+        // equipo ya se deduce del partido), igual que al subir.
+        const clubGuardado = resultId ? null : (club || null);
+        // Visibilidad: igual criterio que al subir (ver POST /api/media),
+        // cualquier valor que no sea "privado" exacto se guarda como
+        // "publico".
+        const visibilidadRaw = (body.visibilidad || "").toString().trim().toLowerCase();
+        const visibilidad = visibilidadRaw === "privado" ? "privado" : "publico";
+        try {
+          await env.DB.prepare(
+            "UPDATE media SET titulo = ?, descripcion = ?, club = ?, portada_segundo = ?, portada_foco = ?, visibilidad = ? WHERE id = ?"
+          ).bind(titulo, descripcion || null, clubGuardado, portadaSegundo, portadaFoco, visibilidad, id).run();
+        } catch (err) {
+          const esColumnaVisibilidadFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /visibilidad/i.test(err.message || "");
+          const esColumnaFocoFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /portada_foco/i.test(err.message || "");
+          const esColumnaFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /portada_segundo/i.test(err.message || "");
+          if (esColumnaVisibilidadFaltante) {
+            try {
+              await env.DB.prepare(
+                "UPDATE media SET titulo = ?, descripcion = ?, club = ?, portada_segundo = ?, portada_foco = ? WHERE id = ?"
+              ).bind(titulo, descripcion || null, clubGuardado, portadaSegundo, portadaFoco, id).run();
+              console.error("No se pudo guardar visibilidad (falta migración migracion_media_visibilidad.sql):", err.message);
+            } catch (err2) {
+              throw err2;
+            }
+          } else if (esColumnaFocoFaltante) {
+            try {
+              await env.DB.prepare(
+                "UPDATE media SET titulo = ?, descripcion = ?, club = ?, portada_segundo = ? WHERE id = ?"
+              ).bind(titulo, descripcion || null, clubGuardado, portadaSegundo, id).run();
+              console.error("No se pudo guardar portada_foco (falta migración migracion_media_portada_foco.sql):", err.message);
+            } catch (err2) {
+              throw err2;
+            }
+          } else if (esColumnaFaltante) {
+            // Columna aún no migrada en esta base de datos: se guarda el
+            // resto de campos igualmente y se avisa del detalle solo por log.
+            await env.DB.prepare(
+              "UPDATE media SET titulo = ?, descripcion = ?, club = ? WHERE id = ?"
+            ).bind(titulo, descripcion || null, clubGuardado, id).run();
+            console.error("No se pudo guardar portada_segundo/portada_foco (falta migración migracion_media_portada.sql):", err.message);
+          } else {
+            throw err;
+          }
+        }
+
+        // ---------- Vínculo con la galería de partido (match_gallery) ----------
+        // Se gestiona aparte del UPDATE de arriba porque no es una simple
+        // columna de "media": es una fila (o ausencia de fila) en otra
+        // tabla. Tres casos posibles:
+        //  1) Se elige un partido y antes no había ninguno vinculado ->
+        //     se crea el enlace.
+        //  2) Se elige un partido y ya había uno vinculado (al mismo
+        //     partido o a otro distinto) -> se actualiza el enlace
+        //     existente (result_id + equipo) en vez de duplicar filas.
+        //  3) Se quita el partido (resultId vacío) habiendo uno antes ->
+        //     se borra el enlace.
+        // Al ser "extra" (igual que en /api/media POST), un fallo aquí no
+        // debe tirar abajo el resto de cambios ya guardados en "media".
+        try {
+          const enlaceExistente = await env.DB.prepare(
+            "SELECT id, result_id FROM match_gallery WHERE media_id = ?"
+          ).bind(id).first();
+
+          if (resultId) {
+            const resultadoDestino = await env.DB.prepare(
+              "SELECT id FROM results WHERE id = ?"
+            ).bind(resultId).first();
+            if (!resultadoDestino) return json({ error: "El partido elegido ya no existe" }, 404);
+
+            if (enlaceExistente) {
+              await env.DB.prepare(
+                "UPDATE match_gallery SET result_id = ?, equipo = ? WHERE id = ?"
+              ).bind(resultId, equipoGaleria, enlaceExistente.id).run();
+            } else {
+              const maxOrdenFila = await env.DB.prepare(
+                "SELECT COALESCE(MAX(orden), -1) AS max_orden FROM match_gallery WHERE result_id = ?"
+              ).bind(resultId).first();
+              const siguienteOrden = (maxOrdenFila?.max_orden ?? -1) + 1;
+              await env.DB.prepare(
+                `INSERT INTO match_gallery (result_id, media_id, orden, vinculado_por_id, equipo) VALUES (?, ?, ?, ?, ?)`
+              ).bind(resultId, id, siguienteOrden, payload.uid, equipoGaleria).run();
+            }
+          } else if (enlaceExistente) {
+            await env.DB.prepare("DELETE FROM match_gallery WHERE id = ?").bind(enlaceExistente.id).run();
+          }
+        } catch (err) {
+          console.error("No se pudo actualizar el vínculo con la galería del partido al editar media:", err.message);
+        }
+
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "editar_media", entidad: "media", entidad_id: id,
           descripcion: `Ha editado el contenido "${titulo}"`,
@@ -7686,10 +8414,12 @@ async function handlePrimary(request, env, ctx) {
       if (mediaMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede eliminar contenido" }, 403);
         const id = parseInt(mediaMatch[1]);
-        const registro = await env.DB.prepare("SELECT cloudinary_public_id, cloudinary_resource_type FROM media WHERE id = ?").bind(id).first();
+        const registro = await env.DB.prepare("SELECT cloudinary_public_id, cloudinary_resource_type, autor_id FROM media WHERE id = ?").bind(id).first();
         if (!registro) return json({ error: "No encontrado" }, 404);
+        if (payload.rol !== "admin" && registro.autor_id !== payload.uid) {
+          return json({ error: "Solo puedes eliminar contenido que hayas subido tú" }, 403);
+        }
         await borrarDeCloudinary(env, registro.cloudinary_public_id, registro.cloudinary_resource_type);
         await env.DB.prepare("DELETE FROM media WHERE id = ?").bind(id).run();
         ctx.waitUntil(registrarActividad(env, request, payload, {
@@ -7697,6 +8427,378 @@ async function handlePrimary(request, env, ctx) {
           descripcion: `Ha eliminado un contenido multimedia (id ${id})`,
         }));
         return json({ ok: true });
+      }
+
+      // ---------- GALERÍA DE PARTIDO (match_gallery) ----------
+      // Vincula imágenes ya existentes en "media" con un partido de
+      // "results" (Bloque B, Fase 10 del plan de colaboradores). No
+      // sube ningún archivo nuevo (eso lo sigue haciendo /api/media,
+      // igual que hasta ahora): esto solo crea/borra/reordena el
+      // enlace entre una imagen ya subida y un partido.
+      //
+      // Permisos (ver puedeGestionarGaleria en el bloque de roles):
+      //  - Consultar la galería de un partido: admin, fotógrafo o
+      //    redactor (el redactor no sube, pero sí necesita poder verla
+      //    para elegir imágenes al escribir una noticia, Fase 12).
+      //  - Vincular/reordenar/desvincular: admin o fotógrafo, sobre
+      //    CUALQUIER partido (no solo "los suyos"): la autoría de cada
+      //    imagen ya queda registrada en media.autor_id para el
+      //    crédito de foto (Fase 14), así que restringir además la
+      //    galería por partido no aporta nada y solo estorbaría si
+      //    varios fotógrafos cubren el mismo encuentro.
+      //  - Desvincular una imagen en concreto: además de lo anterior,
+      //    el propio fotógrafo que la vinculó siempre puede quitarla
+      //    (igual que en /api/media, aunque aquí ya no hace falta ser
+      //    admin para quitar SU PROPIO enlace).
+      const galeriaPartidoMatch = path.match(/^\/api\/results\/(\d+)\/galeria$/);
+
+      if (galeriaPartidoMatch && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarGaleria(payload) && !esRedactor(payload)) {
+          return json({ error: "No tienes acceso a la galería de partidos" }, 403);
+        }
+        const resultId = parseInt(galeriaPartidoMatch[1]);
+        const resultado = await env.DB.prepare(
+          "SELECT id, equipo_local, equipo_visitante, fecha_partido, slug FROM results WHERE id = ?"
+        ).bind(resultId).first();
+        if (!resultado) return json({ error: "Partido no encontrado" }, 404);
+        const { results } = await env.DB.prepare(
+          `SELECT mg.id, mg.orden, mg.created_at, mg.equipo,
+                  m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
+                  m.tipo, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
+           FROM match_gallery mg
+           JOIN media m ON m.id = mg.media_id
+           LEFT JOIN users u ON u.id = m.autor_id
+           WHERE mg.result_id = ?
+           ORDER BY mg.orden ASC, mg.created_at ASC`
+        ).bind(resultId).all();
+        // El link público solo tiene sentido si ya hay al menos una foto
+        // vinculada; no se genera un slug "en vacío" para un partido sin
+        // galería todavía.
+        const slug = results.length ? await slugPartidoUnico(env, resultado) : (resultado.slug || null);
+        return json({
+          galeria: results,
+          equipoLocal: resultado.equipo_local,
+          equipoVisitante: resultado.equipo_visitante,
+          slug,
+          urlPublica: slug ? `${SITIO_URL}/galeria/${slug}` : null,
+        });
+      }
+
+      if (galeriaPartidoMatch && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarGaleria(payload)) {
+          return json({ error: "Un redactor no puede gestionar la galería de un partido, solo consultarla" }, 403);
+        }
+        const resultId = parseInt(galeriaPartidoMatch[1]);
+        const resultado = await env.DB.prepare("SELECT id FROM results WHERE id = ?").bind(resultId).first();
+        if (!resultado) return json({ error: "Partido no encontrado" }, 404);
+
+        const body = await request.json().catch(() => ({}));
+        // Admite vincular una imagen sola (mediaId) o varias de golpe
+        // (mediaIds), para no obligar al frontend a hacer una llamada
+        // por cada foto al subir una tanda entera desde el panel del
+        // fotógrafo.
+        const mediaIds = Array.isArray(body.mediaIds)
+          ? body.mediaIds.map((x) => parseInt(x)).filter((x) => Number.isInteger(x))
+          : (Number.isInteger(parseInt(body.mediaId)) ? [parseInt(body.mediaId)] : []);
+        if (!mediaIds.length) return json({ error: "Falta mediaId o mediaIds" }, 400);
+        // De qué equipo son estas fotos ('local', 'visitante' o vacío
+        // para foto general), igual criterio que en POST /api/media.
+        let equipoGaleria = (body.equipo || "").toString().trim().toLowerCase();
+        if (equipoGaleria !== "local" && equipoGaleria !== "visitante") equipoGaleria = null;
+
+        // Siguiente número de orden libre, para que las imágenes nuevas
+        // se añadan al final de la galería en vez de mezclarse con las
+        // que ya estuvieran (el fotógrafo puede reordenar después con
+        // el PUT de más abajo).
+        const maxOrdenFila = await env.DB.prepare(
+          "SELECT COALESCE(MAX(orden), -1) AS max_orden FROM match_gallery WHERE result_id = ?"
+        ).bind(resultId).first();
+        let siguienteOrden = (maxOrdenFila?.max_orden ?? -1) + 1;
+
+        const vinculadas = [];
+        const errores = [];
+        for (const mediaId of mediaIds) {
+          const media = await env.DB.prepare("SELECT id FROM media WHERE id = ?").bind(mediaId).first();
+          if (!media) {
+            errores.push({ mediaId, error: "No encontrado en la mediateca" });
+            continue;
+          }
+          try {
+            await env.DB.prepare(
+              `INSERT INTO match_gallery (result_id, media_id, orden, vinculado_por_id, equipo) VALUES (?, ?, ?, ?, ?)`
+            ).bind(resultId, mediaId, siguienteOrden, payload.uid, equipoGaleria).run();
+            vinculadas.push(mediaId);
+            siguienteOrden++;
+          } catch (err) {
+            // El índice único (result_id, media_id) rechaza vincular
+            // dos veces la misma imagen al mismo partido: no es un
+            // error real, simplemente ya estaba.
+            if (/unique/i.test(err.message || "")) {
+              errores.push({ mediaId, error: "Ya estaba en la galería de este partido" });
+            } else {
+              errores.push({ mediaId, error: err.message });
+            }
+          }
+        }
+
+        if (vinculadas.length) {
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "vincular_galeria_partido", entidad: "resultado", entidad_id: resultId,
+            descripcion: `Ha añadido ${vinculadas.length} imagen${vinculadas.length === 1 ? "" : "es"} a la galería del partido #${resultId}.`,
+            detalle: { media_ids: vinculadas },
+          }));
+        }
+
+        return json({ ok: true, vinculadas, errores });
+      }
+
+      // ---------- GALERÍA DE PARTIDO: reordenar ----------
+      // Recibe el orden completo deseado como lista de ids de
+      // match_gallery (no de media), más simple que mandar deltas.
+      if (galeriaPartidoMatch && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarGaleria(payload)) {
+          return json({ error: "Un redactor no puede reordenar la galería de un partido" }, 403);
+        }
+        const resultId = parseInt(galeriaPartidoMatch[1]);
+        const body = await request.json().catch(() => ({}));
+        const orden = Array.isArray(body.orden) ? body.orden.map((x) => parseInt(x)).filter((x) => Number.isInteger(x)) : [];
+        if (!orden.length) return json({ error: "Falta el nuevo orden (lista de ids)" }, 400);
+
+        // Solo se tocan filas que de verdad pertenezcan a este partido,
+        // para que no se pueda colar el id de una fila de otra galería
+        // desde el body.
+        for (let i = 0; i < orden.length; i++) {
+          await env.DB.prepare(
+            "UPDATE match_gallery SET orden = ? WHERE id = ? AND result_id = ?"
+          ).bind(i, orden[i], resultId).run();
+        }
+        return json({ ok: true });
+      }
+
+      // ---------- GALERÍA DE PARTIDO: desvincular una imagen ----------
+      // Borra solo el enlace en match_gallery; la imagen sigue
+      // existiendo en "media" (para borrarla del todo se usa
+      // DELETE /api/media/:id, ya existente, solo accesible a admin).
+      const galeriaItemMatch = path.match(/^\/api\/match-gallery\/(\d+)$/);
+
+      // ---------- GALERÍA DE PARTIDO: cambiar el equipo de una foto ----------
+      // Permite corregir a posteriori de qué equipo es una foto ya
+      // vinculada (p. ej. si se subió sin elegir equipo, o se eligió mal),
+      // sin tener que desvincularla y volver a subirla.
+      if (galeriaItemMatch && method === "PATCH") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarGaleria(payload)) {
+          return json({ error: "Un redactor no puede editar la galería de un partido" }, 403);
+        }
+        const id = parseInt(galeriaItemMatch[1]);
+        const enlace = await env.DB.prepare("SELECT id FROM match_gallery WHERE id = ?").bind(id).first();
+        if (!enlace) return json({ error: "No encontrado" }, 404);
+        const body = await request.json().catch(() => ({}));
+        let equipoGaleria = (body.equipo || "").toString().trim().toLowerCase();
+        if (equipoGaleria !== "local" && equipoGaleria !== "visitante") equipoGaleria = null;
+        await env.DB.prepare("UPDATE match_gallery SET equipo = ? WHERE id = ?").bind(equipoGaleria, id).run();
+        return json({ ok: true });
+      }
+
+      if (galeriaItemMatch && method === "DELETE") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const id = parseInt(galeriaItemMatch[1]);
+        const enlace = await env.DB.prepare("SELECT result_id, vinculado_por_id FROM match_gallery WHERE id = ?").bind(id).first();
+        if (!enlace) return json({ error: "No encontrado" }, 404);
+        const puedeQuitar = esAdmin(payload) || enlace.vinculado_por_id === payload.uid;
+        if (!puedeQuitar) {
+          return json({ error: "Solo un administrador o quien vinculó esta imagen puede quitarla de la galería" }, 403);
+        }
+        await env.DB.prepare("DELETE FROM match_gallery WHERE id = ?").bind(id).run();
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "desvincular_galeria_partido", entidad: "resultado", entidad_id: enlace.result_id,
+          descripcion: `Ha quitado una imagen de la galería del partido #${enlace.result_id}.`,
+        }));
+        return json({ ok: true });
+      }
+
+      // ---------- GALERÍA DE PARTIDO: vista pública (Fase 2 galería) ----------
+      // Sin autenticación, a diferencia de GET /api/results/:id/galeria de
+      // arriba (que es la vista de gestión del panel). Se consulta por
+      // slug (no por id) porque es el formato de la URL pública
+      // compartible (/galeria/:slug, ver public/_worker.js). Devuelve las
+      // fotos ya agrupadas por equipo para que el frontend público solo
+      // tenga que pintar las pestañas, sin repetir esa lógica en JS.
+      const galeriaPublicaMatch = path.match(/^\/api\/results\/galeria\/([^/]+)$/);
+      if (galeriaPublicaMatch && method === "GET") {
+        const slug = decodeURIComponent(galeriaPublicaMatch[1]);
+        const resultado = await env.DB.prepare(
+          "SELECT id, equipo_local, equipo_visitante, escudo_local_url, escudo_visitante_url, goles_local, goles_visitante, penaltis_local, penaltis_visitante, fecha_partido, estado, competicion, jornada, slug FROM results WHERE slug = ?"
+        ).bind(slug).first();
+        if (!resultado) return json({ error: "Galería no encontrada" }, 404);
+        // Vista pública, sin autenticar: solo se devuelve lo marcado como
+        // "publico". Lo marcado como "privado" existe igualmente en
+        // match_gallery (para que el equipo de redacción lo siga viendo
+        // y gestionando desde el panel), pero nunca sale por aquí.
+        let filas;
+        try {
+          ({ results: filas } = await env.DB.prepare(
+            `SELECT mg.equipo, m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
+                    m.tipo, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
+             FROM match_gallery mg
+             JOIN media m ON m.id = mg.media_id
+             LEFT JOIN users u ON u.id = m.autor_id
+             WHERE mg.result_id = ? AND m.visibilidad = 'publico'
+             ORDER BY mg.orden ASC, mg.created_at ASC`
+          ).bind(resultado.id).all());
+        } catch (err) {
+          // Columna "visibilidad" aún no migrada en esta base de datos:
+          // se reintenta sin el filtro (todo se trata como público, que
+          // es el comportamiento que había antes de esta función).
+          ({ results: filas } = await env.DB.prepare(
+            `SELECT mg.equipo, m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
+                    m.tipo, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
+             FROM match_gallery mg
+             JOIN media m ON m.id = mg.media_id
+             LEFT JOIN users u ON u.id = m.autor_id
+             WHERE mg.result_id = ?
+             ORDER BY mg.orden ASC, mg.created_at ASC`
+          ).bind(resultado.id).all());
+        }
+        // Agrupado en servidor: "local"/"visitante" con su nombre de
+        // equipo ya resuelto, y "general" para fotos sin equipo asignado
+        // (p.ej. del estadio o del ambiente, no de un equipo en concreto).
+        // Un grupo con cero fotos no se incluye, así el frontend puede
+        // usar directamente Object.keys(grupos) para decidir qué
+        // pestañas mostrar.
+        const grupos = {};
+        const agregarAGrupo = (clave, nombre) => {
+          const deEseGrupo = filas.filter((f) => (f.equipo || null) === clave);
+          if (deEseGrupo.length) grupos[clave || "general"] = { nombre, fotos: deEseGrupo };
+        };
+        agregarAGrupo("local", resultado.equipo_local);
+        agregarAGrupo("visitante", resultado.equipo_visitante);
+        agregarAGrupo(null, "General");
+        return json({
+          partido: resultado,
+          totalFotos: filas.length,
+          grupos,
+        });
+      }
+
+      // ---------- GALERÍA GENERAL DEL SITIO: vista pública ----------
+      // Sin autenticación, a diferencia de GET /api/media (panel), que
+      // exige login y además solo enseña a cada redactor/fotógrafo lo
+      // suyo (o todo, si es admin). Aquí, al revés: se enseña TODO lo
+      // marcado como "publico" (igual criterio que la galería de un
+      // partido en concreto, ver galeriaPublicaMatch más arriba), sin
+      // importar quién lo subió ni a qué partido esté vinculado -es la
+      // "portada" de toda la mediateca, no la de un partido. Paginado
+      // con LIMIT+1 (se piden 25 pero se comprueba si llegó la 25) para
+      // saber si hay más sin tener que lanzar un COUNT(*) aparte.
+      if (path === "/api/media/publica" && method === "GET") {
+        const TAM_PAGINA = 24;
+        const pagina = Math.max(1, parseInt(url.searchParams.get("pagina"), 10) || 1);
+        const tipoFiltro = url.searchParams.get("tipo"); // "foto" | "video" | null (todo)
+        const offset = (pagina - 1) * TAM_PAGINA;
+
+        const condicionTipo = tipoFiltro === "foto" || tipoFiltro === "video" ? "AND m.tipo = ?" : "";
+        const bindsBase = tipoFiltro === "foto" || tipoFiltro === "video" ? [tipoFiltro] : [];
+
+        let filas;
+        try {
+          ({ results: filas } = await env.DB.prepare(
+            `SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.club, m.created_at,
+                    COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
+             FROM media m
+             LEFT JOIN users u ON u.id = m.autor_id
+             WHERE m.visibilidad = 'publico' ${condicionTipo}
+             ORDER BY m.created_at DESC LIMIT ? OFFSET ?`
+          ).bind(...bindsBase, TAM_PAGINA + 1, offset).all());
+        } catch (err) {
+          // Columna "visibilidad" aún no migrada en esta base de datos:
+          // se reintenta sin el filtro, igual criterio que en el resto
+          // de sitios que ya tocan esta columna (todo se trata como
+          // público, que es el comportamiento previo a la migración).
+          ({ results: filas } = await env.DB.prepare(
+            `SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.club, m.created_at,
+                    COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
+             FROM media m
+             LEFT JOIN users u ON u.id = m.autor_id
+             WHERE 1=1 ${condicionTipo}
+             ORDER BY m.created_at DESC LIMIT ? OFFSET ?`
+          ).bind(...bindsBase, TAM_PAGINA + 1, offset).all());
+        }
+
+        const hayMas = filas.length > TAM_PAGINA;
+        if (hayMas) filas.length = TAM_PAGINA;
+
+        // A cada foto/vídeo se le adjunta, si lo tiene, el partido al
+        // que está vinculado en match_gallery (equipos + slug), para
+        // poder ofrecer un "Ver partido" desde la galería general sin
+        // que el frontend tenga que hacer una consulta aparte por foto.
+        if (filas.length) {
+          try {
+            const { results: enlaces } = await env.DB.prepare(
+              `SELECT mg.media_id, r.equipo_local, r.equipo_visitante, r.slug
+               FROM match_gallery mg
+               JOIN results r ON r.id = mg.result_id
+               WHERE mg.media_id IN (${filas.map(() => "?").join(",")})`
+            ).bind(...filas.map((f) => f.id)).all();
+            const porMediaId = new Map(enlaces.map((e) => [e.media_id, e]));
+            for (const f of filas) {
+              const e = porMediaId.get(f.id);
+              if (e && e.slug) {
+                f.partido = { equipo_local: e.equipo_local, equipo_visitante: e.equipo_visitante, slug: e.slug };
+              }
+            }
+          } catch (err) {
+            console.error("No se pudo cargar el partido vinculado de la galería general (se continúa sin ese dato):", err.message);
+          }
+        }
+
+        return json({ media: filas, pagina, hayMas });
+      }
+
+      // ---------- GALERÍA/IMÁGENES DE UNA NOTICIA (article_media, Fase 12) ----------
+      // Consulta lo que ya se vinculó a una noticia (para pintarlo en el
+      // editor, Fase 13, o en la noticia pública, Fase 14). No hace falta
+      // endpoint aparte para vincular: se manda junto con el resto del
+      // formulario en POST/PUT /api/articles (ver sincronizarArticleMedia).
+      const articuloMediaMatch = path.match(/^\/api\/articles\/(\d+)\/media$/);
+      if (articuloMediaMatch && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const articleId = parseInt(articuloMediaMatch[1]);
+        let results;
+        try {
+          ({ results } = await env.DB.prepare(
+            `SELECT am.id, am.orden, m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
+                    m.tipo, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre, m.portada_segundo, m.portada_foco
+             FROM article_media am
+             JOIN media m ON m.id = am.media_id
+             LEFT JOIN users u ON u.id = m.autor_id
+             WHERE am.article_id = ?
+             ORDER BY am.orden ASC`
+          ).bind(articleId).all());
+        } catch (err) {
+          // portada_segundo / portada_foco son columnas añadidas por
+          // migraciones manuales: si aún no se han ejecutado en esta base
+          // de datos, se reintenta sin ellas en vez de romper la consulta.
+          ({ results } = await env.DB.prepare(
+            `SELECT am.id, am.orden, m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
+                    m.tipo, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
+             FROM article_media am
+             JOIN media m ON m.id = am.media_id
+             LEFT JOIN users u ON u.id = m.autor_id
+             WHERE am.article_id = ?
+             ORDER BY am.orden ASC`
+          ).bind(articleId).all());
+        }
+        return json({ media: results });
       }
 
       // ---------- ARTICLES: lista pública / creación ----------
@@ -7732,6 +8834,9 @@ async function handlePrimary(request, env, ctx) {
       if (desactivarBannerMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede gestionar el banner de última hora" }, 403);
+        }
         const id = parseInt(desactivarBannerMatch[1], 10);
         const articulo = await env.DB.prepare("SELECT autor_id, coautor_id FROM articles WHERE id = ?").bind(id).first();
         if (!articulo) return json({ error: "Noticia no encontrada" }, 404);
@@ -7775,8 +8880,11 @@ async function handlePrimary(request, env, ctx) {
         if (admin) {
           // La vista "admin" incluye borradores no publicados, así que
           // exige un token válido; si no lo hay, se trata como pública.
+          // Un fotógrafo tampoco tiene acceso a este listado editorial
+          // (no gestiona noticias/crónicas/artículos), así que para él
+          // también se degrada a la vista pública.
           const payload = await requireAuth(request, env);
-          if (!payload) admin = false;
+          if (!payload || !puedeGestionarContenidoEditorial(payload)) admin = false;
         }
 
         // Columnas necesarias para tarjetas/listados. Se mantiene
@@ -7791,7 +8899,7 @@ async function handlePrimary(request, env, ctx) {
         // a tener contenido, sin transferir el HTML entero.
         let query = `SELECT id, slug, titulo, subtitulo, contenido, tipo, categoria, categorias_adicionales, club, imagen_url, imagenes,
             resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado,
-            estado_borrador, programado_para, slug_congelado, fecha_publicacion, created_at, updated_at,
+            estado_borrador, programado_para, fecha_preferencia_desde, fecha_preferencia_hasta, slug_congelado, fecha_publicacion, created_at, updated_at,
             titulo_eu, LENGTH(contenido_eu) AS contenido_eu_len,
             titulo_ca, LENGTH(contenido_ca) AS contenido_ca_len,
             titulo_gl, LENGTH(contenido_gl) AS contenido_gl_len,
@@ -7851,6 +8959,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/articles" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede crear noticias, crónicas ni artículos" }, 403);
+        }
         const body = await request.json();
         if (!body.titulo || !body.contenido) return json({ error: "Faltan campos obligatorios" }, 400);
 
@@ -7899,6 +9010,14 @@ async function handlePrimary(request, env, ctx) {
         const estadoBorrador = body.publicado === false && !programadoPara
           ? (body.estado_borrador === "terminado" ? "terminado" : "en_proceso")
           : null;
+
+        // Preferencia de publicación del REDACTOR: rango de fechas (día,
+        // sin hora) puramente orientativo que puede acompañar al borrador
+        // cuando se marca como "terminado", para que quien lo revise
+        // sepa en qué días conviene publicarlo. Solo aplica junto a un
+        // borrador "terminado" (si no se guarda como terminado, o si se
+        // publica/programa directamente, no tiene sentido conservarla).
+        const preferenciaFechas = normalizarPreferenciaFechas(estadoBorrador === "terminado" ? body : null);
 
         // Un borrador guardado como "en proceso" (todavía se está
         // escribiendo) no tiene por qué cumplir los límites de longitud:
@@ -8020,23 +9139,28 @@ async function handlePrimary(request, env, ctx) {
         const puedeActivarBanner = payload.rol === "admin" || nivelUsuario >= 2;
         const activarBanner = puedeActivarBanner && body.banner_urgente === true;
 
-        await env.DB.prepare(
-          `INSERT INTO articles (slug, titulo, subtitulo, contenido, tipo, categoria, categorias_adicionales, club, imagen_url, imagenes, resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado, estado_borrador, programado_para, slug_congelado, fecha_publicacion, updated_at,
+        const filaArticuloCreado = await env.DB.prepare(
+          `INSERT INTO articles (slug, titulo, subtitulo, contenido, tipo, categoria, categorias_adicionales, club, imagen_url, imagenes, resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado, estado_borrador, programado_para, fecha_preferencia_desde, fecha_preferencia_hasta, slug_congelado, fecha_publicacion, updated_at,
             titulo_eu, subtitulo_eu, contenido_eu, titulo_ca, subtitulo_ca, contenido_ca, titulo_gl, subtitulo_gl, contenido_gl, titulo_en, subtitulo_en, contenido_en, origin_write_id, ficha_tecnica, banner_urgente, banner_urgente_hasta)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${calcularBannerUrgenteHasta(activarBanner)})`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${calcularBannerUrgenteHasta(activarBanner)}) RETURNING id`
         ).bind(
           slug, body.titulo, body.subtitulo || null, body.contenido,
           body.tipo || "noticia", categoriaFinal, categoriasAdicionales.length ? JSON.stringify(categoriasAdicionales) : null, clubFinal,
           imagenPortada, imagenes.length ? JSON.stringify(imagenes) : null, resultadoId,
           autorId, autorNombre, coautorId, coautorNombre,
-          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, slugCongelado,
+          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, preferenciaFechas.desde, preferenciaFechas.hasta, slugCongelado,
           programadoPara || body.fecha_publicacion || new Date().toISOString(),
           traducciones.titulo_eu, traducciones.subtitulo_eu, traducciones.contenido_eu,
           traducciones.titulo_ca, traducciones.subtitulo_ca, traducciones.contenido_ca,
           traducciones.titulo_gl, traducciones.subtitulo_gl, traducciones.contenido_gl,
           traducciones.titulo_en, traducciones.subtitulo_en, traducciones.contenido_en,
           origenWriteId, fichaTecnica, activarBanner ? 1 : 0
-        ).run();
+        ).first();
+
+        // Fase 12: galería/imágenes sueltas vinculadas a la noticia (aparte
+        // de "imagenes", que van dentro del propio texto). Solo se guarda
+        // algo si el redactor mandó media_ids y/o galeria_resultado_id.
+        await sincronizarArticleMedia(env, filaArticuloCreado.id, body);
 
         const publicado = body.publicado !== false;
         const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista" }[body.tipo] || "Artículo";
@@ -8070,9 +9194,10 @@ async function handlePrimary(request, env, ctx) {
           // no confundirlo con una publicacion real. Si el redactor ha
           // dicho que todavía la está escribiendo ("en_proceso") no se
           // manda ningún correo, para no generar avisos de más.
+          const textoPreferenciaFechas = formatearPreferenciaFechasEmail(preferenciaFechas);
           ctx.waitUntil(enviarEmailNotificacion(env, {
             asunto: `Nuevo borrador terminado: ${body.titulo}`,
-            texto: `${payload.nombre} ha guardado el borrador "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmado por ${firmaAutores}, marcándolo como terminado. Todavía no está publicado.`,
+            texto: `${payload.nombre} ha guardado el borrador "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmado por ${firmaAutores}, marcándolo como terminado. Todavía no está publicado.${textoPreferenciaFechas ? ` Preferencia de fecha del redactor: ${textoPreferenciaFechas}.` : ""}`,
             html: plantillaEmail({
               etiqueta: "Borrador terminado",
               titulo: body.titulo,
@@ -8081,6 +9206,7 @@ async function handlePrimary(request, env, ctx) {
                 { etiqueta: "Autor", valor: firmaAutores },
                 { etiqueta: "Guardado por", valor: payload.nombre },
                 { etiqueta: "Categoría", valor: clubArticuloLegible(clubFinal) || body.categoria },
+                ...(textoPreferenciaFechas ? [{ etiqueta: "Preferencia de fecha", valor: textoPreferenciaFechas }] : []),
               ],
             }),
           }));
@@ -8093,7 +9219,7 @@ async function handlePrimary(request, env, ctx) {
             : `Ha ${publicado ? "publicado" : "guardado el borrador de"} "${tipoLabel.toLowerCase()}": "${body.titulo}"${estadoBorrador ? ` (${estadoBorrador === "terminado" ? "terminado" : "en proceso"})` : ""}${esUltimaHora ? " (Última hora)" : ""}`,
         }));
 
-        return json({ ok: true, slug, publicado, estado_borrador: estadoBorrador, programado_para: programadoPara, avisos_traduccion: avisosTraduccion });
+        return json({ ok: true, slug, publicado, estado_borrador: estadoBorrador, programado_para: programadoPara, fecha_preferencia_desde: preferenciaFechas.desde, fecha_preferencia_hasta: preferenciaFechas.hasta, avisos_traduccion: avisosTraduccion });
       }
 
       // ---------- ARTICLE individual ----------
@@ -8235,6 +9361,34 @@ async function handlePrimary(request, env, ctx) {
           }
           article.resultado = datosPartido.resultado;
           article.alineaciones = datosPartido.alineaciones;
+          // Enlace a la galería pública del partido: a diferencia del
+          // modal de "Resultados" (GET /api/results/:id, más abajo), en
+          // la crónica SIEMPRE se quiere invitar a la galería aunque
+          // todavía no tenga fotos subidas, para animar a fotógrafos y
+          // aficionados a visitarla/rellenarla. Por eso aquí ya no se
+          // condiciona url_galeria a que exista al menos una foto: se
+          // genera (y persiste) el slug del partido de todas formas.
+          // galeria_disponible sí distingue si ya hay fotos reales, para
+          // que el frontend pueda variar el texto/aspecto de la llamada
+          // a la acción ("Ver galería" vs "Sé el primero en verla"/"aún
+          // sin fotos"). foto_portada_galeria (primera foto por orden)
+          // permite pintar una miniatura real en vez de un icono
+          // genérico cuando ya hay contenido. No se guarda nada de esto
+          // dentro de "datosPartido" (que sí se cachea en KV) porque la
+          // galería puede recibir fotos nuevas en cualquier momento y no
+          // queremos servir un estado desactualizado durante todo el TTL
+          // del resto del marcador.
+          if (article.resultado) {
+            const portada = await env.DB.prepare(
+              `SELECT m.cloudinary_url AS cloudinary_url
+               FROM match_gallery mg JOIN media m ON m.id = mg.media_id
+               WHERE mg.result_id = ? AND m.tipo = 'foto'
+               ORDER BY mg.orden ASC, mg.created_at ASC LIMIT 1`
+            ).bind(article.resultado_id).first();
+            article.resultado.url_galeria = `${SITIO_URL}/galeria/${await slugPartidoUnico(env, article.resultado)}`;
+            article.resultado.galeria_disponible = !!portada;
+            article.resultado.foto_portada_galeria = portada ? portada.cloudinary_url : null;
+          }
         } else {
           article.resultado = null;
           // Sin partido vinculado, las alineaciones (si las hay) son
@@ -8242,6 +9396,37 @@ async function handlePrimary(request, env, ctx) {
           // sentido cachearlas aquí: no sufren el mismo problema de
           // volumen que las ligadas a un partido con tráfico público alto.
           article.alineaciones = await obtenerAlineaciones(env, "article_id", article.id);
+        }
+
+        // Fase 14: galería de fotos del fotógrafo vinculada a esta noticia
+        // (tabla puente article_media, ver Fase 12/13). Se adjunta aquí,
+        // en el mismo endpoint público que ya sirve la noticia, para no
+        // añadir una segunda petición en cada carga -es tráfico público,
+        // igual que el resto de este endpoint. El crédito se construye
+        // con el autor real de la foto (autor_nombre de la tabla media,
+        // normalmente el fotógrafo que la subió), no con el autor de la
+        // noticia, para que quede bien atribuida.
+        if (article.id) {
+          const { results: mediaArticulo } = await env.DB.prepare(
+            `SELECT am.orden, m.id AS media_id, m.cloudinary_url, m.descripcion,
+                    m.tipo, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
+             FROM article_media am
+             JOIN media m ON m.id = am.media_id
+             LEFT JOIN users u ON u.id = m.autor_id
+             WHERE am.article_id = ?
+             ORDER BY am.orden ASC`
+          ).bind(article.id).all();
+          article.galeria_fotografo = (mediaArticulo || [])
+            .filter((m) => m.tipo !== "video")
+            .map((m) => ({
+              url: m.cloudinary_url,
+              foco: "50% 50%",
+              credito: m.autor_nombre || null,
+              autor_id: m.autor_id || null,
+              descripcion: m.descripcion || null,
+            }));
+        } else {
+          article.galeria_fotografo = [];
         }
 
         return json({ article });
@@ -8366,6 +9551,9 @@ async function handlePrimary(request, env, ctx) {
       if (articleMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede editar noticias, crónicas ni artículos" }, 403);
+        }
         const id = parseInt(articleMatch[1]);
 
         // Solo el autor (o coautor, o un admin, o alguien con una
@@ -8444,6 +9632,10 @@ async function handlePrimary(request, env, ctx) {
         const estadoBorrador = body.publicado === false && !programadoPara
           ? (body.estado_borrador === "terminado" ? "terminado" : "en_proceso")
           : null;
+
+        // Preferencia de publicación del redactor (ver mismo criterio al
+        // crear, más arriba).
+        const preferenciaFechas = normalizarPreferenciaFechas(estadoBorrador === "terminado" ? body : null);
 
         // Un borrador "en proceso" no tiene por qué cumplir los límites de
         // longitud todavía (ver mismo criterio al crear la noticia).
@@ -8622,7 +9814,7 @@ async function handlePrimary(request, env, ctx) {
         }
 
         await env.DB.prepare(
-          `UPDATE articles SET slug=?, titulo=?, subtitulo=?, contenido=?, tipo=?, categoria=?, categorias_adicionales=?, club=?, imagen_url=?, imagenes=?, resultado_id=?, autor_id=?, autor_nombre=?, coautor_id=?, coautor_nombre=?, destacado=?, publicado=?, estado_borrador=?, programado_para=?, slug_congelado=?, fecha_publicacion=?, updated_at=datetime('now'),
+          `UPDATE articles SET slug=?, titulo=?, subtitulo=?, contenido=?, tipo=?, categoria=?, categorias_adicionales=?, club=?, imagen_url=?, imagenes=?, resultado_id=?, autor_id=?, autor_nombre=?, coautor_id=?, coautor_nombre=?, destacado=?, publicado=?, estado_borrador=?, programado_para=?, fecha_preferencia_desde=?, fecha_preferencia_hasta=?, slug_congelado=?, fecha_publicacion=?, updated_at=datetime('now'),
             titulo_eu=?, subtitulo_eu=?, contenido_eu=?, titulo_ca=?, subtitulo_ca=?, contenido_ca=?, titulo_gl=?, subtitulo_gl=?, contenido_gl=?, titulo_en=?, subtitulo_en=?, contenido_en=?, ficha_tecnica=?, banner_urgente=?${bannerUrgenteHastaSQL !== null ? `, banner_urgente_hasta=${bannerUrgenteHastaSQL}` : ""}
            WHERE id=?`
         ).bind(
@@ -8630,7 +9822,7 @@ async function handlePrimary(request, env, ctx) {
           categoriaFinal, categoriasAdicionales.length ? JSON.stringify(categoriasAdicionales) : null, clubFinal || null, imagenPortada,
           imagenes.length ? JSON.stringify(imagenes) : null, resultadoId,
           autorId, autorNombre, coautorId, coautorNombre,
-          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, slugCongeladoFinal,
+          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, preferenciaFechas.desde, preferenciaFechas.hasta, slugCongeladoFinal,
           fechaPublicacionFinal,
           traducciones.titulo_eu, traducciones.subtitulo_eu, traducciones.contenido_eu,
           traducciones.titulo_ca, traducciones.subtitulo_ca, traducciones.contenido_ca,
@@ -8639,6 +9831,12 @@ async function handlePrimary(request, env, ctx) {
           fichaTecnica, bannerUrgenteFinal, id
         ).run();
         await registrarRedirectSiCambia(env, id, articuloParaPermiso.slug, slug);
+
+        // Fase 12: igual que al crear, sincroniza la galería/imágenes
+        // sueltas vinculadas a la noticia si el redactor mandó media_ids
+        // y/o galeria_resultado_id; si no manda ninguno de los dos, deja
+        // la que ya hubiera guardada tal cual.
+        await sincronizarArticleMedia(env, id, body);
 
         // Si esta edición vincula por primera vez la noticia a un
         // partido (no lo tenía antes y ahora sí), cualquier alineación
@@ -8678,9 +9876,10 @@ async function handlePrimary(request, env, ctx) {
         if (body.publicado === false && estadoBorrador === "terminado" && !yaEstabaTerminado) {
           const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista" }[body.tipo] || "Artículo";
           const firmaAutores = coautorNombre ? `${autorNombre} y ${coautorNombre}` : autorNombre;
+          const textoPreferenciaFechas = formatearPreferenciaFechasEmail(preferenciaFechas);
           ctx.waitUntil(enviarEmailNotificacion(env, {
             asunto: `Borrador terminado: ${body.titulo}`,
-            texto: `${payload.nombre} ha editado y marcado como terminado el borrador "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmado por ${firmaAutores}. Todavía no está publicado.`,
+            texto: `${payload.nombre} ha editado y marcado como terminado el borrador "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmado por ${firmaAutores}. Todavía no está publicado.${textoPreferenciaFechas ? ` Preferencia de fecha del redactor: ${textoPreferenciaFechas}.` : ""}`,
             html: plantillaEmail({
               etiqueta: "Borrador terminado",
               titulo: body.titulo,
@@ -8689,6 +9888,7 @@ async function handlePrimary(request, env, ctx) {
                 { etiqueta: "Autor", valor: firmaAutores },
                 { etiqueta: "Guardado por", valor: payload.nombre },
                 { etiqueta: "Categoría", valor: clubArticuloLegible(clubFinal) || body.categoria },
+                ...(textoPreferenciaFechas ? [{ etiqueta: "Preferencia de fecha", valor: textoPreferenciaFechas }] : []),
               ],
             }),
           }));
@@ -8698,12 +9898,15 @@ async function handlePrimary(request, env, ctx) {
           accion: "editar_articulo", entidad: "articulo", entidad_id: id,
           descripcion: `Ha editado la noticia/crónica "${body.titulo}"${estadoBorrador ? ` (${estadoBorrador === "terminado" ? "borrador terminado" : "borrador en proceso"})` : ""}${esEdicionAjenaPorNivel4 ? " (revisión de contenido ajeno, Nivel 4)" : ""}`,
         }));
-        return json({ ok: true, slug, publicado: body.publicado === false ? 0 : 1, estado_borrador: estadoBorrador, programado_para: programadoPara, avisos_traduccion: avisosTraduccion });
+        return json({ ok: true, slug, publicado: body.publicado === false ? 0 : 1, estado_borrador: estadoBorrador, programado_para: programadoPara, fecha_preferencia_desde: preferenciaFechas.desde, fecha_preferencia_hasta: preferenciaFechas.hasta, avisos_traduccion: avisosTraduccion });
       }
 
       if (articleMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede borrar noticias, crónicas ni artículos" }, 403);
+        }
         const id = parseInt(articleMatch[1]);
         const articuloBorrado = await env.DB.prepare("SELECT titulo, autor_id, coautor_id FROM articles WHERE id = ?").bind(id).first();
         if (!articuloBorrado) return json({ error: "Noticia no encontrada" }, 404);
@@ -8756,6 +9959,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/edit-requests" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no gestiona solicitudes de edición de contenido" }, 403);
+        }
         // Sin filtro: un admin ve todas. Un redactor ve solo las que ha
         // hecho él, o las que le tocaría aprobar (porque es el autor
         // original de la entidad en cuestión).
@@ -8846,6 +10052,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/edit-requests" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede solicitar edición de contenido editorial" }, 403);
+        }
         const body = await request.json();
         const tipoEntidad = body.tipo_entidad === "resultado" ? "resultado" : "articulo";
         const entidadId = parseInt(body.entidad_id, 10);
@@ -10699,6 +11908,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/results" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede crear resultados" }, 403);
+        }
         const body = await request.json();
         if (body.estado && !ESTADOS_RESULTADO_VALIDOS.includes(body.estado)) {
           return json({ error: "Estado no válido" }, 400);
@@ -10820,11 +12032,25 @@ async function handlePrimary(request, env, ctx) {
            ORDER BY fecha_publicacion DESC LIMIT 5`
         ).bind(id).all();
         resultado.noticias_vinculadas = noticiasVinculadas || [];
+        // Enlace a la galería pública del partido (Fase 2 galería), solo
+        // si ya tiene al menos una foto vinculada: igual criterio que en
+        // GET /api/results/:id/galeria (panel), no se genera un slug "en
+        // vacío" para un partido sin galería todavía, ni se ofrece un
+        // enlace que llevaría a una página sin fotos.
+        const hayGaleria = await env.DB.prepare(
+          "SELECT 1 FROM match_gallery WHERE result_id = ? LIMIT 1"
+        ).bind(id).first();
+        resultado.url_galeria = hayGaleria
+          ? `${SITIO_URL}/galeria/${await slugPartidoUnico(env, resultado)}`
+          : null;
         return json({ resultado });
       }
       if (resultMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede editar resultados" }, 403);
+        }
         const id = parseInt(resultMatch[1]);
         const resultadoParaPermiso = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(id).first();
         if (!resultadoParaPermiso) return json({ error: "Resultado no encontrado" }, 404);
@@ -10941,6 +12167,9 @@ async function handlePrimary(request, env, ctx) {
       if (resultMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede eliminar resultados" }, 403);
+        }
         const id = parseInt(resultMatch[1]);
         const resultadoBorrado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(id).first();
         if (!resultadoBorrado) return json({ error: "Resultado no encontrado" }, 404);
@@ -10987,6 +12216,9 @@ async function handlePrimary(request, env, ctx) {
       if (resultMvpMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede marcar el MVP de un partido" }, 403);
+        }
         const id = parseInt(resultMvpMatch[1]);
         const resultado = await env.DB.prepare("SELECT autor_id, equipo_local, equipo_visitante FROM results WHERE id = ?").bind(id).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
@@ -11039,6 +12271,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/alineaciones" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede gestionar alineaciones" }, 403);
+        }
         const body = await request.json();
         const articleId = body.article_id ? parseInt(body.article_id, 10) : null;
         const resultId = body.result_id ? parseInt(body.result_id, 10) : null;
@@ -11084,6 +12319,9 @@ async function handlePrimary(request, env, ctx) {
       if (alineacionMatch && (method === "PUT" || method === "DELETE")) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede gestionar alineaciones" }, 403);
+        }
         const id = parseInt(alineacionMatch[1]);
         const alineacion = await env.DB.prepare("SELECT * FROM alineaciones WHERE id = ?").bind(id).first();
         if (!alineacion) return json({ error: "Alineación no encontrada" }, 404);
@@ -11145,6 +12383,9 @@ async function handlePrimary(request, env, ctx) {
       if (cronometroMatch && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede gestionar el cronómetro del minuto a minuto" }, 403);
+        }
         const resultadoId = parseInt(cronometroMatch[1]);
         const resultado = await env.DB.prepare("SELECT autor_id, fecha_partido FROM results WHERE id = ?").bind(resultadoId).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
@@ -11673,6 +12914,9 @@ async function handlePrimary(request, env, ctx) {
       if (eventosMatch && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede editar los eventos de un partido" }, 403);
+        }
         const resultadoId = parseInt(eventosMatch[1]);
         const resultado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(resultadoId).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
@@ -11773,6 +13017,9 @@ async function handlePrimary(request, env, ctx) {
       if (eventoMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede editar los eventos de un partido" }, 403);
+        }
         const resultadoId = parseInt(eventoMatch[1]);
         const eventoId = parseInt(eventoMatch[2]);
         const resultado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(resultadoId).first();
@@ -11811,6 +13058,9 @@ async function handlePrimary(request, env, ctx) {
       if (eventoMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede eliminar los eventos de un partido" }, 403);
+        }
         const resultadoId = parseInt(eventoMatch[1]);
         const eventoId = parseInt(eventoMatch[2]);
         const resultado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(resultadoId).first();

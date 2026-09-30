@@ -36,63 +36,6 @@ function aSqliteDatetimeUTC(fecha) {
   return fecha.toISOString().slice(0, 19).replace("T", " ");
 }
 
-// Valida y normaliza el rango "fecha_preferencia_desde"/"...hasta" que
-// puede mandar un redactor, opcionalmente, al marcar su borrador como
-// "terminado" (ver estado_borrador): una sugerencia de en qué días (y,
-// opcionalmente, a qué hora) le gustaría que se publicase la noticia,
-// puramente informativa para quien la revise. Solo se guardan si "body"
-// no es null (el llamador ya ha comprobado que el borrador se está
-// marcando como "terminado": si no, se descartan sin más, ver más abajo
-// dónde se llama a esta función).
-// Formato: "YYYY-MM-DD" (fecha simple, sin hora, "todo el día" -
-// compatible con lo guardado antes de añadir la hora) o
-// "YYYY-MM-DDTHH:MM" (con hora opcional, la que manda un
-// <input type="datetime-local"> del panel). Se valida con una expresión
-// regular estricta en vez de fiarse de "new Date(...)", que aceptaría
-// cosas ambiguas.
-// Reglas:
-//  - Las dos son opcionales; se puede mandar solo "desde" (sin límite
-//    superior), o ninguna de las dos.
-//  - Si se manda "hasta" sin "desde", se descarta "hasta" (no tiene
-//    sentido un rango solo con límite superior).
-//  - Si "hasta" es anterior (o igual) a "desde", se descarta "hasta"
-//    (rango invertido: se conserva "desde" igualmente, no se rechaza
-//    todo el guardado del artículo por esto). La comparación es de
-//    texto (mismo formato, mismo orden cronológico), salvo que solo una
-//    de las dos lleve hora: entonces se compara solo la parte de fecha,
-//    para no descartar por ejemplo "hasta" = mismo día con hora si
-//    "desde" es ese mismo día sin hora.
-function normalizarPreferenciaFechas(body) {
-  const esValida = (v) => typeof v === "string"
-    && /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$/.test(v)
-    && !Number.isNaN(new Date(`${v.includes("T") ? v : v + "T00:00"}:00Z`).getTime());
-  if (!body) return { desde: null, hasta: null };
-  const desde = esValida(body.fecha_preferencia_desde) ? body.fecha_preferencia_desde : null;
-  let hasta = esValida(body.fecha_preferencia_hasta) ? body.fecha_preferencia_hasta : null;
-  if (!desde) hasta = null;
-  else if (hasta) {
-    const soloFecha = (v) => v.slice(0, 10);
-    const comparable = (v) => (v.includes("T") && desde.includes("T")) ? v : soloFecha(v);
-    if (comparable(hasta) <= comparable(desde)) hasta = null;
-  }
-  return { desde, hasta };
-}
-
-// Formatea el rango { desde, hasta } de normalizarPreferenciaFechas como
-// texto legible en español (DD/MM/AAAA o DD/MM/AAAA a las HH:MM) para
-// el email que avisa a la redacción de que un borrador está
-// "terminado". Devuelve null si no hay preferencia (no se añade nada al
-// email en ese caso).
-function formatearPreferenciaFechasEmail({ desde, hasta } = {}) {
-  if (!desde) return null;
-  const legible = (v) => {
-    const [fecha, hora] = v.split("T");
-    const [a, m, d] = fecha.split("-");
-    return hora ? `${d}/${m}/${a} a las ${hora}` : `${d}/${m}/${a}`;
-  };
-  return hasta ? `entre el ${legible(desde)} y el ${legible(hasta)}` : `a partir del ${legible(desde)}`;
-}
-
 // Convierte una fecha guardada por SQLite o un ISO string al formato
 // RFC-822 que exige la especificación RSS 2.0 para <pubDate>
 // (p.ej. "Tue, 18 Aug 2026 10:00:00 GMT"). Si no hay fecha o no se
@@ -161,15 +104,11 @@ function fechaPartidoAUtcSqlite(fechaPartido) {
 }
 
 // Whitelist de orígenes permitidos para CORS: solo el dominio de
-// producción (con y sin "www", por si algún día se activa un redirect
-// en vez de forzarlo a nivel DNS/Cloudflare) y localhost en varios
-// puertos habituales, para poder probar el frontend en local contra la
-// API real sin tener que relajar esto a "*". Antes se devolvía "*" para
-// cualquier origen, lo que permite que CUALQUIER web ajena llame a esta
-// API directamente desde el navegador de un visitante (con su sesión,
-// si la tuviera) y lea la respuesta; con la whitelist, un origen que no
-// esté aquí simplemente no recibe cabecera Access-Control-Allow-Origin
-// y el navegador bloquea la lectura de la respuesta en ese origen.
+// producción (con y sin "www") y localhost en varios puertos habituales
+// de desarrollo. Antes se devolvía "*" para cualquier origen. Esta copia
+// de index.js corre dentro de Railway (ver server-railway.js), que ya
+// aplica su propia whitelist vía el middleware cors() de Hono; esto es
+// una segunda capa por si esta función se invoca fuera de ese flujo.
 const ORIGENES_PERMITIDOS = [
   "https://elotrofutbol.media",
   "https://www.elotrofutbol.media",
@@ -185,23 +124,15 @@ function origenPermitido(origin) {
   return !!origin && ORIGENES_PERMITIDOS.includes(origin);
 }
 
+let ORIGEN_PETICION_ACTUAL = null;
+
 function cors(resp, origin) {
-  // Solo se refleja el origen si está en la whitelist; si no lo está (o
-  // no hay cabecera Origin, como en peticiones sin CORS: curl, server a
-  // server...), no se manda Access-Control-Allow-Origin y el navegador
-  // bloqueará la lectura de la respuesta desde ese origen ajeno.
-  if (origenPermitido(origin)) {
-    resp.headers.set("Access-Control-Allow-Origin", origin);
-    // Necesario en cuanto Access-Control-Allow-Origin deja de ser fijo
-    // ("*") y pasa a depender del Origin de cada petición: le dice a
-    // cualquier caché (Cloudflare, el propio navegador, un proxy
-    // intermedio) que no sirva a un origen la respuesta CORS calculada
-    // para otro, o dos pestañas en distintos orígenes podrían acabar
-    // compartiendo por caché una respuesta con el Allow-Origin de la
-    // otra.
+  const efectivo = origin !== undefined ? origin : ORIGEN_PETICION_ACTUAL;
+  if (origenPermitido(efectivo)) {
+    resp.headers.set("Access-Control-Allow-Origin", efectivo);
     resp.headers.set("Vary", "Origin");
   }
-  resp.headers.set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  resp.headers.set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   resp.headers.set("Access-Control-Allow-Headers", "Content-Type,Authorization");
   // Sin esto, el JavaScript del navegador no puede leer estas cabeceras
   // aunque viajen en la respuesta: por defecto, fetch() en un origen
@@ -215,16 +146,6 @@ function cors(resp, origin) {
   resp.headers.set("Access-Control-Expose-Headers", "X-Failover-Backend,X-Failover-Test,X-Failover-Reason,X-Data-Staleness-Ms,X-Data-Staleness-Stale,X-Data-Staleness-Warning");
   return resp;
 }
-// Origen (cabecera Origin) de la petición que se está gestionando ahora
-// mismo, fijado al principio de fetch() para que json() y el resto de
-// sitios que llaman a cors() sin pasar el request explícitamente (hay
-// más de 40 en este archivo) puedan seguir haciéndolo sin cambiar su
-// firma. Cloudflare Workers no comparten esta variable de módulo entre
-// peticiones concurrentes: cada invocación de fetch() corre en su propio
-// contexto aislado, así que no hay riesgo de que una petición vea el
-// origen de otra.
-let ORIGEN_PETICION_ACTUAL = null;
-
 function json(data, status = 200) {
   return cors(new Response(JSON.stringify(data), {
     status,
@@ -234,7 +155,7 @@ function json(data, status = 200) {
     // esta cabecera el marcador/estado podían quedarse "pegados" al primer
     // valor que se pidió, aunque los eventos sí se actualizaran.
     headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
-  }), ORIGEN_PETICION_ACTUAL);
+  }));
 }
 
 // ---------- Utils crypto ----------
@@ -260,20 +181,6 @@ function randomSalt() {
   const arr = new Uint8Array(16);
   crypto.getRandomValues(arr);
   return bufToHex(arr.buffer);
-}
-
-// Codifica un ArrayBuffer (p. ej. el resultado de crypto.subtle.digest)
-// en base64url (RFC 4648 §5: como base64 normal pero con "-"/"_" en vez
-// de "+"/"/", y sin "=" de relleno al final). Usado para el
-// "code_challenge" de PKCE en el login con X (ver
-// /api/readers/x/iniciar): no había ningún helper de codificación en
-// este archivo, solo de decodificación (b64urlDecode/b64urlDecodeTexto
-// más abajo, que hacen justo lo contrario).
-function base64urlDeHash(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let binario = "";
-  for (const byte of bytes) binario += String.fromCharCode(byte);
-  return btoa(binario).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 // ---------- Traducciones de artículos ----------
@@ -355,15 +262,7 @@ function conIdiomasDisponibles(article) {
       idiomas_disponibles.push(idioma);
     }
   }
-  return {
-    ...article,
-    idiomas_disponibles,
-    imagen_foco: focoDePortada(article),
-    // Se expone ya como array (en vez del JSON en texto guardado en la
-    // columna) para que el panel y la web no tengan que parsearlo cada
-    // vez; ver parsearCategoriasAdicionales.
-    categorias_adicionales: parsearCategoriasAdicionales(article.categorias_adicionales),
-  };
+  return { ...article, idiomas_disponibles, imagen_foco: focoDePortada(article) };
 }
 
 // El foco de recorte ("qué parte de la foto no se debe recortar nunca")
@@ -440,277 +339,6 @@ function escapeHtmlEmail(str) {
   return String(str ?? "")
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-}
-
-// ---------- Widgets embebibles para lectores ----------
-// Nombres legibles de competición para los widgets (no existe ya un mapeo
-// de esto en el backend; categoriaLabel() en public/js/config.js es para
-// categorías editoriales de artículos, no para competiciones).
-const NOMBRE_COMPETICION_WIDGET = {
-  hypermotion: "LaLiga Hypermotion",
-  primera_federacion: "Primera Federación",
-  segunda_federacion: "Segunda Federación",
-};
-
-function nombreCompeticionWidget(comp) {
-  return NOMBRE_COMPETICION_WIDGET[comp] || comp;
-}
-
-// Cabecera/pie común a los 4 widgets: fuente del sistema (nada de Google
-// Fonts u otro recurso externo, para que el widget cargue rápido y sin
-// depender de terceros dentro del iframe de un sitio ajeno), tema
-// claro/oscuro vía ?tema=oscuro, y un script mínimo que informa al
-// documento padre de la altura real del contenido (postMessage) para que
-// la web que lo embebe pueda ajustar el alto del <iframe> sin scroll
-// interno ni recortes. escucha "resize" del propio iframe (p.ej. si una
-// imagen tarda en cargar y cambia el alto) además del alto inicial.
-function widgetBaseHtml({ tema, tituloPagina, cuerpo, origen }) {
-  const oscuro = tema === "oscuro";
-  const bg = oscuro ? "#0c1420" : "#ffffff";
-  const fg = oscuro ? "#e8ebf0" : "#0c1b2e";
-  const fgSuave = oscuro ? "#9aa4b2" : "#5a6472";
-  const borde = oscuro ? "#22303f" : "#e6e9ee";
-  const acento = "#d1132e";
-  const filaAlterna = oscuro ? "#101a28" : "#f7f8fa";
-  return `<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex">
-<title>${escapeHtmlEmail(tituloPagina)}</title>
-<style>
-  :root { color-scheme: ${oscuro ? "dark" : "light"}; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 10px 12px 12px;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    background: ${bg}; color: ${fg};
-  }
-  a { color: inherit; }
-  .eof-w-cab {
-    display: flex; align-items: center; justify-content: space-between;
-    margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid ${borde};
-  }
-  .eof-w-marca {
-    display: flex; align-items: center; gap: 6px;
-    font-size: 11.5px; font-weight: 800; letter-spacing: .3px;
-    text-decoration: none; color: ${fg};
-  }
-  .eof-w-marca span.eof-w-punto { color: ${acento}; }
-  .eof-w-titulo { font-size: 13px; font-weight: 700; color: ${fgSuave}; }
-  .eof-w-tabla { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-  .eof-w-tabla th {
-    text-align: left; font-size: 10.5px; text-transform: uppercase;
-    letter-spacing: .04em; color: ${fgSuave}; font-weight: 700;
-    padding: 4px 6px; border-bottom: 1px solid ${borde};
-  }
-  .eof-w-tabla td { padding: 5px 6px; border-bottom: 1px solid ${borde}; vertical-align: middle; }
-  .eof-w-tabla tr:nth-child(even) td { background: ${filaAlterna}; }
-  .eof-w-equipo { display: flex; align-items: center; gap: 6px; font-weight: 600; }
-  .eof-w-escudo { width: 16px; height: 16px; object-fit: contain; flex-shrink: 0; }
-  .eof-w-pts { font-weight: 800; text-align: center; }
-  .eof-w-num { text-align: center; color: ${fgSuave}; }
-  .eof-w-partido {
-    display: flex; align-items: center; justify-content: space-between;
-    gap: 8px; padding: 7px 4px; border-bottom: 1px solid ${borde}; font-size: 12.5px;
-  }
-  .eof-w-partido:last-child { border-bottom: none; }
-  .eof-w-eq { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }
-  .eof-w-eq.eof-w-eq-der { justify-content: flex-end; text-align: right; }
-  .eof-w-eq span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .eof-w-marcador {
-    font-weight: 800; font-size: 13px; padding: 2px 8px; border-radius: 6px;
-    background: ${oscuro ? "#1a2534" : "#f0f2f5"}; white-space: nowrap; min-width: 46px; text-align: center;
-  }
-  .eof-w-marcador.eof-w-vivo { background: ${acento}; color: #fff; }
-  .eof-w-hora { font-size: 11px; color: ${fgSuave}; white-space: nowrap; min-width: 46px; text-align: center; }
-  .eof-w-vacio { padding: 18px 4px; text-align: center; color: ${fgSuave}; font-size: 12.5px; }
-  .eof-w-noticia-img { width: 100%; height: auto; display: block; border-radius: 8px; margin-bottom: 8px; }
-  .eof-w-noticia-titulo { font-size: 15px; font-weight: 800; line-height: 1.3; margin: 0 0 4px; }
-  .eof-w-noticia-titulo a { text-decoration: none; }
-  .eof-w-noticia-titulo a:hover { text-decoration: underline; }
-  .eof-w-noticia-resumen { font-size: 12.5px; color: ${fgSuave}; line-height: 1.4; margin: 0; }
-  .eof-w-pie { margin-top: 8px; text-align: right; }
-  .eof-w-pie a { font-size: 10.5px; color: ${fgSuave}; text-decoration: none; }
-  .eof-w-pie a:hover { text-decoration: underline; }
-</style>
-</head>
-<body>
-  <div class="eof-w-cab">
-    <a class="eof-w-marca" href="${origen}/" target="_blank" rel="noopener">EL OTRO<span class="eof-w-punto">FÚTBOL</span></a>
-    <span class="eof-w-titulo">${escapeHtmlEmail(tituloPagina)}</span>
-  </div>
-  ${cuerpo}
-  <div class="eof-w-pie"><a href="${origen}/" target="_blank" rel="noopener">elotrofutbol.media →</a></div>
-<script>
-  // Comunica al documento padre la altura real del widget para que pueda
-  // ajustar el alto del iframe (sin esto, un iframe con altura fija deja
-  // scroll interno o espacio vacío según cuánto contenido haya). No asume
-  // ninguna librería de terceros: un mensaje postMessage simple que la
-  // web anfitriona puede escuchar si quiere auto-ajustar, o ignorar si
-  // prefiere fijar su propia altura.
-  function eofWidgetNotificarAltura() {
-    var altura = document.body.scrollHeight;
-    try { window.parent.postMessage({ eofWidget: true, altura: altura }, "*"); } catch (e) {}
-  }
-  window.addEventListener("load", eofWidgetNotificarAltura);
-  window.addEventListener("resize", eofWidgetNotificarAltura);
-  if (window.ResizeObserver) {
-    new ResizeObserver(eofWidgetNotificarAltura).observe(document.body);
-  } else {
-    setTimeout(eofWidgetNotificarAltura, 400);
-  }
-</script>
-</body>
-</html>`;
-}
-
-function widgetHtmlResponse(html) {
-  return new Response(html, {
-    status: 200,
-    headers: {
-      "Content-Type": "text/html; charset=UTF-8",
-      // Cacheado corto en el borde de Cloudflare: son páginas públicas sin
-      // datos personalizados, así que un CDN cache de 60s reduce mucho la
-      // carga a D1 si un widget se embebe en una web con tráfico alto, sin
-      // que el marcador en vivo se quede notablemente desactualizado.
-      "Cache-Control": "public, max-age=60",
-      // Deliberadamente SIN X-Frame-Options / Content-Security-Policy
-      // frame-ancestors restrictiva: el objetivo explícito de esta ruta es
-      // que otras webs la carguen dentro de un <iframe>.
-    },
-  });
-}
-
-async function widgetsRouter(path, url, env) {
-  const tema = url.searchParams.get("tema") === "oscuro" ? "oscuro" : "claro";
-  const origen = "https://elotrofutbol.media";
-
-  if (path === "/widgets/clasificacion") {
-    const competicion = url.searchParams.get("competicion") || "hypermotion";
-    if (!NOMBRE_COMPETICION_WIDGET[competicion]) {
-      return widgetHtmlResponse(widgetBaseHtml({
-        tema, origen, tituloPagina: "Clasificación",
-        cuerpo: `<div class="eof-w-vacio">Competición no válida.</div>`,
-      }));
-    }
-    const gruposConTabla = await obtenerClasificacionesPorGrupo(env, competicion);
-    const grupoParam = url.searchParams.get("grupo");
-    const elegido = grupoParam
-      ? gruposConTabla.find((g) => g.grupo === grupoParam) || gruposConTabla[0]
-      : gruposConTabla[0];
-    let cuerpo;
-    if (!elegido || !elegido.tabla.length) {
-      cuerpo = `<div class="eof-w-vacio">Todavía no hay clasificación disponible.</div>`;
-    } else {
-      // Tope de 10 filas: un widget embebido es para un vistazo rápido, no
-      // para sustituir la página completa de clasificación (que sí enlaza
-      // el pie de esta tarjeta).
-      const filas = elegido.tabla.slice(0, 10).map((f, i) => `
-        <tr>
-          <td class="eof-w-num">${i + 1}</td>
-          <td>
-            <div class="eof-w-equipo">
-              ${f.escudoUrl ? `<img class="eof-w-escudo" src="${escapeHtmlEmail(f.escudoUrl)}" alt="" loading="lazy">` : ""}
-              <span>${escapeHtmlEmail(f.equipo)}</span>
-            </div>
-          </td>
-          <td class="eof-w-num">${f.pj}</td>
-          <td class="eof-w-num">${f.gf - f.gc >= 0 ? "+" : ""}${f.gf - f.gc}</td>
-          <td class="eof-w-pts">${f.pts}</td>
-        </tr>`).join("");
-      cuerpo = `<table class="eof-w-tabla">
-        <thead><tr><th>#</th><th>Equipo</th><th class="eof-w-num">PJ</th><th class="eof-w-num">DG</th><th class="eof-w-pts">Pts</th></tr></thead>
-        <tbody>${filas}</tbody>
-      </table>`;
-    }
-    return widgetHtmlResponse(widgetBaseHtml({
-      tema, origen,
-      tituloPagina: nombreCompeticionWidget(competicion) + (elegido && elegido.grupo ? ` · ${elegido.grupo}` : ""),
-      cuerpo,
-    }));
-  }
-
-  if (path === "/widgets/resultados" || path === "/widgets/calendario") {
-    const esCalendario = path === "/widgets/calendario";
-    const competicion = url.searchParams.get("competicion");
-    const club = url.searchParams.get("club");
-    let query = "SELECT equipo_local, equipo_visitante, goles_local, goles_visitante, estado, fecha_partido, escudo_local_url, escudo_visitante_url, finalizado_no_cubierto FROM results WHERE 1=1 AND finalizado_no_cubierto = 0";
-    const binds = [];
-    if (competicion) { query += " AND competicion = ?"; binds.push(competicion); }
-    if (club) { query += " AND (equipo_local = ? OR equipo_visitante = ?)"; binds.push(club, club); }
-    if (esCalendario) {
-      query += " AND estado = 'programado' ORDER BY fecha_partido ASC LIMIT 8";
-    } else {
-      query += " AND estado IN ('finalizado','en_juego') ORDER BY fecha_partido DESC LIMIT 8";
-    }
-    const { results: partidos } = await env.DB.prepare(query).bind(...binds).all();
-    let cuerpo;
-    if (!partidos.length) {
-      cuerpo = `<div class="eof-w-vacio">${esCalendario ? "No hay próximos partidos programados." : "Todavía no hay resultados."}</div>`;
-    } else {
-      const filas = partidos.map((p) => {
-        const fecha = p.fecha_partido ? new Date(p.fecha_partido) : null;
-        const fechaTexto = fecha && !isNaN(fecha.getTime())
-          ? fecha.toLocaleDateString("es-ES", { day: "2-digit", month: "2-digit" }) + " " + fecha.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })
-          : "Por confirmar";
-        let marcadorHtml;
-        if (p.estado === "en_juego") {
-          marcadorHtml = `<span class="eof-w-marcador eof-w-vivo">${p.goles_local ?? 0}-${p.goles_visitante ?? 0}</span>`;
-        } else if (p.estado === "finalizado") {
-          marcadorHtml = `<span class="eof-w-marcador">${p.goles_local ?? 0}-${p.goles_visitante ?? 0}</span>`;
-        } else {
-          marcadorHtml = `<span class="eof-w-hora">${fechaTexto}</span>`;
-        }
-        return `<div class="eof-w-partido">
-          <div class="eof-w-eq">
-            ${p.escudo_local_url ? `<img class="eof-w-escudo" src="${escapeHtmlEmail(p.escudo_local_url)}" alt="" loading="lazy">` : ""}
-            <span>${escapeHtmlEmail(p.equipo_local)}</span>
-          </div>
-          ${marcadorHtml}
-          <div class="eof-w-eq eof-w-eq-der">
-            <span>${escapeHtmlEmail(p.equipo_visitante)}</span>
-            ${p.escudo_visitante_url ? `<img class="eof-w-escudo" src="${escapeHtmlEmail(p.escudo_visitante_url)}" alt="" loading="lazy">` : ""}
-          </div>
-        </div>`;
-      }).join("");
-      cuerpo = `<div>${filas}</div>`;
-    }
-    return widgetHtmlResponse(widgetBaseHtml({
-      tema, origen,
-      tituloPagina: esCalendario ? "Próximos partidos" : "Resultados",
-      cuerpo,
-    }));
-  }
-
-  if (path === "/widgets/noticia") {
-    const categoria = url.searchParams.get("categoria");
-    const club = url.searchParams.get("club");
-    let query = `SELECT slug, titulo, subtitulo, contenido, categoria, imagen_url, fecha_publicacion
-      FROM articles WHERE publicado = 1`;
-    const binds = [];
-    if (categoria) { query += " AND categoria = ?"; binds.push(categoria); }
-    if (club) { query += " AND (club = ? OR club LIKE ?)"; binds.push(club, `%"${club}"%`); }
-    query += " ORDER BY fecha_publicacion DESC LIMIT 1";
-    const articulo = await env.DB.prepare(query).bind(...binds).first();
-    let cuerpo;
-    if (!articulo) {
-      cuerpo = `<div class="eof-w-vacio">No hay noticias disponibles.</div>`;
-    } else {
-      const resumen = articulo.subtitulo || (articulo.contenido || "").replace(/<[^>]+>/g, "").slice(0, 140);
-      const urlNoticia = `${origen}/futbol/${encodeURIComponent(articulo.categoria)}/${encodeURIComponent(articulo.slug)}`;
-      cuerpo = `
-        ${articulo.imagen_url ? `<a href="${urlNoticia}" target="_blank" rel="noopener"><img class="eof-w-noticia-img" src="${escapeHtmlEmail(articulo.imagen_url)}" alt="" loading="lazy"></a>` : ""}
-        <p class="eof-w-noticia-titulo"><a href="${urlNoticia}" target="_blank" rel="noopener">${escapeHtmlEmail(articulo.titulo)}</a></p>
-        <p class="eof-w-noticia-resumen">${escapeHtmlEmail(resumen)}${resumen.length >= 140 ? "…" : ""}</p>`;
-    }
-    return widgetHtmlResponse(widgetBaseHtml({
-      tema, origen, tituloPagina: "Última noticia", cuerpo,
-    }));
-  }
-
-  return new Response("Widget no encontrado", { status: 404, headers: { "Content-Type": "text/plain; charset=UTF-8" } });
 }
 
 // Página de mantenimiento temporal (ver "MODO MANTENIMIENTO TEMPORAL" en
@@ -854,10 +482,7 @@ function paginaMantenimiento(horaHasta, desdeISO) {
 // una lista de datos clave (autor, club, etc.) y un botón de acción.
 // Todo con estilos en línea (tablas) porque así es como hay que maquetar
 // para que se vea bien en Gmail, Outlook, etc.
-// bloqueHtml (opcional): HTML ya construido y ya escapado por quien llama
-// (p. ej. el resumen de partidos sin cubrir, agrupado por tipo). Se pinta
-// entre las filas y el botón, con el mismo ancho que el resto.
-function plantillaEmail({ etiqueta, titulo, filas = [], parrafo, boton, bloqueHtml }) {
+function plantillaEmail({ etiqueta, titulo, filas = [], parrafo, boton }) {
   const filasHtml = filas
     .filter((f) => f && f.valor)
     .map(
@@ -907,12 +532,6 @@ function plantillaEmail({ etiqueta, titulo, filas = [], parrafo, boton, bloqueHt
               <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;background:#eef1f5;border-radius:8px;padding:14px 16px;">
                 ${filasHtml}
               </table>
-            </td>
-          </tr>` : ""}
-          ${bloqueHtml ? `
-          <tr>
-            <td style="padding:14px 28px 0;">
-              ${bloqueHtml}
             </td>
           </tr>` : ""}
           <tr>
@@ -1347,7 +966,7 @@ async function obtenerResultadosDestacadosBoletin(env, desde) {
   const { results } = await env.DB.prepare(
     `SELECT competicion, grupo, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido
      FROM results
-     WHERE estado = 'finalizado' AND finalizado_no_cubierto = 0 AND fecha_partido >= ?
+     WHERE estado = 'finalizado' AND fecha_partido >= ?
        AND goles_local IS NOT NULL AND goles_visitante IS NOT NULL
      ORDER BY fecha_partido DESC LIMIT 6`
   ).bind(desde).all();
@@ -1398,86 +1017,12 @@ function urlNoticia(categoria, slug) {
   return `${SITIO_URL}/futbol/${categoriaUrlSlug(categoria)}/${encodeURIComponent(slug)}`;
 }
 
-// ---------- Cuentas de Resend: principal + secundaria (respaldo) ----------
-// El plan gratis de Resend tiene un tope diario/mensual de correos. Cuando
-// la cuenta principal se queda sin cupo (o falla), los envíos pasan solos a
-// una segunda cuenta de Resend. La secundaria es OPCIONAL: sin
-// RESEND_API_KEY_2 todo funciona exactamente como antes.
-//   Principal:   RESEND_API_KEY    (+ RESEND_FROM   opcional)
-//   Secundaria:  RESEND_API_KEY_2  + RESEND_FROM_2 (los DOS son obligatorios para activarla)
-// OJO: un dominio solo puede estar activo en UNA cuenta de Resend a la vez,
-// así que el remitente de la secundaria (RESEND_FROM_2) tiene que usar otro
-// dominio/subdominio verificado en esa cuenta (p. ej. mail2.elotrofutbol.media).
-const REMITENTE_RESEND_POR_DEFECTO = "ELOTROFÚTBOLTV <notificaciones@elotrofutbol.media>";
-// Si la principal responde "cupo agotado", durante un rato se salta directamente
-// a la secundaria (en vez de probar la principal en cada correo, p. ej. en el
-// boletín con muchos suscriptores). Solo vive mientras dure este isolate.
-let RESEND_PRINCIPAL_AGOTADA_HASTA = 0;
-
-let AVISO_RESEND_SIN_FROM_2_MOSTRADO = false;
-function cuentasResend(env) {
-  const cuentas = [];
-  if (env.RESEND_API_KEY) {
-    cuentas.push({ clave: env.RESEND_API_KEY, from: env.RESEND_FROM || REMITENTE_RESEND_POR_DEFECTO });
-  }
-  // La secundaria SOLO se activa si tiene su propio remitente (RESEND_FROM_2):
-  // como un dominio solo puede estar activo en una cuenta de Resend, si se
-  // reutilizase el remitente de la principal, la secundaria fallaría siempre
-  // con 403 (dominio no verificado en esa cuenta) y no serviría de respaldo.
-  if (env.RESEND_API_KEY_2 && env.RESEND_FROM_2) {
-    cuentas.push({ clave: env.RESEND_API_KEY_2, from: env.RESEND_FROM_2 });
-  } else if (env.RESEND_API_KEY_2 && !AVISO_RESEND_SIN_FROM_2_MOSTRADO) {
-    AVISO_RESEND_SIN_FROM_2_MOSTRADO = true;
-    console.warn("Resend: RESEND_API_KEY_2 está definida pero falta RESEND_FROM_2; la cuenta secundaria NO se usa (necesita un remitente de otro dominio verificado en esa cuenta)");
-  }
-  return cuentas;
-}
-
-// ¿El fallo es de LA CUENTA (sin cupo, límite de ritmo, clave rechazada,
-// dominio no verificado en esa cuenta o caída del servicio)? Entonces
-// merece la pena probar con la otra. Si el problema es el propio correo
-// (400/422: destinatario o datos inválidos) fallaría igual en la otra.
-function esFalloDeCuentaResend(status) {
-  return status === 401 || status === 403 || status === 429 || status >= 500;
-}
-
-// Envía un correo por Resend con respaldo automático. `payload` lleva
-// to/subject/text/html (el "from" lo pone cada cuenta). Devuelve la Response
-// de Resend (la de la última cuenta probada) o null si no hay ninguna cuenta
-// configurada; lanza el error de red solo si fallan todas las cuentas.
-async function enviarConResend(env, payload) {
-  const cuentas = cuentasResend(env);
-  if (!cuentas.length) return null;
-  const ahora = Date.now();
-  const candidatas = cuentas.length > 1 && ahora < RESEND_PRINCIPAL_AGOTADA_HASTA ? cuentas.slice(1) : cuentas;
-  for (let i = 0; i < candidatas.length; i++) {
-    const cuenta = candidatas[i];
-    const hayOtra = i < candidatas.length - 1;
-    try {
-      const resp = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${cuenta.clave}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ from: cuenta.from, ...payload }),
-      });
-      if (resp.ok || !hayOtra || !esFalloDeCuentaResend(resp.status)) return resp;
-      const cuerpo = await resp.clone().text();
-      if (cuenta === cuentas[0] && /quota_exceeded/i.test(cuerpo)) {
-        RESEND_PRINCIPAL_AGOTADA_HASTA = ahora + 30 * 60 * 1000; // 30 min
-      }
-      console.warn(`Resend: la cuenta con remitente "${cuenta.from}" no puede enviar (${resp.status}); se prueba con la siguiente. ${cuerpo}`);
-    } catch (err) {
-      if (!hayOtra) throw err;
-      console.warn(`Resend: error de red con la cuenta "${cuenta.from}" (${err.message}); se prueba con la siguiente`);
-    }
-  }
-}
-
 // Envía el boletín a todos los suscriptores activos vía Resend, en
 // lotes (la API de Resend admite varios destinatarios por llamada, pero
 // se agrupan en lotes moderados para no depender de un límite exacto
 // que pueda cambiar). Un fallo enviando un lote no interrumpe el resto.
 async function enviarBoletinALista(env, { destinatarios, articulos, clasificaciones = [], resultadosDestacados = [], encuestas = [] }) {
-  if (!cuentasResend(env).length) {
+  if (!env.RESEND_API_KEY) {
     console.log("RESEND_API_KEY no configurado: boletín semanal omitido");
     return;
   }
@@ -1492,10 +1037,18 @@ async function enviarBoletinALista(env, { destinatarios, articulos, clasificacio
       lote.map(async (s) => {
         const bajaUrl = `${API_URL}/api/newsletter/baja?token=${encodeURIComponent(s.baja_token)}`;
         try {
-          const resp = await enviarConResend(env, {
-            to: [s.email],
-            subject: "Tu resumen semanal de ELOTROFÚTBOLTV",
-            html: plantillaNewsletter({ articulos, bajaUrl, clasificaciones, resultadosDestacados, encuestas }),
+          const resp = await fetch("https://api.resend.com/emails", {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${env.RESEND_API_KEY}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              from: env.RESEND_FROM || "ELOTROFÚTBOLTV <notificaciones@elotrofutbol.media>",
+              to: [s.email],
+              subject: "Tu resumen semanal de ELOTROFÚTBOLTV",
+              html: plantillaNewsletter({ articulos, bajaUrl, clasificaciones, resultadosDestacados, encuestas }),
+            }),
           });
           if (!resp.ok) {
             console.log("Error enviando boletín a", s.email, resp.status, await resp.text());
@@ -1575,28 +1128,32 @@ async function enviarBoletinSemanalSiToca(env) {
 }
 
 async function enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario } = {}) {
-  if (!cuentasResend(env).length) {
+  if (!env.RESEND_API_KEY) {
     console.log("RESEND_API_KEY no configurado: aviso por email omitido ->", asunto);
-    return false;
+    return;
   }
   try {
-    const resp = await enviarConResend(env, {
-      to: [destinatario || EMAIL_NOTIFICACIONES],
-      subject: asunto,
-      text: texto,
-      html: html || undefined,
+    const resp = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: env.RESEND_FROM || "ELOTROFÚTBOLTV <notificaciones@elotrofutbol.media>",
+        to: [destinatario || EMAIL_NOTIFICACIONES],
+        subject: asunto,
+        text: texto,
+        html: html || undefined,
+      }),
     });
-    if (!resp || !resp.ok) {
-      console.log("Error al enviar email de notificación:", resp && resp.status, resp ? await resp.text() : "");
-      return false;
+    if (!resp.ok) {
+      console.log("Error al enviar email de notificación:", resp.status, await resp.text());
     }
-    return true;
   } catch (err) {
     console.log("Error al enviar email de notificación:", err.message);
-    return false;
   }
 }
-
 // ---------- Equipos de un usuario (hasta 3 clubes) ----------
 // Se guardan en la columna "equipo" como un array JSON en texto, p. ej.
 // '["Real Madrid","FC Barcelona"]'. Antes era un unico club en texto
@@ -1659,7 +1216,6 @@ function clubArticuloLegible(valorClub) {
   const clubes = parsearClubArticulo(valorClub);
   return clubes.join(" - ");
 }
-
 // Construye el valor a guardar en la columna "club" a partir de los dos
 // equipos de un resultado vinculado (previa/crónica). Siempre devuelve
 // el array JSON de 2 clubes, incluso si por algún motivo vinieran
@@ -1670,176 +1226,33 @@ function clubArticuloDesdeResultado(equipoLocal, equipoVisitante) {
     .map((c) => c.trim());
   return clubes.length ? JSON.stringify(clubes) : null;
 }
-
-// Resuelve el valor final a guardar en "club" (y, para previa/crónica,
-// también en "categoria") para un artículo, según su tipo. Para
-// "previa" y "cronica" ni el club ni la categoría los elige ya el
-// redactor a mano en el panel (ver Fase 2 y Fase 3): ambos se derivan
-// siempre del resultado vinculado (los dos equipos, y la competición
-// del partido), así que hace falta un resultado_id válido con ambos
-// equipos y competición. Además, el estado del partido debe encajar con
-// el tipo: una crónica solo tiene sentido de un partido "finalizado", y
-// una previa solo de uno que todavía no se ha jugado ("programado" o
-// "retrasado"); esto evita crónicas de partidos que no han terminado y
-// previas de partidos ya jugados, incluso si alguien manda la petición
-// a mano saltándose la comprobación del panel (ver también
-// errorEstadoResultadoParaTipo en public/admin/js/admin.js, que hace la
-// misma comprobación en el frontend). Para el resto de tipos (noticia,
-// análisis, opinión, entrevista) el comportamiento no cambia: se guarda
-// tal cual el club que venga en el body (un único nombre, o vacío/null
-// para "General"), y la categoría se resuelve aparte (ver
-// validarCategoriaSegunAutor). Devuelve { error } si es previa/crónica
-// sin resultado vinculado (o sin competición, o con un estado
-// incompatible), o { club, categoria } con los valores finales listos
-// para el INSERT/UPDATE (categoria es undefined para el resto de tipos,
-// ya que ahí la decide validarCategoriaSegunAutor).
+// Resuelve el valor final a guardar en "club" para un artículo, según su
+// tipo. Para "previa" y "cronica" el club ya no lo elige el redactor a
+// mano en el panel (ver Fase 2): se deriva siempre de los dos equipos
+// del resultado vinculado, así que hace falta un resultado_id válido y
+// con ambos equipos. Para el resto de tipos (noticia, análisis, opinión,
+// entrevista) el comportamiento no cambia: se guarda tal cual el club
+// que venga en el body (un único nombre, o vacío/null para "General").
+// Devuelve { error } si es previa/crónica sin resultado vinculado, o
+// { club } con el valor final (string simple, o el array JSON de 2
+// clubes) listo para el INSERT/UPDATE.
 async function resolverClubArticulo(env, tipo, resultadoId, clubBody) {
   if (tipo !== "previa" && tipo !== "cronica") {
     return { club: clubBody || null };
   }
   if (!resultadoId) {
-    return { error: "Una previa o crónica debe tener un resultado vinculado para poder guardarse (el club y la categoría se toman automáticamente del partido)." };
+    return { error: "Una previa o crónica debe tener un resultado vinculado para poder guardarse (el club se toma automáticamente de los dos equipos del partido)." };
   }
-  const resultado = await env.DB.prepare("SELECT equipo_local, equipo_visitante, competicion, estado FROM results WHERE id = ?")
+  const resultado = await env.DB.prepare("SELECT equipo_local, equipo_visitante FROM results WHERE id = ?")
     .bind(resultadoId).first();
   if (!resultado) {
     return { error: "El resultado vinculado ya no existe. Elige de nuevo el partido." };
-  }
-  if (tipo === "cronica" && resultado.estado !== "finalizado") {
-    return { error: "No puedes guardar una crónica de un partido que todavía no ha terminado." };
-  }
-  if (tipo === "previa" && resultado.estado !== "programado" && resultado.estado !== "retrasado") {
-    return { error: "No puedes guardar una previa de un partido que ya ha terminado o está en juego." };
   }
   const club = clubArticuloDesdeResultado(resultado.equipo_local, resultado.equipo_visitante);
   if (!club) {
     return { error: "El resultado vinculado no tiene los dos equipos definidos." };
   }
-  if (!resultado.competicion) {
-    return { error: "El resultado vinculado no tiene competición definida." };
-  }
-  return { club, categoria: resultado.competicion };
-}
-
-// ---------- Redactores "sin equipo, con categoría(s) fija(s)" ----------
-// Categorías que un admin puede fijar para este tipo de redactor:
-// "Arbitraje" y "Jurisdicción deportiva"; si en el futuro se añaden
-// más, basta con añadirlas aquí.
-const CATEGORIAS_FIJAS_VALIDAS = ["arbitraje", "jurisdiccion"];
-
-// Igual que parsearEquipos(): convierte el JSON en texto guardado en
-// "categorias_fijas" a un array de strings. [] si no tiene ninguna.
-function parsearCategoriasFijas(valor) {
-  if (!valor) return [];
-  try {
-    const parsed = JSON.parse(valor);
-    if (Array.isArray(parsed)) return parsed.filter((c) => typeof c === "string" && c.trim()).map((c) => c.trim());
-  } catch {
-    if (typeof valor === "string" && valor.trim()) return [valor.trim()];
-  }
-  return [];
-}
-
-// Valida la lista de "categorias_fijas" recibida del panel: cada valor
-// debe estar en CATEGORIAS_FIJAS_VALIDAS, sin duplicados. Un array vacío
-// (o vacío/null/undefined) significa "redactor normal, sin categoría
-// fija". Devuelve { error } o { categoriasFijas } con el array ya limpio
-// (puede ser []).
-function validarCategoriasFijas(valorRecibido) {
-  let lista = [];
-  if (Array.isArray(valorRecibido)) {
-    lista = valorRecibido;
-  } else if (typeof valorRecibido === "string" && valorRecibido.trim()) {
-    lista = [valorRecibido];
-  } else if (valorRecibido === undefined || valorRecibido === null || valorRecibido === "") {
-    return { categoriasFijas: [] };
-  }
-  const limpios = [...new Set(lista.filter((c) => typeof c === "string" && c.trim()).map((c) => c.trim()))];
-  const noValidos = limpios.filter((c) => !CATEGORIAS_FIJAS_VALIDAS.includes(c));
-  if (noValidos.length) return { error: `Categoría fija no válida: ${noValidos.join(", ")}` };
-  return { categoriasFijas: limpios };
-}
-
-// Si el autor final de una noticia (el que la firma, no necesariamente
-// quien la sube: ver "autor_id" en POST/PUT /api/articles) tiene alguna
-// "categoría fija" asignada, la categoría de la noticia tiene que ser
-// una de esas. Se aplica igual cuando es el propio redactor quien sube
-// su noticia que cuando un admin la sube en su nombre eligiéndolo como
-// autor: lo que importa es de quién queda firmada, no quién la sube.
-// Devuelve { error } si no cumple, o { categoria } con la categoría ya
-// validada (o forzada a la única fija disponible, si aplica).
-function validarCategoriaSegunAutor(categoriasFijasAutor, categoriaRecibida) {
-  if (!categoriasFijasAutor || !categoriasFijasAutor.length) {
-    return { categoria: categoriaRecibida || "hypermotion" };
-  }
-  if (categoriasFijasAutor.length === 1) {
-    // Con una sola categoría fija, queda fija de facto: no hace falta
-    // que el formulario la mande bien, se fuerza siempre.
-    return { categoria: categoriasFijasAutor[0] };
-  }
-  if (!categoriaRecibida || !categoriasFijasAutor.includes(categoriaRecibida)) {
-    return { error: `La categoría de esta noticia debe ser una de las categorías fijas del autor: ${categoriasFijasAutor.join(", ")}.` };
-  }
-  return { categoria: categoriaRecibida };
-}
-
-// ---------- Categoría(s) adicional(es) de una noticia ----------
-// Todas las categorías que puede tener una noticia (principal o
-// adicional). Coincide con el desplegable "Categoría" del panel (ver
-// public/js/config.js, CATEGORIES) más "arbitraje" y "jurisdiccion"
-// (solo llegan a través de las categorías fijas de un redactor de ese
-// tipo).
-const CATEGORIAS_ARTICULO_VALIDAS = ["hypermotion", "primera_federacion", "segunda_federacion", "general", "amistoso", "arbitraje", "jurisdiccion"];
-const MAX_CATEGORIAS_ADICIONALES = 4;
-
-// Igual que parsearEquipos()/parsearCategoriasFijas(): convierte el JSON
-// en texto guardado en "categorias_adicionales" a un array de strings.
-// [] si no tiene ninguna.
-function parsearCategoriasAdicionales(valor) {
-  if (!valor) return [];
-  try {
-    const parsed = JSON.parse(valor);
-    if (Array.isArray(parsed)) return parsed.filter((c) => typeof c === "string" && c.trim()).map((c) => c.trim());
-  } catch {
-    if (typeof valor === "string" && valor.trim()) return [valor.trim()];
-  }
-  return [];
-}
-
-// Valida la lista de "categorias_adicionales" recibida del panel contra
-// la categoría principal ya decidida (categoriaPrincipal) y, si el autor
-// tiene categoría(s) fija(s), también contra esas (mismo criterio que la
-// propia categoría principal: ver validarCategoriaSegunAutor). Quita
-// duplicados y la propia principal si se hubiera colado, y limita a
-// MAX_CATEGORIAS_ADICIONALES. Devuelve { error } o { categoriasAdicionales }
-// con el array ya limpio (puede ser []).
-function validarCategoriasAdicionales(valorRecibido, categoriaPrincipal, categoriasFijasAutor) {
-  let lista = [];
-  if (Array.isArray(valorRecibido)) {
-    lista = valorRecibido;
-  } else if (typeof valorRecibido === "string" && valorRecibido.trim()) {
-    lista = [valorRecibido];
-  } else if (valorRecibido === undefined || valorRecibido === null || valorRecibido === "") {
-    return { categoriasAdicionales: [] };
-  }
-  const limpios = [...new Set(
-    lista.filter((c) => typeof c === "string" && c.trim()).map((c) => c.trim())
-  )].filter((c) => c !== categoriaPrincipal);
-  const noValidos = limpios.filter((c) => !CATEGORIAS_ARTICULO_VALIDAS.includes(c));
-  if (noValidos.length) return { error: `Categoría adicional no válida: ${noValidos.join(", ")}.` };
-  if (limpios.length > MAX_CATEGORIAS_ADICIONALES) {
-    return { error: `Puedes seleccionar como máximo ${MAX_CATEGORIAS_ADICIONALES} categorías adicionales.` };
-  }
-  // Un redactor con categoría(s) fija(s) también queda restringido a
-  // esas mismas categorías para las adicionales (no puede etiquetar una
-  // noticia con una categoría fuera de las suyas).
-  if (categoriasFijasAutor && categoriasFijasAutor.length) {
-    const fueraDeFijas = limpios.filter((c) => !categoriasFijasAutor.includes(c));
-    if (fueraDeFijas.length) {
-      return { error: `Las categorías adicionales de esta noticia deben estar entre las categorías fijas del autor: ${categoriasFijasAutor.join(", ")}.` };
-    }
-  }
-  return { categoriasAdicionales: limpios };
+  return { club };
 }
 
 // ---------- "Última hora": PIN de 4 dígitos único y compartido ----------
@@ -1881,21 +1294,15 @@ async function comprobarUltimaHora(env, pinRecibido) {
 }
 
 // ---------- Banner flotante de "última hora" (distinto del PIN de arriba) ----------
-// Esto es la marca visual (banner rojo fijo en toda la web) que un
-// admin/redactor activa a mano desde el panel para una noticia
-// concreta. Nada que ver con "ultima_hora_pin" (que es un permiso de
-// publicación directa para redactores de Nivel 1); por eso usa un
-// nombre de columna distinto (banner_urgente) para no confundir los
-// dos conceptos.
+// Ver el comentario gemelo en worker/src/index.js: esto es la marca
+// visual (banner rojo fijo en toda la web), no el PIN de publicación
+// directa. Nombre de columna distinto (banner_urgente) para no
+// confundir los dos conceptos.
 //
-// La duración SIEMPRE se calcula en el servidor (nunca se acepta un
-// valor mandado por el cliente): así nadie puede alargar a mano, desde
-// el panel, cuánto tiempo estará el banner activo.
-// En minutos (no horas): worker-secondary/src/sql-compat.js traduce
-// SQLite -> Postgres para el failover a Railway, y solo tiene patrón de
+// En minutos (no horas): sql-compat.js traduce SQLite -> Postgres para
+// las consultas que llegan aquí por failover, y solo tiene patrón de
 // traducción ya hecho para "+N minutes" / "+N days" en
-// datetime('now', ...), no para "hours". Usar minutos aquí evita tener
-// que tocar también ese traductor para añadir un caso nuevo.
+// datetime('now', ...), no para "hours".
 const BANNER_URGENTE_DURACION_MINUTOS = 120; // 2 horas
 function calcularBannerUrgenteHasta(activar) {
   return activar ? `datetime('now', '+${BANNER_URGENTE_DURACION_MINUTOS} minutes')` : "NULL";
@@ -1927,17 +1334,8 @@ function generatePassword(length = 10) {
 }
 
 // ---------- JWT (HS256) ----------
-// btoa() solo admite caracteres Latin1: cualquier nombre de perfil con
-// tildes, emojis o caracteres no-ASCII (frecuente en nombres de X,
-// Discord, Google...) lo rompe con "btoa() can only operate on
-// characters in the Latin1 range" en cuanto entra en el payload del
-// JWT (ver b64urlJSON más abajo). Se codifica primero a bytes UTF-8 con
-// TextEncoder y se pasan esos bytes a btoa() carácter a carácter, en
-// vez del string original -- mismo patrón ya usado para las
-// credenciales de X en el intercambio de token.
 function b64url(str) {
-  const bytesUtf8 = new TextEncoder().encode(str);
-  return btoa(String.fromCharCode(...bytesUtf8)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 function b64urlJSON(obj) {
   return b64url(JSON.stringify(obj));
@@ -1958,19 +1356,21 @@ function b64urlDecodeTexto(str) {
   const bytes = Uint8Array.from(binario, (c) => c.charCodeAt(0));
   return new TextDecoder("utf-8").decode(bytes);
 }
-// ---------- Firma RS256 (para el JWT de cuenta de servicio de Google) ----------
-// Distinto de signHS256 (arriba, HS256 con secreto compartido, usado
-// para nuestros propios JWT de sesión): la API de Google exige que el
-// JWT de autorización de una cuenta de servicio vaya firmado con la
-// clave PRIVADA RSA de esa cuenta (RS256), igual que hacemos ya para
-// VERIFICAR (no firmar) los id_token que llegan de Google/Microsoft en
-// verificarGoogleIdToken/verificarMicrosoftIdToken.
+async function signHS256(data, secret) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
+  return b64url(String.fromCharCode(...new Uint8Array(sig)));
+}
+
+// ---------- Firma RS256 + Search Console ----------
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa de todo este bloque (JWT Bearer de cuenta de servicio de
+// Google, RFC 7523). Duplicado aquí para que el panel de analíticas
+// también funcione si el failover pone a este worker (Railway) a
+// atender las lecturas (ver apiFetch()/circuit breaker en
+// public/js/config.js).
 async function signRS256(data, clavePrivadaPem) {
-  // La clave llega en formato PEM estándar (la que descarga la consola
-  // de Google al crear la cuenta de servicio, con las líneas
-  // "-----BEGIN PRIVATE KEY-----"): hay que quitar cabecera/pie y
-  // saltos de línea, decodificar el base64 restante a bytes DER, e
-  // importarla como PKCS8.
   const pem = clavePrivadaPem
     .replace(/-----BEGIN PRIVATE KEY-----/, "")
     .replace(/-----END PRIVATE KEY-----/, "")
@@ -1987,12 +1387,6 @@ async function signRS256(data, clavePrivadaPem) {
   return b64url(String.fromCharCode(...new Uint8Array(sig)));
 }
 
-// Intercambia las credenciales de una cuenta de servicio de Google
-// (JSON descargado de la consola de Cloud, guardado como los dos
-// secretos GSC_SERVICE_ACCOUNT_EMAIL y GSC_SERVICE_ACCOUNT_KEY) por un
-// access_token OAuth de corta duración, con el scope de solo lectura de
-// Search Console. Sigue el flujo estándar "JWT Bearer" de Google
-// (RFC 7523): un JWT autofirmado que se canjea en /oauth2/v4/token.
 async function obtenerTokenGoogleServiceAccount(env) {
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: "RS256", typ: "JWT" };
@@ -2022,23 +1416,6 @@ async function obtenerTokenGoogleServiceAccount(env) {
   return data.access_token;
 }
 
-// ---------- Search Console: KPIs + serie diaria + top consultas ----------
-// Consume la API oficial de Search Console (searchanalytics.query),
-// autenticada con una cuenta de servicio a la que se le ha dado acceso
-// de lectura a la propiedad del sitio desde search.google.com/search-console
-// ("Configuración" -> "Usuarios y permisos" -> añadir el email de la
-// cuenta de servicio como "Restringido"/lectura). Requiere dos secretos
-// (ver README):
-//   wrangler secret put GSC_SERVICE_ACCOUNT_EMAIL
-//   wrangler secret put GSC_SERVICE_ACCOUNT_KEY
-// y la variable GSC_SITE_URL (la propiedad exacta tal y como aparece en
-// Search Console, p. ej. "sc-domain:elotrofutbol.media" o
-// "https://elotrofutbol.media/").
-//
-// Si faltan credenciales, se devuelve { conectado:false } (no un error):
-// es el estado "todavía no configurado", que el panel ya sabe pintar
-// como aviso neutro en vez de como fallo -- antes esto ni siquiera
-// llegaba aquí porque la ruta no existía (404 -> "Error de conexión").
 async function calcularGscAnaliticas(env, dias) {
   if (!env.GSC_SERVICE_ACCOUNT_EMAIL || !env.GSC_SERVICE_ACCOUNT_KEY || !env.GSC_SITE_URL) {
     return { conectado: false };
@@ -2047,9 +1424,6 @@ async function calcularGscAnaliticas(env, dias) {
   try {
     const accessToken = await obtenerTokenGoogleServiceAccount(env);
 
-    // GSC solo tiene datos con ~2-3 días de retraso respecto a hoy; se
-    // pide hasta hace 2 días para no recibir una cola de días vacíos que
-    // desvirtúe la serie/los promedios.
     const hoy = new Date();
     const fin = new Date(hoy);
     fin.setDate(fin.getDate() - 2);
@@ -2114,12 +1488,6 @@ async function calcularGscAnaliticas(env, dias) {
   }
 }
 
-async function signHS256(data, secret) {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
-  return b64url(String.fromCharCode(...new Uint8Array(sig)));
-}
 async function createJWT(payload, secret, expiresInSec = 60 * 60 * 12) {
   const header = { alg: "HS256", typ: "JWT" };
   const now = Math.floor(Date.now() / 1000);
@@ -2139,12 +1507,13 @@ async function verifyJWT(token, secret) {
   return payload;
 }
 // Ver el porqué completo en requireAuth: cubre el hueco entre que se crea
-// una sesión en D1 y que llega replicada a la tabla "sessions" del Worker
-// secundario (Railway/Postgres), sin el cual el failover automático
-// PRIMARY->SECONDARY podía devolver 403 en peticiones perfectamente
-// legítimas justo tras un login. 5 minutos = varias pasadas del
-// scheduler de sync (~60s por defecto) de margen, sin dejar la ventana
-// abierta indefinidamente para una sesión revocada de verdad.
+// una sesión en D1 y que llega replicada a esta tabla "sessions" (este
+// Worker es el secundario/Railway; D1 sigue siendo la autoridad -- ver
+// sync/tables.mjs), sin el cual el failover automático PRIMARY->SECONDARY
+// podía devolver 403 en peticiones perfectamente legítimas justo tras un
+// login. 5 minutos = varias pasadas del scheduler de sync (~60s por
+// defecto) de margen, sin dejar la ventana abierta indefinidamente para
+// una sesión revocada de verdad.
 const TOLERANCIA_SESION_NO_REPLICADA_SEGUNDOS = 5 * 60;
 
 async function requireAuth(request, env, url) {
@@ -2168,28 +1537,8 @@ async function requireAuth(request, env, url) {
       "SELECT id, last_seen_at FROM sessions WHERE id = ? AND user_id = ? AND revoked_at IS NULL"
     ).bind(payload.sid, payload.uid).first();
     if (!sesion) {
-      // TOLERANCIA_SESION_NO_REPLICADA_SEGUNDOS: en el Worker secundario
-      // (Railway/Postgres), "sessions" no es la tabla original sino una
-      // réplica que llega vía worker-secondary/sync (job periódico, ~60s
-      // por defecto -- ver sync/scheduler.mjs), no una escritura en el
-      // mismo request. Si el failover PRIMARY->SECONDARY (ver
-      // eofFetchConTimeout/apiFetch en public/js/config.js) salta justo
-      // tras un login o poco después, la sesión puede no haber llegado
-      // TODAVÍA a esta réplica aunque el JWT sea perfectamente válido y
-      // la sesión SÍ exista en D1 -- eso hacía que /api/admin/analiticas/*
-      // (y cualquier otra ruta protegida) devolviera 403 de forma
-      // intermitente solo para las peticiones que, por timing, caían en
-      // la secundaria, sin que la persona hubiera hecho nada mal.
-      //
-      // Se admite igualmente si el JWT es "reciente" (por iat, no por
-      // exp: un JWT de larga duración recién revocado también debe
-      // rechazarse aquí, no solo los de corta duración) -- igual que ya
-      // se hace con los JWT antiguos sin "sid". Esto no reintroduce el
-      // problema que "sessions" resuelve (cerrar sesión no tiene efecto
-      // hasta caducar el JWT): sigue bloqueando de inmediato una sesión
-      // revocada hace más de esta ventana, que es el caso real de "cerrar
-      // sesión desde otro dispositivo", y cubre solo el hueco de
-      // replicación, no un salvoconducto permanente.
+      // Ver requireAuth en worker/src/index.js (D1) para la explicación
+      // completa de esta tolerancia.
       const emitidoHaceSegundos = payload.iat ? Math.floor(Date.now() / 1000) - payload.iat : Infinity;
       if (emitidoHaceSegundos > TOLERANCIA_SESION_NO_REPLICADA_SEGUNDOS) return null;
     } else {
@@ -2211,23 +1560,12 @@ async function requireAuth(request, env, url) {
 }
 
 // ---------- Colaboradores: roles y permisos ----------
-// Un "colaborador" es cualquier cuenta de users.rol distinta de lector:
-// 'admin', 'redactor' o 'fotografo'. Este bloque centraliza en un solo
-// sitio qué puede hacer cada rol, para no tener que repetir
-// "payload.rol !== 'admin'" (u otras comparaciones sueltas) por todo el
-// archivo cada vez que se añade o se matiza un permiso.
-//
-// IMPORTANTE: de momento este bloque solo AÑADE helpers; no cambia
-// ningún comportamiento existente todavía. Los endpoints se migran a
-// usar estas funciones en fases posteriores, endpoint a endpoint, para
-// poder revisar cada cambio de permisos por separado.
+// Espejo exacto de los helpers equivalentes en worker/src/index.js (D1):
+// ver ahí la explicación completa. Se mantienen sincronizados a mano
+// porque este Worker secundario replica la misma lógica de negocio
+// sobre Postgres.
 const ROLES_VALIDOS = ["admin", "redactor", "fotografo"];
 
-// Normaliza un rol recibido del cliente (p. ej. al crear/editar un
-// usuario): si no es uno de los tres válidos, cae a 'redactor' como
-// hacía el código anterior (mantiene el comportamiento por defecto de
-// siempre; antes solo existían 'admin' y 'redactor' así que cualquier
-// valor no-admin caía en redactor).
 function normalizarRolColaborador(rol) {
   return ROLES_VALIDOS.includes(rol) ? rol : "redactor";
 }
@@ -2244,74 +1582,12 @@ function esFotografo(payload) {
   return !!payload && payload.rol === "fotografo";
 }
 
-// Noticias, crónicas, artículos de opinión, entrevistas, resultados,
-// minuto a minuto, "Última hora", etc.: contenido editorial de toda la
-// vida. Admin y redactor pueden acceder (con los matices de nivel/
-// autoría ya existentes en cada endpoint); fotógrafo NO.
 function puedeGestionarContenidoEditorial(payload) {
   return esAdmin(payload) || esRedactor(payload);
 }
 
-// Galería/imágenes: tabla "media" y (fases siguientes) galería de
-// partido. Admin y fotógrafo pueden subir/gestionar; redactor puede
-// consultar para adjuntar a sus noticias pero no sube como fotógrafo
-// (esto se termina de definir en el Bloque B, ver plan de fases).
 function puedeGestionarGaleria(payload) {
   return esAdmin(payload) || esFotografo(payload);
-}
-
-// ---------- Bloque B, Fase 12: adjuntar galería/imágenes sueltas a una noticia ----------
-// Tabla puente "article_media" (ver migracion_article_media.sql): guarda,
-// para cada noticia/crónica, qué imágenes de "media" se han vinculado
-// como galería adicional (aparte de "imagenes", que son las fotos
-// insertadas dentro del propio cuerpo del texto — ver normalizarImagenes).
-// Se admite mandar la selección de dos formas, que se pueden combinar:
-//  - body.galeria_resultado_id: vuelca TODA la galería de ese partido
-//    (match_gallery) en el momento de guardar, en su mismo orden.
-//  - body.media_ids: lista de ids de "media" sueltos, elegidos a mano en
-//    el banco general (no necesariamente ligados a ningún partido).
-// Se resuelve a una lista final de media_ids (sin duplicados, en el
-// orden en que deben aparecer) y se sustituye por completo la fila de
-// article_media de esta noticia: es más simple que calcular altas/bajas
-// y aquí el volumen por noticia es pequeño (unas pocas decenas de fotos
-// como mucho), así que no compensa la complejidad de un diff.
-async function sincronizarArticleMedia(env, articleId, body) {
-  if (!Object.prototype.hasOwnProperty.call(body, "media_ids") && !Object.prototype.hasOwnProperty.call(body, "galeria_resultado_id")) {
-    // Ninguno de los dos campos viene en el body: no se toca la galería
-    // ya guardada (permite editar la noticia sin mandar siempre la
-    // galería completa, igual que el resto de campos opcionales del PUT).
-    return;
-  }
-  const idsFinales = [];
-  const vistos = new Set();
-  const agregar = (id) => {
-    const n = parseInt(id, 10);
-    if (Number.isInteger(n) && !vistos.has(n)) { vistos.add(n); idsFinales.push(n); }
-  };
-
-  if (body.galeria_resultado_id) {
-    const resultId = parseInt(body.galeria_resultado_id, 10);
-    if (Number.isInteger(resultId)) {
-      const { results: galeriaPartido } = await env.DB.prepare(
-        "SELECT media_id FROM match_gallery WHERE result_id = ? ORDER BY orden ASC, created_at ASC"
-      ).bind(resultId).all();
-      galeriaPartido.forEach((g) => agregar(g.media_id));
-    }
-  }
-  if (Array.isArray(body.media_ids)) {
-    body.media_ids.forEach((id) => agregar(id));
-  }
-
-  await env.DB.prepare("DELETE FROM article_media WHERE article_id = ?").bind(articleId).run();
-  for (let i = 0; i < idsFinales.length; i++) {
-    // Un id de media que ya no exista (borrado mientras tanto) se ignora
-    // en vez de romper el guardado de la noticia entera.
-    try {
-      await env.DB.prepare(
-        "INSERT INTO article_media (article_id, media_id, orden) VALUES (?, ?, ?)"
-      ).bind(articleId, idsFinales[i], i).run();
-    } catch (err) { /* media_id inexistente: se ignora esta fila */ }
-  }
 }
 
 // ---------- Sesiones (dispositivos con la sesión iniciada) ----------
@@ -2389,57 +1665,6 @@ async function crearSesion(env, request, user) {
   return token;
 }
 
-// Variante de requireAuth SOLO para subidas de archivos (POST /api/media y
-// POST /api/subir-imagen).
-//
-// Problema que resuelve: requireAuth rechaza con 401 "No autorizado" cuando
-// la fila de la sesión no se encuentra en la tabla "sessions" y el JWT tiene
-// más de 5 minutos. Esa fila puede faltar por motivos que NO son una sesión
-// cerrada (réplica con retraso entre D1 y Postgres, sesión creada en el otro
-// backend, etc.). En una tanda larga de fotos esto hacía que las primeras
-// subieran bien y, pasados unos minutos, el resto salieran "No autorizado"
-// con una sesión perfectamente válida.
-//
-// Aquí se distingue entre:
-//   - fila de sesión AUSENTE  -> no se considera motivo de rechazo.
-//   - fila de sesión REVOCADA -> se rechaza (cerrar sesión en otro
-//                                 dispositivo sigue funcionando).
-// Siguen siendo obligatorios: JWT firmado y sin caducar, y que el usuario
-// exista y esté activo (activo = 1).
-async function requireAuthSubida(request, env) {
-  const estricto = await requireAuth(request, env);
-  if (estricto) return estricto;
-
-  const auth = request.headers.get("Authorization") || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-  if (!token) return null;
-
-  let payload;
-  try {
-    payload = await verifyJWT(token, env.JWT_SECRET);
-  } catch {
-    return null;
-  }
-  if (!payload || !payload.uid) return null;
-
-  try {
-    if (payload.sid) {
-      const sesion = await env.DB.prepare(
-        "SELECT revoked_at FROM sessions WHERE id = ? AND user_id = ?"
-      ).bind(payload.sid, payload.uid).first();
-      if (sesion && sesion.revoked_at) return null;
-    }
-    const usuario = await env.DB.prepare(
-      "SELECT id FROM users WHERE id = ? AND activo = 1"
-    ).bind(payload.uid).first();
-    if (!usuario) return null;
-  } catch (err) {
-    console.error("requireAuthSubida: no se pudo comprobar la sesión/usuario:", err.message);
-    return null;
-  }
-  return payload;
-}
-
 // ---------- Sesiones de lectores (cuentas públicas, ver readers/reader_sessions) ----------
 // Mismo patrón que requireAuth/crearSesion de arriba, pero con su propio
 // payload de JWT (lleva "rid" en vez de "uid") para que un token de
@@ -2496,20 +1721,10 @@ async function crearSesionLector(env, request, reader) {
 }
 
 // ---------- Verificación del id_token de Google (login de lectores) ----------
-// Google Identity Services entrega en el navegador un id_token: un JWT
-// firmado por Google con RS256 (no HS256 como los nuestros, ver
-// createJWT/verifyJWT arriba). Para confiar en él sin ninguna librería
-// externa, se valida su firma contra las claves públicas de Google
-// (JWKS, rotan de vez en cuando, por eso se piden en cada arranque de
-// caché) y se comprueban los campos estándar: que el "issuer" sea
-// realmente Google, que la audiencia sea nuestro Client ID (para que un
-// id_token emitido para OTRA web no sirva aquí) y que no haya caducado.
-//
-// Cacheado en memoria del propio Worker (dura mientras el isolate esté
-// vivo, normalmente minutos-horas): evita pedir las claves a Google en
-// cada login sin arriesgarse a quedarse con una clave ya rotada, porque
-// si la verificación falla por "kid" desconocida se vuelve a pedir una
-// vez más por si acaso (ver getGoogleJWK).
+// Ver el comentario largo en worker/src/index.js (Worker principal):
+// esta es la misma función, replicada aquí para que el failover a
+// Railway/Postgres soporte el mismo login con Google sin depender del
+// principal estando vivo.
 let cacheGoogleJWKS = null;
 async function getGoogleJWK(kid, forzarRefresco = false) {
   if (!cacheGoogleJWKS || forzarRefresco) {
@@ -2529,7 +1744,6 @@ async function verificarGoogleIdToken(idToken, googleClientId) {
   const header = JSON.parse(b64urlDecodeTexto(h));
   const payload = JSON.parse(b64urlDecodeTexto(p));
 
-  // "iss" puede venir con o sin "https://" según el flujo de Google.
   if (payload.iss !== "https://accounts.google.com" && payload.iss !== "accounts.google.com") return null;
   if (payload.aud !== googleClientId) return null;
   if (!payload.exp || Math.floor(Date.now() / 1000) > payload.exp) return null;
@@ -2557,29 +1771,14 @@ async function verificarGoogleIdToken(idToken, googleClientId) {
   );
   if (!valido) return null;
 
-  return payload; // incluye email, email_verified, name, picture, sub...
+  return payload;
 }
 
 // ---------- Verificación del id_token de Microsoft (login de lectores) ----------
-// Mismo patrón que verificarGoogleIdToken: Microsoft Identity Platform
-// (MSAL.js en el navegador) entrega un id_token JWT firmado con RS256.
-// Se valida su firma contra las claves públicas de Microsoft (JWKS del
-// endpoint "common", válido tanto para cuentas personales como de
-// organización/Azure AD) y se comprueban issuer, audiencia y caducidad.
-//
-// El "iss" de Microsoft incluye el tenant ID (algo como
-// "https://login.microsoftonline.com/<tenant>/v2.0"), así que a
-// diferencia de Google no se compara con un valor fijo: basta con que
-// empiece por ese prefijo común a cualquier tenant, ya que la app está
-// registrada como "multitenant + cuentas personales" (ver README de
-// despliegue). El identificador estable del usuario es "oid" cuando
-// existe (recomendado por Microsoft para todos los flujos) y si no
-// "sub" como respaldo.
-//
-// Cacheado en memoria del propio Worker igual que con Google: evita
-// pedir las claves a Microsoft en cada login, y si la verificación
-// falla por "kid" desconocida se vuelve a pedir una vez más por si la
-// clave ha rotado.
+// Ver el comentario largo en worker/src/index.js (Worker principal):
+// esta es la misma función, replicada aquí para que el failover a
+// Railway/Postgres soporte el mismo login con Microsoft sin depender
+// del principal estando vivo.
 let cacheMicrosoftJWKS = null;
 async function getMicrosoftJWK(kid, forzarRefresco = false) {
   if (!cacheMicrosoftJWKS || forzarRefresco) {
@@ -2599,8 +1798,6 @@ async function verificarMicrosoftIdToken(idToken, microsoftClientId) {
   const header = JSON.parse(b64urlDecodeTexto(h));
   const payload = JSON.parse(b64urlDecodeTexto(p));
 
-  // El issuer lleva el tenant id en medio (login.microsoftonline.com/<tenant>/v2.0),
-  // por eso se comprueba el prefijo/sufijo en vez de un valor exacto.
   if (typeof payload.iss !== "string") return null;
   if (!payload.iss.startsWith("https://login.microsoftonline.com/") || !payload.iss.endsWith("/v2.0")) return null;
   if (payload.aud !== microsoftClientId) return null;
@@ -2629,12 +1826,9 @@ async function verificarMicrosoftIdToken(idToken, microsoftClientId) {
   );
   if (!valido) return null;
 
-  // Normaliza el email: algunas cuentas Microsoft solo traen
-  // "preferred_username" (que para cuentas personales suele ser el
-  // correo real) y no "email".
   if (!payload.email && payload.preferred_username) payload.email = payload.preferred_username;
 
-  return payload; // incluye email, name, oid, sub, preferred_username...
+  return payload;
 }
 
 // ---------- Cloudinary ----------
@@ -2717,13 +1911,10 @@ function clasificarDispositivo(userAgent) {
   return "escritorio";
 }
 
-// Bots/crawlers/herramientas SEO conocidos que SÍ ejecutan JavaScript
-// (headless Chrome, previsualizadores de enlaces, escáneres de SEO) y
-// por tanto disparan analiticas-tracking.js igual que una persona real,
-// inflando "páginas vistas" sin que sean lectores. Los crawlers básicos
-// (Googlebot clásico, sin JS) ya no cuentan porque nunca llegan a cargar
-// el script; esta lista cubre a los que sí lo hacen. Coincidencia por
-// substring en minúsculas, sin distinguir mayúsculas.
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa: bots/crawlers/herramientas SEO que sí ejecutan JavaScript y
+// disparaban analiticas-tracking.js igual que un lector real, inflando
+// "páginas vistas".
 const PATRONES_USER_AGENT_BOT = [
   "bot", "spider", "crawl", "slurp", "headless", "phantomjs", "puppeteer",
   "playwright", "selenium", "lighthouse", "pagespeed", "gptbot", "ccbot",
@@ -2735,79 +1926,30 @@ const PATRONES_USER_AGENT_BOT = [
 ];
 function esUserAgentBot(userAgent) {
   const ua = (userAgent || "").toLowerCase();
-  if (!ua) return true; // sin User-Agent: casi siempre un script, nunca un navegador real
+  if (!ua) return true;
   return PATRONES_USER_AGENT_BOT.some((p) => ua.includes(p));
 }
 
-// ---------- Cuentas de Cloudinary: principal + secundaria (respaldo) ----------
-// El plan gratis de Cloudinary tiene un tope de créditos (almacenamiento +
-// ancho de banda + transformaciones). Cuando la cuenta principal se queda
-// sin cupo, las subidas nuevas pasan solas a una segunda cuenta de
-// Cloudinary. La secundaria es OPCIONAL: si no están sus tres variables,
-// todo funciona exactamente como antes con una sola cuenta.
-//   Principal:   CLOUDINARY_CLOUD_NAME   / CLOUDINARY_API_KEY   / CLOUDINARY_API_SECRET
-//   Secundaria:  CLOUDINARY_CLOUD_NAME_2 / CLOUDINARY_API_KEY_2 / CLOUDINARY_API_SECRET_2
-// Los archivos ya subidos NO se mueven: su URL guarda el cloud name de la
-// cuenta donde viven, así que se siguen viendo igual, y al borrar se
-// elige la cuenta correcta a partir de esa URL.
-function cuentasCloudinary(env) {
-  const cuentas = [];
-  if (env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_API_KEY && env.CLOUDINARY_API_SECRET) {
-    cuentas.push({ cloudName: env.CLOUDINARY_CLOUD_NAME, apiKey: env.CLOUDINARY_API_KEY, apiSecret: env.CLOUDINARY_API_SECRET });
-  }
-  if (env.CLOUDINARY_CLOUD_NAME_2 && env.CLOUDINARY_API_KEY_2 && env.CLOUDINARY_API_SECRET_2) {
-    cuentas.push({ cloudName: env.CLOUDINARY_CLOUD_NAME_2, apiKey: env.CLOUDINARY_API_KEY_2, apiSecret: env.CLOUDINARY_API_SECRET_2 });
-  }
-  return cuentas;
-}
-
-// "https://res.cloudinary.com/<cloud_name>/image/upload/..." -> "<cloud_name>"
-function cloudNameDeUrlCloudinary(url) {
-  const m = /res\.cloudinary\.com\/([^\/]+)\//.exec(url || "");
-  return m ? m[1] : null;
-}
-
-// ¿Este fallo de Cloudinary se debe a que ESA CUENTA no puede aceptar más
-// (sin cupo, desactivada, credenciales rechazadas, límite de peticiones o
-// caída del servicio)? Si es así merece la pena probar con la otra cuenta.
-// Si el problema es el propio archivo (demasiado pesado, demasiados
-// megapíxeles, formato dañado...) NO: fallaría igual en la otra cuenta.
-function esFalloDeCuentaCloudinary(status, mensaje) {
-  if (status === undefined) return true; // error de red: no llegó a responder
-  if (status === 401 || status === 403 || status === 420 || status === 429 || status >= 500) return true;
-  const m = (mensaje || "").toLowerCase();
-  // Primero las señales claras de que la CUENTA no puede aceptar más (un
-  // mensaje tipo "Maximum storage exceeded" contiene "maximum" pero es de
-  // cuota, no del archivo), y solo después las del propio archivo.
-  if (/quota|credit|storage|disabled|blocked|suspended|usage/.test(m)) return true;
-  if (/file size|megapixel|pixel|dimension|resolution|maximum|too large|invalid|unsupported|corrupt/.test(m)) return false;
-  return /exceed|limit/.test(m);
-}
-
-// Sube un archivo a UNA cuenta concreta de Cloudinary sin ninguna
-// transformación (se conserva la calidad original).
-async function subirACloudinaryEnCuenta(cuenta, fileBytes, mimeType, nombreArchivo) {
+// Sube un archivo a Cloudinary sin ninguna transformación (se conserva la
+// calidad original). Devuelve { publicId, resourceType, url }.
+async function subirACloudinary(env, fileBytes, mimeType, nombreArchivo) {
   const timestamp = Math.floor(Date.now() / 1000);
-  const signature = await sha1Hex(`timestamp=${timestamp}${cuenta.apiSecret}`);
+  const signature = await sha1Hex(`timestamp=${timestamp}${env.CLOUDINARY_API_SECRET}`);
 
   const form = new FormData();
   form.append("file", new Blob([fileBytes], { type: mimeType }));
-  form.append("api_key", cuenta.apiKey);
+  form.append("api_key", env.CLOUDINARY_API_KEY);
   form.append("timestamp", timestamp.toString());
   form.append("signature", signature);
 
-  const resp = await fetch(`https://api.cloudinary.com/v1_1/${cuenta.cloudName}/auto/upload`, {
+  const resp = await fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/auto/upload`, {
     method: "POST",
     body: form,
   });
   if (!resp.ok) {
     const cuerpoError = await resp.text();
-    console.error(`Cloudinary (${cuenta.cloudName}) respondió ${resp.status} al subir "${nombreArchivo || "(sin nombre)"}" (${mimeType || "tipo desconocido"}): ${cuerpoError}`);
-    const errCloudinary = new Error(`Cloudinary (${resp.status}): ${cuerpoError}`);
-    errCloudinary.cloudinaryStatus = resp.status;
-    // Mensaje legible que da Cloudinary (viene como {"error":{"message":"..."}}).
-    try { errCloudinary.cloudinaryMensaje = JSON.parse(cuerpoError)?.error?.message || null; } catch {}
-    throw errCloudinary;
+    console.error(`Cloudinary respondió ${resp.status} al subir "${nombreArchivo || "(sin nombre)"}" (${mimeType || "tipo desconocido"}): ${cuerpoError}`);
+    throw new Error(`Cloudinary (${resp.status}): ${cuerpoError}`);
   }
   const data = await resp.json();
   // HEIC/HEIF (formato por defecto de las fotos de iPhone) no lo renderiza
@@ -2826,28 +1968,7 @@ async function subirACloudinaryEnCuenta(cuenta, fileBytes, mimeType, nombreArchi
     const i = url.indexOf(marca);
     if (i !== -1) url = url.slice(0, i + marca.length) + "f_auto,q_auto/" + url.slice(i + marca.length);
   }
-  return { publicId: data.public_id, resourceType: data.resource_type, url, cloudName: cuenta.cloudName };
-}
-
-// Sube un archivo a Cloudinary. Prueba primero la cuenta principal y, si
-// esta no puede aceptarlo (sin espacio, desactivada, etc.), reintenta
-// automáticamente con la secundaria. Devuelve
-// { publicId, resourceType, url, cloudName }.
-async function subirACloudinary(env, fileBytes, mimeType, nombreArchivo) {
-  const cuentas = cuentasCloudinary(env);
-  if (!cuentas.length) throw new Error("Cloudinary no está configurado (faltan CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET)");
-  let ultimoError;
-  for (let i = 0; i < cuentas.length; i++) {
-    try {
-      return await subirACloudinaryEnCuenta(cuentas[i], fileBytes, mimeType, nombreArchivo);
-    } catch (err) {
-      ultimoError = err;
-      const hayOtraCuenta = i < cuentas.length - 1;
-      if (!hayOtraCuenta || !esFalloDeCuentaCloudinary(err.cloudinaryStatus, err.cloudinaryMensaje)) throw err;
-      console.warn(`Cloudinary: la cuenta "${cuentas[i].cloudName}" no puede aceptar la subida (${err.cloudinaryStatus ?? "sin respuesta"}); se prueba con la cuenta "${cuentas[i + 1].cloudName}"`);
-    }
-  }
-  throw ultimoError;
+  return { publicId: data.public_id, resourceType: data.resource_type, url };
 }
 
 // ---------- Validación de archivos subidos (imágenes y vídeos) ----------
@@ -2934,23 +2055,6 @@ async function procesarSubidaArchivo(env, file, opciones, fileBytes) {
   return subida;
 }
 
-// D1 admite como máximo 100 variables enlazadas (?) por consulta: un
-// "WHERE id IN (?,?,?,...)" con más de 100 ids falla con "too many SQL
-// variables". Esta función parte la lista en lotes de 90, lanza las
-// consultas y devuelve todas las filas juntas. `construirSql` recibe los
-// marcadores ("?,?,?") de cada lote y devuelve el SQL completo.
-async function selectPorLotesDeIds(env, ids, construirSql) {
-  const TAM_LOTE = 90;
-  const lotes = [];
-  for (let i = 0; i < ids.length; i += TAM_LOTE) lotes.push(ids.slice(i, i + TAM_LOTE));
-  const respuestas = await Promise.all(
-    lotes.map((lote) =>
-      env.DB.prepare(construirSql(lote.map(() => "?").join(","))).bind(...lote).all()
-    )
-  );
-  return respuestas.flatMap((r) => r.results || []);
-}
-
 // Hash SHA-256 (en hexadecimal) del contenido binario de un archivo.
 // Se usa para detectar duplicados por contenido real, no por nombre: dos
 // archivos con el mismo hash son bit a bit idénticos aunque se hayan
@@ -2960,34 +2064,20 @@ async function sha256Hex(arrayBuffer) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function borrarDeCloudinary(env, publicId, resourceType, cloudName) {
-  // Se borra en la cuenta donde vive el archivo (cloudName, sacado de su
-  // URL o de la propia subida). Si no se sabe cuál es, se prueba en todas:
-  // destroy en una cuenta que no lo tiene responde "not found" sin más.
-  const cuentas = cuentasCloudinary(env);
-  const coincidentes = cloudName ? cuentas.filter((c) => c.cloudName === cloudName) : cuentas;
-  // Si este backend no tiene configurada la cuenta donde vive el archivo
-  // (p. ej. le faltan las variables _2), antes no se borraba nada y sin
-  // avisar; ahora se prueba en las que sí tiene (destroy en una cuenta que
-  // no lo tiene responde "not found" sin más).
-  const candidatas = coincidentes.length ? coincidentes : cuentas;
-  let respuesta = null;
-  for (const cuenta of candidatas) {
-    const timestamp = Math.floor(Date.now() / 1000);
-    const signature = await sha1Hex(`public_id=${publicId}&timestamp=${timestamp}${cuenta.apiSecret}`);
+async function borrarDeCloudinary(env, publicId, resourceType) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const signature = await sha1Hex(`public_id=${publicId}&timestamp=${timestamp}${env.CLOUDINARY_API_SECRET}`);
 
-    const form = new FormData();
-    form.append("public_id", publicId);
-    form.append("api_key", cuenta.apiKey);
-    form.append("timestamp", timestamp.toString());
-    form.append("signature", signature);
+  const form = new FormData();
+  form.append("public_id", publicId);
+  form.append("api_key", env.CLOUDINARY_API_KEY);
+  form.append("timestamp", timestamp.toString());
+  form.append("signature", signature);
 
-    respuesta = await fetch(`https://api.cloudinary.com/v1_1/${cuenta.cloudName}/${resourceType}/destroy`, {
-      method: "POST",
-      body: form,
-    });
-  }
-  return respuesta;
+  return fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/${resourceType}/destroy`, {
+    method: "POST",
+    body: form,
+  });
 }
 
 // Posiciones válidas para cada foto (que no sea la portada, que siempre
@@ -3278,31 +2368,6 @@ async function slugUnico(env, titulo, idPropio) {
   }
 }
 
-// Devuelve (generándolo si hace falta) el slug de la galería pública de
-// un partido: "real-valladolid-lugo-2026-03-10" o, si ya existe otro
-// partido igual esa fecha (o sin fecha), con un sufijo numérico o de
-// timestamp para desempatar, igual que slugUnico() con los artículos.
-// Se genera la primera vez que el partido recibe una foto de galería
-// (ver POST /api/media) y a partir de ahí ya no cambia, aunque cambien
-// los nombres de los equipos: es un enlace que se puede compartir.
-async function slugPartidoUnico(env, resultado) {
-  if (resultado.slug) return resultado.slug;
-  const fecha = (resultado.fecha_partido || "").slice(0, 10);
-  let base = slugify(`${resultado.equipo_local} ${resultado.equipo_visitante} ${fecha}`);
-  if (!base) base = `partido-${resultado.id}`;
-  let slug = base;
-  let intento = 0;
-  while (true) {
-    const choca = await env.DB.prepare("SELECT id FROM results WHERE slug = ? AND id != ?")
-      .bind(slug, resultado.id).first();
-    if (!choca) break;
-    intento++;
-    slug = `${base}-${intento > 1 ? intento : Date.now().toString().slice(-5)}`;
-  }
-  await env.DB.prepare("UPDATE results SET slug = ? WHERE id = ?").bind(slug, resultado.id).run();
-  return slug;
-}
-
 // Al guardar un artículo cuyo slug ha cambiado (porque todavía no está
 // "congelado", ver slug_congelado en schema.sql), guarda el slug antiguo
 // en article_slug_redirects para que quien entre con el enlace viejo se
@@ -3334,7 +2399,7 @@ function longitudTextoPlano(html) {
     .trim().length;
 }
 
-const CONTENIDO_MIN = 1500;
+const CONTENIDO_MIN = 2000;
 const CONTENIDO_MAX = 8000;
 
 // ---------- Sistema de niveles y recompensas ----------
@@ -3343,14 +2408,6 @@ const CONTENIDO_MAX = 8000;
 // nivel automáticamente (lo decide un admin, ver PUT /api/users/:id/nivel);
 // esto es solo lo que se usa para calcular el progreso y decir si la
 // persona "ya está en condiciones de que la evalúen".
-//
-// "previa" y "analisis" no tienen aquí un umbral propio (se añadieron
-// como tipos de contenido nuevos, pero no se ha decidido todavía cuánto
-// deben pesar para subir de nivel): se cuentan igualmente en
-// contarPublicacionesPorTipo/DeVarios de abajo para que el desglose de
-// "Mi progreso" las muestre, pero de momento no hacen falta para
-// cumplir ningún nivel. Si en el futuro se quiere que sí cuenten para
-// ascender, basta con añadirlas aquí como una clave más.
 const NIVELES_REQUISITOS = {
   1: null, // Principiante: nivel inicial, no requiere nada.
   2: { noticia: 30, cronica: 15, opinion: 3, entrevista: 1 },
@@ -3385,25 +2442,14 @@ const NIVELES_INFO = {
 // adelante, debe contarle igual para su progreso de nivel, no solo al
 // autor principal.
 async function contarPublicacionesPorTipo(env, autorId) {
-  // UNION ALL en vez de "WHERE (autor_id = ? OR coautor_id = ?)": el OR
-  // entre dos columnas indexadas por separado (idx_articles_autor_publicado
-  // / idx_articles_coautor_publicado) impide a SQLite usar ninguno de los
-  // dos índices y fuerza un escaneo completo de la tabla en cada llamada
-  // -esta consulta se veía en las métricas de D1 de sep-2026 leyendo 112
-  // filas por cada fila realmente devuelta-. Con UNION ALL cada mitad usa
-  // su propio índice, igual que ya hacía contarPublicacionesPorTipoDeVarios.
   const { results } = await env.DB.prepare(
     `SELECT tipo, COUNT(*) AS total FROM articles
-     WHERE autor_id = ? AND publicado = 1
-     GROUP BY tipo
-     UNION ALL
-     SELECT tipo, COUNT(*) AS total FROM articles
-     WHERE coautor_id = ? AND publicado = 1
+     WHERE (autor_id = ? OR coautor_id = ?) AND publicado = 1
      GROUP BY tipo`
   ).bind(autorId, autorId).all();
-  const conteo = { noticia: 0, previa: 0, cronica: 0, analisis: 0, opinion: 0, entrevista: 0 };
+  const conteo = { noticia: 0, cronica: 0, opinion: 0, entrevista: 0 };
   for (const fila of results) {
-    if (conteo[fila.tipo] !== undefined) conteo[fila.tipo] += fila.total;
+    if (conteo[fila.tipo] !== undefined) conteo[fila.tipo] = fila.total;
   }
   return conteo;
 }
@@ -3421,41 +2467,21 @@ async function contarPublicacionesPorTipo(env, autorId) {
 // por culpa del OR.
 async function contarPublicacionesPorTipoDeVarios(env, autorIds) {
   const idsUnicos = [...new Set(autorIds.filter((id) => id != null))];
-  const conteos = new Map(idsUnicos.map((id) => [id, { noticia: 0, previa: 0, cronica: 0, analisis: 0, opinion: 0, entrevista: 0 }]));
+  const conteos = new Map(idsUnicos.map((id) => [id, { noticia: 0, cronica: 0, opinion: 0, entrevista: 0 }]));
   if (idsUnicos.length === 0) return conteos;
-  // Se trocea en lotes de 90 ids: D1/SQLite tiene un límite de 100
-  // parámetros bind por consulta, y esta plantilla ya reutiliza la
-  // misma lista una sola vez (placeholders numerados ?1, ?2... en vez
-  // de "?" repetido dos veces), pero si el número de redactores sigue
-  // creciendo por encima de 100 volvería a fallar igual. Trocear aquí
-  // deja margen sin depender de que nadie recuerde bajar el límite de
-  // D1 -- ver el aviso más abajo sobre el incidente que causó esto.
-  const LOTE = 90;
-  for (let inicio = 0; inicio < idsUnicos.length; inicio += LOTE) {
-    const lote = idsUnicos.slice(inicio, inicio + LOTE);
-    // Placeholders NUMERADOS (?1, ?2...) en vez de "?" repetido: así la
-    // misma lista de ids se puede reutilizar en las dos mitades del UNION
-    // ALL (autor_id y coautor_id) pasándola en el bind UNA sola vez, no
-    // dos. Con "?" sin numerar y bind(...ids, ...ids) (como estaba antes),
-    // una plantilla con más de ~50 usuarios ya superaba el límite de 100
-    // parámetros por consulta de D1/SQLite -> la consulta lanzaba una
-    // excepción, GET /api/users devolvía 500, y el Worker hacía failover
-    // a Railway (que no tiene la columna categorias_fijas en su esquema,
-    // así que esa respuesta tampoco la incluía nunca).
-    const placeholders = lote.map((_, i) => `?${i + 1}`).join(",");
-    const { results } = await env.DB.prepare(
-      `SELECT autor_id AS id, tipo, COUNT(*) AS total FROM articles
-       WHERE autor_id IN (${placeholders}) AND publicado = 1
-       GROUP BY autor_id, tipo
-       UNION ALL
-       SELECT coautor_id AS id, tipo, COUNT(*) AS total FROM articles
-       WHERE coautor_id IN (${placeholders}) AND publicado = 1
-       GROUP BY coautor_id, tipo`
-    ).bind(...lote).all();
-    for (const fila of results) {
-      const conteo = conteos.get(fila.id);
-      if (conteo && conteo[fila.tipo] !== undefined) conteo[fila.tipo] += fila.total;
-    }
+  const placeholders = idsUnicos.map(() => "?").join(",");
+  const { results } = await env.DB.prepare(
+    `SELECT autor_id AS id, tipo, COUNT(*) AS total FROM articles
+     WHERE autor_id IN (${placeholders}) AND publicado = 1
+     GROUP BY autor_id, tipo
+     UNION ALL
+     SELECT coautor_id AS id, tipo, COUNT(*) AS total FROM articles
+     WHERE coautor_id IN (${placeholders}) AND publicado = 1
+     GROUP BY coautor_id, tipo`
+  ).bind(...idsUnicos, ...idsUnicos).all();
+  for (const fila of results) {
+    const conteo = conteos.get(fila.id);
+    if (conteo && conteo[fila.tipo] !== undefined) conteo[fila.tipo] += fila.total;
   }
   return conteos;
 }
@@ -3595,19 +2621,14 @@ async function iniciarCronometroPartido(env, resultadoId, minutoInicial = 0) {
   // COALESCE(goles_local, 0) / COALESCE(goles_visitante, 0): un partido
   // "programado" tiene goles_local/goles_visitante a NULL hasta que
   // alguien anota el primer gol o lo pone a mano a 0-0. Si este cronómetro
-  // se arranca desde el cron automático (iniciarPartidosProgramadosCuya-
-  // HoraHaLlegado) en vez de desde el formulario manual, esos campos se
-  // quedaban en NULL al pasar a "en_juego". calcularClasificacion() en
-  // clasificacion.html/calendario.html descarta cualquier partido
-  // "en_juego" con goles NULL (no puede calcular puntos provisionales sin
-  // marcador), así que ese partido en vivo sencillamente desaparecía de la
-  // clasificación en vivo -- mientras que otro partido en vivo arrancado a
-  // mano desde el panel (que sí fija 0-0 al pulsar "Iniciar partido") se
-  // veía perfectamente. Esto es lo que explicaba que la clasificación en
-  // vivo funcionara "solo a veces" o "solo en un grupo": dependía de qué
-  // camino había arrancado cada partido en concreto, no de nada relacionado
-  // con el grupo/competición. Con COALESCE, cualquier partido que llegue
-  // aquí sin marcador queda a 0-0 en vez de NULL, sea cual sea el camino.
+  // se arranca desde el cron automático en vez de desde el formulario
+  // manual, esos campos se quedaban en NULL al pasar a "en_juego".
+  // calcularClasificacion() en clasificacion.html/calendario.html descarta
+  // cualquier partido "en_juego" con goles NULL, así que ese partido en
+  // vivo desaparecía de la clasificación en vivo -- explicando por qué
+  // "a veces va y a veces no" según qué camino había arrancado cada
+  // partido. Con COALESCE, cualquier partido que llegue aquí sin
+  // marcador queda a 0-0 en vez de NULL.
   await env.DB.prepare(
     `UPDATE results SET inicio_cronometro_at = datetime('now', ?), cronometro_pausado_en = NULL,
        ajuste_cronometro_minutos = 0, estado = 'en_juego', aviso_desatendido_mitad = NULL,
@@ -3639,45 +2660,16 @@ async function iniciarPartidosProgramadosCuyaHoraHaLlegado(env) {
   //     retrasado se quedaba en "retrasado" para siempre por mucho que
   //     pasara su nueva hora -- el redactor tenía que arrancarlo a mano
   //     porque nada volvía a comprobar esta columna una vez guardada.
-  //
-  // Toda la función va envuelta en try/catch, y CADA partido dentro del
-  // bucle también por separado: antes, si D1 fallaba (timeout, cuota,
-  // error transitorio) al leer los candidatos o al arrancar UN partido
-  // concreto, la excepción se propagaba sin capturar. Como esta función
-  // se llama desde "scheduled" con ctx.waitUntil(...) y sin ningún
-  // try/catch alrededor, ese fallo simplemente desaparecía sin dejar
-  // rastro en los logs, y -si el bucle ya había arrancado- todos los
-  // partidos que venían DETRÁS del que falló en ese mismo array se
-  // quedaban también sin arrancar ese minuto, aunque su hora ya hubiera
-  // pasado. Como el cron vuelve a pasar al minuto siguiente, casi
-  // siempre se recuperaba solo en la siguiente pasada -- pero eso es
-  // justo lo que se estaba viendo: partidos que arrancan "a veces sí, a
-  // veces no, sin patrón claro" (depende de en qué partido concreto, o
-  // en qué consulta, caía el fallo transitorio de D1 ese minuto). Con
-  // cada partido aislado en su propio try/catch, un fallo puntual con
-  // UNO no impide que los demás arranquen en la misma pasada, y además
-  // queda logueado para poder ver en el dashboard de Cloudflare (Logs)
-  // si D1 está fallando de verdad y por qué.
-  let candidatosProgramados = [];
-  let candidatosRetrasados = [];
-  try {
-    ({ results: candidatosProgramados = [] } = await env.DB.prepare(
-      `SELECT id, fecha_partido FROM results
-       WHERE estado = 'programado' AND fecha_partido IS NOT NULL
-         AND length(fecha_partido) = 16` // "YYYY-MM-DDTHH:MM": solo si se conoce la hora, no solo la fecha
-    ).all());
-  } catch (err) {
-    console.error("[arranque automático] fallo leyendo partidos 'programado':", err.message);
-  }
-  try {
-    ({ results: candidatosRetrasados = [] } = await env.DB.prepare(
-      `SELECT id, fecha_partido_retrasado AS fecha_partido FROM results
-       WHERE estado = 'retrasado' AND fecha_partido_retrasado IS NOT NULL
-         AND length(fecha_partido_retrasado) = 16`
-    ).all());
-  } catch (err) {
-    console.error("[arranque automático] fallo leyendo partidos 'retrasado':", err.message);
-  }
+  const { results: candidatosProgramados } = await env.DB.prepare(
+    `SELECT id, fecha_partido FROM results
+     WHERE estado = 'programado' AND fecha_partido IS NOT NULL
+       AND length(fecha_partido) = 16` // "YYYY-MM-DDTHH:MM": solo si se conoce la hora, no solo la fecha
+  ).all();
+  const { results: candidatosRetrasados } = await env.DB.prepare(
+    `SELECT id, fecha_partido_retrasado AS fecha_partido FROM results
+     WHERE estado = 'retrasado' AND fecha_partido_retrasado IS NOT NULL
+       AND length(fecha_partido_retrasado) = 16`
+  ).all();
   const candidatos = [...candidatosProgramados, ...candidatosRetrasados];
   const ahoraSqlite = aSqliteDatetimeUTC(new Date());
   const pendientes = candidatos.filter((p) => {
@@ -3685,27 +2677,19 @@ async function iniciarPartidosProgramadosCuyaHoraHaLlegado(env) {
     return inicioUtc !== null && inicioUtc <= ahoraSqlite;
   });
   for (const partido of pendientes) {
-    try {
-      await iniciarCronometroPartido(env, partido.id, 0);
-      // Comprobación defensiva por si, justo en el minuto en que pasa el
-      // cron, el redactor ha pulsado "Iniciar partido" a mano casi a la
-      // vez: sin esto podían colarse dos "Comienza el partido" para el
-      // mismo encuentro (ver también la comprobación gemela en el POST de
-      // /eventos, que cubre el caso opuesto: cron primero, botón después).
-      const yaTieneInicio = await env.DB.prepare(
-        "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = 'inicio_partido' LIMIT 1"
-      ).bind(partido.id).first();
-      if (yaTieneInicio) continue;
-      await env.DB.prepare(
-        `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden) VALUES (?, 'inicio_partido', 'ninguno', 0, 0)`
-      ).bind(partido.id).run();
-    } catch (err) {
-      // No se relanza: se deja que el bucle siga con el resto de
-      // partidos pendientes, y este en concreto se reintentará solo en
-      // la siguiente pasada del cron (un minuto después), porque sigue
-      // en estado 'programado'/'retrasado' con su hora ya cumplida.
-      console.error(`[arranque automático] fallo arrancando el partido ${partido.id}:`, err.message);
-    }
+    await iniciarCronometroPartido(env, partido.id, 0);
+    // Comprobación defensiva por si, justo en el minuto en que pasa el
+    // cron, el redactor ha pulsado "Iniciar partido" a mano casi a la
+    // vez: sin esto podían colarse dos "Comienza el partido" para el
+    // mismo encuentro (ver también la comprobación gemela en el POST de
+    // /eventos, que cubre el caso opuesto: cron primero, botón después).
+    const yaTieneInicio = await env.DB.prepare(
+      "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = 'inicio_partido' LIMIT 1"
+    ).bind(partido.id).first();
+    if (yaTieneInicio) continue;
+    await env.DB.prepare(
+      `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden) VALUES (?, 'inicio_partido', 'ninguno', 0, 0)`
+    ).bind(partido.id).run();
   }
 }
 
@@ -3720,24 +2704,14 @@ const MINUTO_DESCANSO_AUTOMATICO = 45;
 // partidos desatendidos) los partidos "en_juego" cuyo cronómetro sigue
 // corriendo y ya ha alcanzado MINUTO_DESCANSO_AUTOMATICO, y les inserta
 // el evento "descanso" solo si todavía no existe uno para ese partido.
-// Así el descanso queda registrado igual si el redactor está delante
-// del panel y pulsa el botón a tiempo, que si se despista: el aviso de
-// "desatendido" (ver revisarPartidosDesatendidos) seguía disparándose
-// más tarde en ese segundo caso, pero el propio evento no aparecía en
-// el timeline hasta que alguien entraba a pulsarlo a mano. Se limita a
-// partidos con el cronómetro corriendo (no pausado): si ya está
-// pausado es que alguien ya ha pitado algo (descanso, hidratación...)
+// Se limita a partidos con el cronómetro corriendo (no pausado): si ya
+// está pausado es que alguien ya ha pitado algo (descanso, hidratación...)
 // y no hay que tocarlo.
-async function crearDescansoAutomaticoAlMinuto45(env, partidosEnJuego) {
-  // partidosEnJuego (opcional): lista ya cargada por el cron (ver
-  // "scheduled" -- se pide UNA sola vez por minuto en vez de que cada
-  // una de las 4 funciones que miran 'en_juego' repita la misma
-  // consulta a D1). Si no se pasa (llamada suelta, no desde el cron),
-  // se sigue consultando aquí como antes.
-  const partidos = (partidosEnJuego ?? (await env.DB.prepare(
+async function crearDescansoAutomaticoAlMinuto45(env) {
+  const { results: partidos } = await env.DB.prepare(
     `SELECT id, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos
      FROM results WHERE estado = 'en_juego' AND cronometro_pausado_en IS NULL`
-  ).all()).results).filter((p) => p.cronometro_pausado_en === null || p.cronometro_pausado_en === undefined);
+  ).all();
   if (!partidos.length) return;
 
   for (const partido of partidos) {
@@ -3756,22 +2730,15 @@ async function crearDescansoAutomaticoAlMinuto45(env, partidosEnJuego) {
 }
 
 // Minuto real (de cronómetro) a partir del cual se considera que nadie
-// va a cubrir ya el final del partido y el cron lo cierra solo. Se ha
-// subido de 100 a 150 para dar mucho más margen antes de intervenir
-// (tiempo añadido, prórroga de Copa/playoffs, tanda de penaltis...): un
-// partido real casi nunca llega aquí sin que alguien haya pitado ya el
-// final, así que sigue siendo una red de seguridad, no la forma habitual
-// de cerrar partidos.
+// va a cubrir ya el final del partido y el cron lo cierra solo. Subido
+// de 100 a 150 (ver mismo cambio en worker/src/index.js) para dar mucho
+// más margen antes de intervenir.
 const MINUTO_FIN_PARTIDO_AUTOMATICO = 150;
 
 // Minuto con el que se REGISTRA el evento "fin_partido" y el marcador
 // del partido cuando lo cierra el cron (no el minuto real en el que se
-// detecta, MINUTO_FIN_PARTIDO_AUTOMATICO). Un partido real casi nunca
-// termina más allá del 90'+añadido, así que dejar constancia de un
-// "minuto 150" en el timeline público quedaría raro y fuera de lugar;
-// se dejan los 90' como cierre "limpio" y el aviso de que fue un cierre
-// automático sin cubrir vive aparte, en finalizado_no_cubierto (ver
-// pintarListaResultados en admin.js), no en el minuto del evento.
+// detecta, MINUTO_FIN_PARTIDO_AUTOMATICO). Ver comentario gemelo en
+// worker/src/index.js.
 const MINUTO_REGISTRADO_FIN_AUTOMATICO = 90;
 
 // Revisa cada minuto los partidos "en_juego" cuyo cronómetro sigue
@@ -3783,16 +2750,13 @@ const MINUTO_REGISTRADO_FIN_AUTOMATICO = 90;
 // (por ejemplo en el descanso o una hidratación) no se toca -no hay
 // riesgo de "colarse" cerrando un partido que solo está parado un
 // momento-, y ese caso ya lo cubre revisarPartidosDesatendidos() con su
-// propio aviso. Además marca finalizado_no_cubierto = 1 para que el
-// panel de admin pinte el aviso "FINALIZADO NO CUBIERTO" en la tabla de
-// Resultados (ver pintarListaResultados en admin.js).
-async function crearFinPartidoAutomaticoAlMinuto90(env, partidosEnJuego) {
-  // partidosEnJuego (opcional): ver comentario gemelo en
-  // crearDescansoAutomaticoAlMinuto45.
-  const partidos = (partidosEnJuego ?? (await env.DB.prepare(
+// propio aviso. Marca finalizado_no_cubierto = 1 (ver misma columna en
+// worker/src/index.js) para el aviso "FINALIZADO NO CUBIERTO" del panel.
+async function crearFinPartidoAutomaticoAlMinuto90(env) {
+  const { results: partidos } = await env.DB.prepare(
     `SELECT id, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos
      FROM results WHERE estado = 'en_juego' AND cronometro_pausado_en IS NULL`
-  ).all()).results).filter((p) => p.cronometro_pausado_en === null || p.cronometro_pausado_en === undefined);
+  ).all();
   if (!partidos.length) return;
 
   for (const partido of partidos) {
@@ -3807,17 +2771,9 @@ async function crearFinPartidoAutomaticoAlMinuto90(env, partidosEnJuego) {
     await env.DB.prepare(
       `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, orden) VALUES (?, 'fin_partido', 'ninguno', ?, 0)`
     ).bind(partido.id, MINUTO_REGISTRADO_FIN_AUTOMATICO).run();
-    // Mismo efecto que el POST /eventos manual con tipo "fin_partido":
-    // pasa el partido a 'finalizado' y limpia aviso_desatendido_mitad
-    // (ver comentario gemelo en el endpoint) para no arrastrar avisos
-    // de esta "vida" del partido si se reabre más adelante. Se marca
-    // además finalizado_no_cubierto = 1 (a diferencia del cierre manual,
-    // que nunca toca este campo) para distinguir en el panel un cierre
-    // real de uno forzado por inactividad.
     await env.DB.prepare(
       "UPDATE results SET estado = 'finalizado', aviso_desatendido_mitad = NULL, finalizado_no_cubierto = 1 WHERE id = ?"
     ).bind(partido.id).run();
-    await invalidarCacheArticuloPartido(env, partido.id);
   }
 }
 
@@ -3831,11 +2787,9 @@ async function crearFinPartidoAutomaticoAlMinuto90(env, partidosEnJuego) {
 //
 // Dos situaciones se consideran "desatendido":
 //   1) El cronómetro sigue corriendo (no pausado) y ya ha superado el
-//      minuto UMBRAL_PRIMERA_PARTE_SIN_DESCANSO (o el
-//      UMBRAL_SEGUNDA_PARTE_SIN_FINAL, si ya va por la 2ª parte) sin que
-//      nadie haya pitado el descanso / el final. Entre el min. 55 y el
-//      100 el reloj corre con normalidad SOLO si ya se inició la 2ª
-//      parte (evento "fin_descanso"): ver evaluarSituacionDesatendida().
+//      minuto UMBRAL_PRIMERA_PARTE_SIN_DESCANSO sin que exista un
+//      evento "descanso" registrado: la primera parte no dura tanto en
+//      ningún partido real, así que el reloj se ha "olvidado" corriendo.
 //   2) El cronómetro está pausado en el descanso (evento "descanso" es
 //      el último evento de tipo pausa) desde hace más de
 //      UMBRAL_DESCANSO_SIN_REANUDAR minutos: el redactor no ha pulsado
@@ -3891,16 +2845,12 @@ const AVISOS_DESATENDIDOS_MAX_FILAS_EMAIL = 40;
 // grave (ya se ha ocultado el partido de la web) que no debe esperar.
 const UMBRAL_PARTIDO_COLGADO = 2000; // minutos
 
-async function marcarPartidosColgados(env, ctx, partidosEnJuego) {
-  // partidosEnJuego (opcional): ver comentario en
-  // crearDescansoAutomaticoAlMinuto45; aquí no se filtra por
-  // cronometro_pausado_en porque un partido colgado puede seguir
-  // corriendo o no, da igual para este chequeo.
-  const partidos = partidosEnJuego ?? (await env.DB.prepare(
+async function marcarPartidosColgados(env, ctx) {
+  const { results: partidos } = await env.DB.prepare(
     `SELECT id, competicion, jornada, equipo_local, equipo_visitante, autor_id, autor_nombre,
             inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos
      FROM results WHERE estado = 'en_juego'`
-  ).all()).results;
+  ).all();
   if (!partidos.length) return [];
 
   const idsColgados = [];
@@ -3912,7 +2862,7 @@ async function marcarPartidosColgados(env, ctx, partidosEnJuego) {
     idsColgados.push(partido.id);
 
     const nombrePartido = `${partido.equipo_local} - ${partido.equipo_visitante}`;
-    const enlacePanel = `${SITIO_URL}/admin/panel.html?minuto_a_minuto=${partido.id}`;
+    const enlacePanel = `${SITIO_URL}/admin/minuto-a-minuto.html?id=${partido.id}`;
     const motivo = `El cronómetro lleva corriendo sin parar desde hace más de ${Math.floor(minuto / 60 / 24)} días (minuto ${minuto}) sin que se haya registrado el final del partido. Se ha ocultado automáticamente de la web mientras se revisa.`;
 
     let destinatario = EMAIL_NOTIFICACIONES;
@@ -3971,140 +2921,6 @@ function minutoEnVivoServidor(resultado) {
   return Math.max(0, Math.floor((Date.now() - inicioMs) / 60000) + ajuste);
 }
 
-// ---------- Avisos de partidos sin cubrir: evaluación, validación y agrupación ----------
-//
-// Interpreta una fecha guardada en la BD como instante UTC (ms). Acepta
-// "YYYY-MM-DD HH:MM:SS" (D1), ISO con T/Z/offset y objetos Date (que es
-// lo que puede devolver el driver "pg" en Railway). Devuelve NaN si no
-// se entiende. Antes cada sitio hacía su propio new Date(String(x)
-// .replace(" ", "T") + "Z"), que con un objeto Date daba NaN en silencio.
-function fechaBdAMs(valor) {
-  if (valor instanceof Date) return valor.getTime();
-  if (valor === null || valor === undefined || valor === "") return NaN;
-  let raw = String(valor).trim();
-  if (!/[zZ]|[+-]\d\d:?\d\d$/.test(raw)) {
-    raw = raw.includes("T") ? raw + "Z" : raw.replace(" ", "T") + "Z";
-  }
-  return new Date(raw).getTime();
-}
-
-const NOMBRE_COMPETICION_AVISO = {
-  hypermotion: "LaLiga Hypermotion",
-  primera_federacion: "Primera Federación",
-  segunda_federacion: "Segunda Federación",
-};
-
-// Si se ha registrado un evento (gol, tarjeta, cambio...) hace menos de
-// estos minutos, el partido SÍ se está cubriendo aunque el reloj vaya
-// más allá de lo normal. Mismo margen que MAM_MINUTOS_ACTIVIDAD_RECIENTE
-// en public/admin/js/admin.js: el email y el "🔴 Sin cubrir" del panel
-// deben coincidir (antes el panel ya lo respetaba y el email no).
-const AVISOS_DESATENDIDOS_ACTIVIDAD_RECIENTE_MIN = 5;
-
-// Grupos del email, de más a menos grave. "corto" es la etiqueta que
-// se usa en el asunto.
-const AVISOS_DESATENDIDOS_GRUPOS = [
-  { tipo: "sin_final", emoji: "🔴", titulo: "Sin final del partido", corto: "sin final",
-    detalle: "El cronómetro sigue corriendo y nadie ha pulsado «Fin del partido»." },
-  { tipo: "sin_descanso", emoji: "🟠", titulo: "Sin descanso ni 2ª parte", corto: "sin descanso",
-    detalle: "El reloj ha pasado del minuto 45 sin que nadie pitara el descanso ni iniciara la 2ª parte." },
-  { tipo: "descanso_sin_reanudar", emoji: "⏸️", titulo: "Parados en el descanso", corto: "parados en el descanso",
-    detalle: "Nadie ha pulsado «Comienza la 2ª parte»." },
-  { tipo: "cerrado_auto", emoji: "⚫", titulo: "Cerrados automáticamente", corto: "cerrados por el sistema",
-    detalle: "El sistema los cerró solo: revisa el marcador y los eventos del tramo final." },
-];
-
-async function partidoTieneEvento(env, resultadoId, tipo) {
-  const fila = await env.DB.prepare(
-    "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = ? LIMIT 1"
-  ).bind(resultadoId, tipo).first();
-  return !!fila;
-}
-
-async function partidoTieneActividadReciente(env, resultadoId) {
-  const fila = await env.DB.prepare(
-    "SELECT MAX(created_at) AS ultimo FROM match_events WHERE resultado_id = ?"
-  ).bind(resultadoId).first();
-  const ms = fechaBdAMs(fila && fila.ultimo);
-  if (!Number.isFinite(ms)) return false;
-  return (Date.now() - ms) / 60000 < AVISOS_DESATENDIDOS_ACTIVIDAD_RECIENTE_MIN;
-}
-
-// Decide si un partido "en_juego" está AHORA MISMO sin cubrir y de qué
-// tipo. Devuelve null si no lo está, o { tipo, mitad, motivo,
-// motivoCorto, minuto }. La usan tanto la detección (cada minuto) como
-// la validación justo antes de enviar el resumen, para que las dos
-// miren exactamente lo mismo.
-//
-// El cronómetro NO se reinicia en la 2ª parte: "Comienza la 2ª parte"
-// lo reanuda desde el minuto 45 (ver mamComenzarSegundaParte en
-// minuto-a-minuto.js) y registra un evento "fin_descanso". Por eso un
-// reloj corriendo entre el min. 55 y el 100 es lo NORMAL si ya hay
-// "fin_descanso" (2ª parte en marcha). Antes solo se miraba si existía
-// un evento "descanso", pero ese evento lo inserta también el cron solo
-// al llegar al minuto 45 (crearDescansoAutomaticoAlMinuto45), así que
-// casi todos los partidos, con o sin redactor delante, acababan
-// marcados como "sin final" hacia el minuto 55 de la 2ª parte. Ahora el
-// aviso "sin descanso" salta solo si pasa del minuto 55 SIN
-// "fin_descanso": nadie ha pausado el descanso ni iniciado la 2ª parte.
-//
-// omitirMitades (opcional): mitades ya avisadas. Si la situación que
-// tocaría evaluar pertenece a una de ellas se devuelve null sin gastar
-// consultas (el cron pasa por aquí cada minuto por cada partido en
-// juego; el envío del resumen no pasa esta lista y evalúa todo).
-async function evaluarSituacionDesatendida(env, partido, omitirMitades = []) {
-  const corriendo = partido.cronometro_pausado_en === null || partido.cronometro_pausado_en === undefined;
-  const minuto = minutoEnVivoServidor(partido);
-  let situacion = null;
-
-  if (corriendo && minuto >= UMBRAL_SEGUNDA_PARTE_SIN_FINAL) {
-    if (omitirMitades.includes("segunda")) return null;
-    situacion = {
-      tipo: "sin_final", mitad: "segunda",
-      motivo: `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya registrado el final del partido.`,
-      motivoCorto: `min. ${minuto} sin final`,
-    };
-  } else if (corriendo && minuto >= UMBRAL_PRIMERA_PARTE_SIN_DESCANSO) {
-    if (omitirMitades.includes("primera")) return null;
-    if (!(await partidoTieneEvento(env, partido.id, "fin_descanso"))) {
-      situacion = {
-        tipo: "sin_descanso", mitad: "primera",
-        motivo: `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que nadie haya pausado el descanso ni iniciado la 2ª parte.`,
-        motivoCorto: `min. ${minuto} sin descanso`,
-      };
-    }
-  } else if (!corriendo) {
-    if (omitirMitades.includes("primera")) return null;
-    // Se incluye "fin_descanso" en la búsqueda: si lo último es que se
-    // inició la 2ª parte, un reloj pausado después ya no es "parado en
-    // el descanso" (antes se seguía contando desde el evento "descanso",
-    // que podía tener horas).
-    const ultimaPausa = await env.DB.prepare(
-      `SELECT tipo, created_at FROM match_events
-       WHERE resultado_id = ? AND tipo IN ('descanso', 'fin_descanso', 'pausa_hidratacion')
-       ORDER BY id DESC LIMIT 1`
-    ).bind(partido.id).first();
-    if (ultimaPausa && ultimaPausa.tipo === "descanso") {
-      const desdeMs = fechaBdAMs(ultimaPausa.created_at);
-      const minutosParado = Number.isFinite(desdeMs) ? Math.floor((Date.now() - desdeMs) / 60000) : 0;
-      if (minutosParado >= UMBRAL_DESCANSO_SIN_REANUDAR) {
-        situacion = {
-          tipo: "descanso_sin_reanudar",
-          // El descanso es la frontera entre mitades: se cuenta como
-          // aviso de la 1ª parte (es el cierre pendiente de esa mitad).
-          mitad: "primera",
-          motivo: `El partido lleva parado en el descanso ${minutosParado} minutos sin que se haya iniciado la 2ª parte.`,
-          motivoCorto: `${minutosParado} min parado en el descanso`,
-        };
-      }
-    }
-  }
-
-  if (!situacion) return null;
-  if (await partidoTieneActividadReciente(env, partido.id)) return null;
-  return { ...situacion, minuto };
-}
-
 // Lee la cola de avisos pendientes (tabla avisos_desatendidos_cola).
 // Devuelve siempre un array. encolado_ms se pasa por Number(): el driver
 // "pg" devuelve los BIGINT de Postgres como string (no como número, a
@@ -4115,7 +2931,7 @@ async function leerColaAvisosDesatendidos(env) {
     "SELECT resultado_id, partido, jornada, redactor, motivo_corto, encolado_ms FROM avisos_desatendidos_cola ORDER BY encolado_ms ASC"
   ).all();
   return (results || []).map((f) => ({
-    id: Number(f.resultado_id),
+    id: f.resultado_id,
     partido: f.partido,
     jornada: f.jornada,
     redactor: f.redactor,
@@ -4124,169 +2940,43 @@ async function leerColaAvisosDesatendidos(env) {
   }));
 }
 
-// Carga el estado ACTUAL de los partidos de la cola (en tandas de 90:
-// D1/SQLite admite como mucho 100 parámetros bind por consulta).
-async function cargarPartidosDeAvisos(env, ids) {
-  const mapa = new Map();
-  const TANDA = 90;
-  for (let inicio = 0; inicio < ids.length; inicio += TANDA) {
-    const tanda = ids.slice(inicio, inicio + TANDA);
-    const { results } = await env.DB.prepare(
-      `SELECT id, competicion, jornada, equipo_local, equipo_visitante, autor_nombre, estado, finalizado_no_cubierto,
-              inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos
-       FROM results WHERE id IN (${tanda.map(() => "?").join(",")})`
-    ).bind(...tanda).all();
-    for (const fila of results || []) mapa.set(Number(fila.id), fila);
-  }
-  return mapa;
-}
+// Manda UN solo email con todos los partidos de la cola. Devuelve true
+// si había algo que enviar.
+async function enviarDigestAvisosDesatendidos(env, cola, motivoEnvio) {
+  if (!cola.length) return false;
 
-// Los avisos esperan en la cola hasta 30 minutos: en ese rato el
-// redactor puede haber retomado el partido, haberlo cerrado o haber
-// vuelto a meter eventos. Justo antes de enviar se vuelve a mirar cada
-// partido y solo pasan los que SIGUEN sin cubrir, ya clasificados por
-// tipo y con el minuto actual (no el de hace media hora):
-//   - en_juego y todavía desatendido -> su tipo actual
-//   - finalizado por el cron (finalizado_no_cubierto) -> "cerrado_auto"
-//   - cualquier otra cosa (resuelto, cerrado a mano, oculto por
-//     'colgado' -que ya manda su propio email urgente-, borrado) -> se
-//     descarta.
-async function validarAvisosDesatendidos(env, cola) {
-  const filas = await cargarPartidosDeAvisos(env, cola.map((a) => a.id));
-  const vigentes = [];
-  for (const aviso of cola) {
-    const p = filas.get(aviso.id);
-    if (!p) continue;
+  const visibles = cola.slice(0, AVISOS_DESATENDIDOS_MAX_FILAS_EMAIL);
+  const ocultos = cola.length - visibles.length;
+  const enlaceLista = `${SITIO_URL}/admin/resultados.html`;
 
-    let tipo = null;
-    let motivoCorto = null;
-    if (p.estado === "en_juego") {
-      const situacion = await evaluarSituacionDesatendida(env, p);
-      if (!situacion) continue;
-      tipo = situacion.tipo;
-      motivoCorto = situacion.motivoCorto;
-    } else if (p.estado === "finalizado" && (p.finalizado_no_cubierto === true || Number(p.finalizado_no_cubierto) === 1)) {
-      tipo = "cerrado_auto";
-      motivoCorto = "cerrado por el sistema";
-    } else {
-      continue;
-    }
+  const filas = visibles.map((a) => ({
+    etiqueta: `Jornada ${a.jornada}`,
+    valor: `${a.partido} — ${a.redactor || "sin asignar"} (${a.motivoCorto})`,
+  }));
+  if (ocultos > 0) filas.push({ etiqueta: "…", valor: `y ${ocultos} partidos más (revisa el panel)` });
 
-    vigentes.push({
-      id: aviso.id,
-      tipo,
-      motivoCorto,
-      partido: `${p.equipo_local} - ${p.equipo_visitante}`,
-      competicion: NOMBRE_COMPETICION_AVISO[p.competicion] || p.competicion || "",
-      jornada: p.jornada,
-      redactor: p.autor_nombre || aviso.redactor || null,
-    });
-  }
-  return vigentes;
-}
-
-// Agrupa por tipo (de más a menos grave) y, dentro de cada tipo, por
-// redactor (los "sin asignar" al final) y jornada.
-function agruparAvisosDesatendidos(avisos) {
-  const comparar = (a, b) => {
-    const sinA = a.redactor ? 0 : 1;
-    const sinB = b.redactor ? 0 : 1;
-    if (sinA !== sinB) return sinA - sinB;
-    const porRedactor = String(a.redactor || "").localeCompare(String(b.redactor || ""), "es");
-    if (porRedactor) return porRedactor;
-    const porJornada = (Number(a.jornada) || 0) - (Number(b.jornada) || 0);
-    if (porJornada) return porJornada;
-    return String(a.partido).localeCompare(String(b.partido), "es");
-  };
-  return AVISOS_DESATENDIDOS_GRUPOS
-    .map((g) => ({ ...g, items: avisos.filter((a) => a.tipo === g.tipo).sort(comparar) }))
-    .filter((g) => g.items.length > 0);
-}
-
-function detalleAvisoDesatendido(a) {
-  return [a.competicion, a.jornada ? `J${a.jornada}` : "", a.redactor || "Sin asignar", a.motivoCorto]
-    .filter(Boolean)
-    .join(" · ");
-}
-
-// Construye asunto, texto y HTML del resumen ya agrupado.
-function construirDigestAvisosDesatendidos(grupos, motivoEnvio) {
-  const total = grupos.reduce((n, g) => n + g.items.length, 0);
-  const urlLista = `${SITIO_URL}/admin/panel.html?ir=resultados.lista&sin_cubrir=1`;
-  const urlPartido = (id) => `${SITIO_URL}/admin/panel.html?minuto_a_minuto=${id}`;
-
-  // Tope de filas listadas entre TODOS los grupos (los más graves
-  // primero); el resto se resume con "y N más" en su grupo.
-  let restantes = AVISOS_DESATENDIDOS_MAX_FILAS_EMAIL;
-  const visibles = grupos.map((g) => {
-    const mostrados = g.items.slice(0, Math.max(0, restantes));
-    restantes -= mostrados.length;
-    return { ...g, mostrados, ocultos: g.items.length - mostrados.length };
-  });
-
-  const porRedactor = new Map();
-  for (const g of grupos) {
-    for (const a of g.items) {
-      const nombre = a.redactor || "Sin asignar";
-      porRedactor.set(nombre, (porRedactor.get(nombre) || 0) + 1);
-    }
-  }
-  const resumenRedactores = [...porRedactor.entries()]
-    .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0]), "es"))
-    .map(([nombre, n]) => `${nombre} (${n})`)
-    .join(", ");
-
-  const desglose = grupos.map((g) => `${g.items.length} ${g.corto}`).join(", ");
-  const asunto = `⚠️ ${total} ${total === 1 ? "partido" : "partidos"} sin cubrir: ${desglose}`;
-  const titulo = total === 1 ? "1 partido sin cubrir" : `${total} partidos sin cubrir`;
+  const titulo = cola.length === 1
+    ? "1 partido posiblemente sin cubrir"
+    : `${cola.length} partidos posiblemente sin cubrir`;
   const parrafo = motivoEnvio === "lote"
-    ? `Se han acumulado ${total} partidos que parecen desatendidos. Solo se listan los que siguen sin resolverse ahora mismo.`
-    : `Estos partidos llevan un rato desatendidos y siguen sin resolverse.`;
+    ? `Se han acumulado ${cola.length} partidos en los que el cronómetro parece desatendido.`
+    : `Estos partidos llevan un rato con el cronómetro desatendido y siguen sin resolverse.`;
 
-  const texto = [
-    parrafo,
-    total > 1 ? `Por redactor: ${resumenRedactores}` : "",
-    ...visibles.map((g) => [
-      `${g.emoji} ${g.titulo.toUpperCase()} (${g.items.length})`,
-      ...g.mostrados.map((a) => `- ${a.partido} · ${detalleAvisoDesatendido(a)}\n  ${urlPartido(a.id)}`),
-      g.ocultos > 0 ? `  …y ${g.ocultos} más de este grupo.` : "",
-    ].filter(Boolean).join("\n")),
-    `Ver todos en el panel: ${urlLista}`,
-  ].filter(Boolean).join("\n\n");
+  const lineasTexto = visibles
+    .map((a) => `- ${a.partido} (jornada ${a.jornada}) — ${a.redactor || "sin asignar"}: ${a.motivoCorto}\n  ${SITIO_URL}/admin/minuto-a-minuto.html?id=${a.id}`)
+    .join("\n");
 
-  const seccionesHtml = visibles.map((g) => `
-    <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;margin:0 0 14px;background:#eef1f5;border-radius:8px;padding:12px 16px;">
-      <tr><td style="padding:0 0 8px;">
-        <div style="font-size:13px;font-weight:700;color:#0c1b2e;">${g.emoji} ${escapeHtmlEmail(g.titulo)} <span style="color:#d1132e;">(${g.items.length})</span></div>
-        <div style="margin-top:2px;font-size:12px;line-height:1.4;color:#5a6270;">${escapeHtmlEmail(g.detalle)}</div>
-      </td></tr>
-      ${g.mostrados.map((a) => `
-      <tr><td style="padding:9px 0;border-top:1px solid #dde2ea;">
-        <a href="${urlPartido(a.id)}" style="font-size:14px;font-weight:700;color:#0c1b2e;text-decoration:none;">${escapeHtmlEmail(a.partido)}</a>
-        <div style="margin-top:3px;font-size:12.5px;line-height:1.45;color:#5a6270;">${escapeHtmlEmail(detalleAvisoDesatendido(a))}</div>
-      </td></tr>`).join("")}
-      ${g.ocultos > 0 ? `<tr><td style="padding:9px 0 0;border-top:1px solid #dde2ea;font-size:12.5px;color:#5a6270;">…y ${g.ocultos} más de este grupo (revisa el panel)</td></tr>` : ""}
-    </table>`).join("");
-
-  const bloqueHtml = `${total > 1 ? `<p style="margin:0 0 14px;font-size:13px;line-height:1.5;color:#5a6270;"><strong style="color:#0c1b2e;">Por redactor:</strong> ${escapeHtmlEmail(resumenRedactores)}</p>` : ""}${seccionesHtml}`;
-
-  const html = plantillaEmail({
-    etiqueta: "Aviso automático",
-    titulo,
-    parrafo,
-    bloqueHtml,
-    boton: { texto: "Ver sin cubrir en el panel", url: urlLista },
-  });
-  return { asunto, texto, html };
-}
-
-// Manda UN solo email con todos los partidos vigentes, agrupados.
-// Devuelve true si había algo que enviar.
-async function enviarDigestAvisosDesatendidos(env, avisos, motivoEnvio) {
-  if (!avisos.length) return false;
-  const { asunto, texto, html } = construirDigestAvisosDesatendidos(agruparAvisosDesatendidos(avisos), motivoEnvio);
-  const enviado = await enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario: EMAIL_NOTIFICACIONES });
-  if (!enviado) console.log("Resumen de partidos sin cubrir: el envío ha fallado (la cola ya estaba vaciada, no se reintenta).");
+  await enviarEmailNotificacion(env, {
+    asunto: `⚠️ ${titulo}`,
+    texto: `${parrafo}\n\n${lineasTexto}${ocultos > 0 ? `\n\n…y ${ocultos} partidos más.` : ""}\n\nRevisa el panel: ${enlaceLista}`,
+    html: plantillaEmail({
+      etiqueta: "Aviso automático",
+      titulo,
+      parrafo,
+      filas,
+      boton: { texto: "Abrir el panel", url: enlaceLista },
+    }),
+  }, { destinatario: EMAIL_NOTIFICACIONES });
   return true;
 }
 
@@ -4294,50 +2984,88 @@ async function enviarDigestAvisosDesatendidos(env, avisos, motivoEnvio) {
 // mitad, como siempre). El email ya NO sale desde aquí partido a
 // partido: lo manda enviarDigestAvisosDesatendidos cuando toca (ver el
 // bloque de comentarios "AVISOS EN LOTE" más arriba).
-async function revisarPartidosDesatendidos(env, ctx, partidosEnJuego) {
+async function revisarPartidosDesatendidos(env, ctx) {
   // Los partidos ya marcados como 'colgado' (ver marcarPartidosColgados,
   // que corre justo antes en el cron) se excluyen aquí para no duplicar
   // avisos: ese caso ya manda su propio email, más urgente, y ya no
   // está en estado 'en_juego' de todas formas.
-  //
-  // partidosEnJuego (opcional): lista ya cargada por el cron (ver
-  // "scheduled"). OJO: si viene de fuera puede faltarle
-  // aviso_desatendido_mitad si el llamador cargó una versión reducida;
-  // por eso el cron carga siempre la consulta "completa" (con todas las
-  // columnas que hacen falta aquí) y se la pasa también a
-  // marcarPartidosColgados, que solo usa un subconjunto de ellas.
-  const partidos = partidosEnJuego ?? (await env.DB.prepare(
+  const { results: partidos } = await env.DB.prepare(
     `SELECT id, competicion, jornada, equipo_local, equipo_visitante, autor_id, autor_nombre,
             inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos,
             aviso_desatendido_mitad
      FROM results WHERE estado = 'en_juego'`
-  ).all()).results;
+  ).all();
 
   // Aunque no haya partidos en juego hay que mirar la cola igualmente:
   // puede haber avisos pendientes de un partido que ya terminó, y su
   // temporizador de espera máxima debe seguir corriendo para que se
-  // envíen. Por eso no hay un "return" temprano aquí.
+  // envíen. Por eso ya no hay un "return" temprano aquí.
   for (const partido of partidos) {
-    // A qué mitad pertenece la situación (ver evaluarSituacionDesatendida)
-    // para repartir como mucho un aviso por mitad (columna
-    // aviso_desatendido_mitad) en vez de uno para todo el partido: así
-    // un partido desatendido en la 1ª parte que, tras retomarlo, vuelve
-    // a desatenderse en la 2ª, puede avisar otra vez.
-    //
-    // Si el partido ya no está en situación de riesgo pero se había
-    // avisado antes, no se toca nada: cada mitad solo se limpia cuando
-    // termina el partido o se reinicia desde cero, así no se vuelve a
-    // avisar dentro de la misma mitad nada más resolverse un despiste
-    // puntual.
-    const mitadesAvisadas = (partido.aviso_desatendido_mitad || "").split("_").filter(Boolean);
-    const situacion = await evaluarSituacionDesatendida(env, partido, mitadesAvisadas);
-    if (!situacion) continue;
-    if (mitadesAvisadas.includes(situacion.mitad)) continue; // ya avisado en esta mitad, no se repite
+    const corriendo = partido.cronometro_pausado_en === null || partido.cronometro_pausado_en === undefined;
+    const minuto = minutoEnVivoServidor(partido);
 
-    // Se marca la mitad como avisada YA (aunque el email salga más tarde
-    // en el lote): así el mismo partido no se vuelve a apuntar en la
-    // cola en el siguiente minuto del cron.
-    const nuevoValor = [...new Set([...mitadesAvisadas, situacion.mitad])].join("_");
+    // A qué mitad del partido pertenece la situación de riesgo detectada,
+    // para repartir como mucho un aviso por mitad (ver comentario de la
+    // columna aviso_desatendido_mitad) en vez de un único aviso para todo
+    // el partido: así un partido que se queda desatendido en la 1ª parte
+    // y luego, tras retomarlo, vuelve a quedarse desatendido en la 2ª,
+    // puede avisar de nuevo esa segunda vez en lugar de quedarse callado.
+    let motivo = null;
+    let motivoCorto = null;
+    let mitad = null;
+    if (corriendo && minuto >= UMBRAL_SEGUNDA_PARTE_SIN_FINAL) {
+      motivo = `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya registrado el final del partido.`;
+      motivoCorto = `min. ${minuto} sin final`;
+      mitad = "segunda";
+    } else if (corriendo && minuto >= UMBRAL_PRIMERA_PARTE_SIN_DESCANSO) {
+      const yaHuboDescanso = await env.DB.prepare(
+        "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = 'descanso' LIMIT 1"
+      ).bind(partido.id).first();
+      if (!yaHuboDescanso) {
+        motivo = `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya pitado el descanso.`;
+        motivoCorto = `min. ${minuto} sin descanso`;
+        mitad = "primera";
+      } else {
+        // Ya hubo descanso pero el cronómetro sigue corriendo por encima
+        // del umbral de la 1ª parte: en realidad ya estamos en la 2ª.
+        motivo = `El cronómetro sigue corriendo y ya marca el minuto ${minuto} sin que se haya registrado el final del partido.`;
+        motivoCorto = `min. ${minuto} sin final`;
+        mitad = "segunda";
+      }
+    } else if (!corriendo) {
+      const ultimaPausa = await env.DB.prepare(
+        `SELECT tipo, created_at FROM match_events WHERE resultado_id = ? AND tipo IN ('descanso', 'pausa_hidratacion')
+         ORDER BY id DESC LIMIT 1`
+      ).bind(partido.id).first();
+      if (ultimaPausa && ultimaPausa.tipo === "descanso") {
+        const desdeMs = new Date(String(ultimaPausa.created_at).replace(" ", "T") + "Z").getTime();
+        const minutosParado = isNaN(desdeMs) ? 0 : Math.floor((Date.now() - desdeMs) / 60000);
+        if (minutosParado >= UMBRAL_DESCANSO_SIN_REANUDAR) {
+          motivo = `El partido lleva parado en el descanso ${minutosParado} minutos sin que se haya iniciado la 2ª parte.`;
+          motivoCorto = `${minutosParado} min parado en el descanso`;
+          // El descanso es la frontera entre mitades: se cuenta como
+          // aviso de la 1ª parte (es el cierre pendiente de esa mitad).
+          mitad = "primera";
+        }
+      }
+    }
+
+    const mitadesAvisadas = (partido.aviso_desatendido_mitad || "").split("_").filter(Boolean);
+
+    if (!motivo) {
+      // Si el partido ya no está en situación de riesgo pero se había
+      // avisado antes, no se toca nada: cada mitad solo se limpia
+      // cuando termina el partido o se reinicia desde cero (abajo),
+      // así no se vuelve a avisar dentro de la misma mitad nada más
+      // resolverse un despiste puntual.
+      continue;
+    }
+    if (mitadesAvisadas.includes(mitad)) continue; // ya avisado en esta mitad, no se repite
+
+    // Se marca la mitad como avisada YA (igual que antes, aunque el email
+    // salga más tarde en el lote): así el mismo partido no se vuelve a
+    // apuntar en la cola en el siguiente minuto del cron.
+    const nuevoValor = [...new Set([...mitadesAvisadas, mitad])].join("_");
     await env.DB.prepare("UPDATE results SET aviso_desatendido_mitad = ? WHERE id = ?").bind(nuevoValor, partido.id).run();
 
     // INSERT ... ON CONFLICT: si el mismo partido ya estaba en la cola
@@ -4350,12 +3078,12 @@ async function revisarPartidosDesatendidos(env, ctx, partidosEnJuego) {
          redactor = excluded.redactor, motivo_corto = excluded.motivo_corto, encolado_ms = excluded.encolado_ms`
     ).bind(
       partido.id, `${partido.equipo_local} - ${partido.equipo_visitante}`, partido.jornada,
-      partido.autor_nombre || null, situacion.motivoCorto, Date.now()
+      partido.autor_nombre || null, motivoCorto, Date.now()
     ).run();
 
     await registrarActividad(env, null, { uid: null, nombre: "Vigilancia de partidos", rol: "sistema" }, {
       accion: "aviso_partido_desatendido", entidad: "resultado", entidad_id: partido.id,
-      descripcion: `Aviso automático (en cola para el resumen): ${partido.equipo_local} - ${partido.equipo_visitante} — ${situacion.motivo}`,
+      descripcion: `Aviso automático (en cola para el resumen): ${partido.equipo_local} - ${partido.equipo_visitante} — ${motivo}`,
     });
   }
 
@@ -4366,9 +3094,7 @@ async function revisarPartidosDesatendidos(env, ctx, partidosEnJuego) {
   // más antiguo (la cola viene ordenada por encolado_ms ASC) lleva
   // esperando más de AVISOS_DESATENDIDOS_ESPERA_MAX_MIN. Un encolado_ms
   // ilegible (NaN) cuenta como "ya lleva mucho": mejor avisar de más una
-  // vez que dejar un aviso atascado para siempre. Esta decisión usa la
-  // cola tal cual (una sola consulta por minuto); la comprobación de
-  // que cada partido sigue sin cubrir se hace solo al enviar.
+  // vez que dejar un aviso atascado para siempre.
   const esperaMin = Number.isFinite(cola[0].encoladoMs) ? (Date.now() - cola[0].encoladoMs) / 60000 : Infinity;
   const loteCompleto = cola.length >= AVISOS_DESATENDIDOS_LOTE;
   const esperaAgotada = esperaMin >= AVISOS_DESATENDIDOS_ESPERA_MAX_MIN;
@@ -4383,12 +3109,14 @@ async function revisarPartidosDesatendidos(env, ctx, partidosEnJuego) {
   // un fallo puntual de Resend es preferible a un bucle de reintentos
   // que agote el cupo diario.
   //
-  // Se trocea en lotes de 90 ids (límite de 100 parámetros bind en
-  // D1/SQLite, mismo criterio que contarPublicacionesPorTipoDeVarios):
-  // si la espera máxima acumula más de 100 partidos (una jornada entera
-  // sin nadie cubriendo) un DELETE de una sola vez fallaría con "too many
-  // SQL variables" y, al no borrarse la cola, el mismo aviso se
-  // reenviaría CADA MINUTO.
+  // Se trocea en lotes de 90 ids: D1/SQLite tiene un límite de 100
+  // parámetros bind por consulta (mismo criterio que
+  // contarPublicacionesPorTipoDeVarios). Con AVISOS_DESATENDIDOS_LOTE = 20
+  // rara vez habrá tantos, pero si la espera máxima acumula más de 100
+  // partidos (una jornada entera sin nadie cubriendo) un DELETE de una
+  // sola vez fallaría con "too many SQL variables" y, al no borrarse la
+  // cola, el mismo aviso se reenviaría CADA MINUTO: justo el bucle de
+  // emails que este sistema existe para evitar.
   const ids = cola.map((a) => a.id);
   const LOTE_BORRADO = 90;
   for (let inicio = 0; inicio < ids.length; inicio += LOTE_BORRADO) {
@@ -4397,16 +3125,7 @@ async function revisarPartidosDesatendidos(env, ctx, partidosEnJuego) {
       `DELETE FROM avisos_desatendidos_cola WHERE resultado_id IN (${lote.map(() => "?").join(",")})`
     ).bind(...lote).run();
   }
-
-  // Solo se avisa de lo que sigue sin cubrir en este momento. Si durante
-  // la espera se resolvió todo, no se manda nada (y ya no queda nada en
-  // la cola).
-  const vigentes = await validarAvisosDesatendidos(env, cola);
-  if (!vigentes.length) {
-    console.log(`Resumen de partidos sin cubrir: ${cola.length} aviso(s) en cola, todos resueltos antes de enviar. No se manda email.`);
-    return;
-  }
-  await enviarDigestAvisosDesatendidos(env, vigentes, loteCompleto ? "lote" : "espera");
+  await enviarDigestAvisosDesatendidos(env, cola, loteCompleto ? "lote" : "espera");
 }
 
 async function publicarArticulosProgramados(env) {
@@ -4422,7 +3141,7 @@ async function publicarArticulosProgramados(env) {
       `UPDATE articles SET publicado = 1, programado_para = NULL, slug_congelado = 1, fecha_publicacion = datetime('now'), updated_at = datetime('now') WHERE id = ?`
     ).bind(articulo.id).run();
 
-    const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista" }[articulo.tipo] || "Artículo";
+    const tipoLabel = { noticia: "Noticia", cronica: "Crónica", opinion: "Opinión", entrevista: "Entrevista" }[articulo.tipo] || "Artículo";
     const firmaAutores = articulo.coautor_nombre ? `${articulo.autor_nombre} y ${articulo.coautor_nombre}` : articulo.autor_nombre;
 
     await enviarEmailNotificacion(env, {
@@ -4434,7 +3153,7 @@ async function publicarArticulosProgramados(env) {
         parrafo: articulo.subtitulo || null,
         filas: [
           { etiqueta: "Autor", valor: firmaAutores },
-          { etiqueta: "Categoría", valor: clubArticuloLegible(articulo.club) || articulo.categoria },
+          { etiqueta: "Categoría", valor: articulo.club || articulo.categoria },
         ],
         boton: { texto: "Ver la noticia", url: urlNoticia(articulo.categoria, articulo.slug) },
       }),
@@ -4687,25 +3406,6 @@ async function superaLimitePeticionesPesadas(env, clave) {
   }
 }
 
-// Borra la entrada de caché de "articulo-partido" para un resultado
-// concreto (ver más abajo, GET /api/articles/:slug): se llama justo
-// después de cualquier cambio en ese partido (marcador, estado, goles,
-// tarjetas, alineaciones) para que la próxima visita a su crónica/previa
-// recoja el dato nuevo al momento, en vez de esperar a que expire el TTL
-// largo (hasta 1h) que ahora tiene esa caché para partidos que no están
-// "en_juego". Es "best effort" y nunca debe frenar la petición que la
-// dispara: si KV falla o no está configurado, simplemente no se invalida
-// nada y la próxima visita servirá el dato cacheado hasta que expire por
-// su cuenta -- no es un error grave, así que solo se registra.
-async function invalidarCacheArticuloPartido(env, resultadoId) {
-  if (!env.ELOTROFUTBOL_KV || !resultadoId) return;
-  try {
-    await env.ELOTROFUTBOL_KV.delete(`articulo-partido:${resultadoId}`);
-  } catch (err) {
-    console.error("[cache-articulo-partido] fallo al invalidar (no crítico):", err);
-  }
-}
-
 // Envuelve una ruta cara en caché de KV: si hay una respuesta reciente
 // guardada bajo `cacheKey`, la devuelve sin tocar D1; si no, ejecuta
 // `generar` (que sí consulta D1), guarda el resultado y lo devuelve.
@@ -4819,16 +3519,12 @@ async function calcularFuentesAnaliticas(env, desde) {
 }
 
 async function calcularAutoresAnaliticas(env, desde) {
-  // Antes esto sacaba la lista de article_id con vistas y volvía a
-  // consultar articles/article_reading con "WHERE id IN (?,?,?...)",
-  // bindeando un parámetro por artículo -- con más de 100 artículos
-  // distintos con vistas en el rango, D1 rechaza la consulta por
-  // superar su límite de 100 parámetros bindeados por statement (ver
-  // la nota completa en calcularCategoriasAnaliticas). Se reescribe
-  // igual que esa: vistas y lecturas se agregan por separado (evita el
-  // fan-out de un doble JOIN, cada evento se cuenta una vez) pero sin
-  // ninguna lista de IDs dinámica -- article_reading se filtra por
-  // fecha directamente, no por "IN (ids con vistas)".
+  // Ver la versión gemela en worker/src/index.js (D1) para la
+  // explicación completa: se quita el "WHERE id IN (?,?,?...)" con un
+  // parámetro por artículo (rompía el límite de 100 parámetros
+  // bindeados de D1 con tráfico real) en favor de un JOIN. Vistas y
+  // lecturas se siguen agregando por separado para evitar el fan-out de
+  // un doble JOIN (articles x article_views x article_reading).
   const { results: vistasPorArticulo } = await env.DB.prepare(
     `SELECT a.id, a.autor_nombre, COUNT(v.id) AS vistas
      FROM article_views v
@@ -4890,10 +3586,8 @@ async function calcularTiempoLecturaAnaliticas(env, desde) {
 }
 
 // ---------- Idiomas más usados al leer una noticia ----------
-// Cuenta vistas de article_views agrupadas por la columna `idioma` (ver
-// migracion_analiticas_idioma_partidos.sql). Devuelve también el
-// porcentaje sobre el total para que el panel pueda pintar barras sin
-// tener que recalcularlo en el cliente.
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
 const NOMBRES_IDIOMA = { es: "Castellano", eu: "Euskera", ca: "Català", gl: "Galego", en: "English" };
 async function calcularIdiomasAnaliticas(env, desde) {
   const { results } = await env.DB.prepare(
@@ -4913,8 +3607,8 @@ async function calcularIdiomasAnaliticas(env, desde) {
 }
 
 // ---------- Partidos más seguidos (minuto a minuto) ----------
-// Igual que calcularMasLeidasAnaliticas pero sobre result_views/results,
-// para la página pública minuto-a-minuto.html (ver /api/track/result-view).
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
 async function calcularPartidosMasSeguidosAnaliticas(env, desde, limit) {
   const { results } = await env.DB.prepare(
     `SELECT r.id, r.competicion, r.grupo, r.jornada, r.equipo_local, r.equipo_visitante,
@@ -4932,12 +3626,9 @@ async function calcularPartidosMasSeguidosAnaliticas(env, desde, limit) {
 }
 
 // ---------- Franja horaria con más tráfico ----------
-// Agrupa las vistas por hora del día (0-23), sumando todos los días del
-// rango: sirve para ver a qué hora suele leer la gente, no una serie
-// temporal (para eso está calcularUltimas24hAnaliticas). `created_at` es
-// TEXT tipo "YYYY-MM-DD HH:MM:SS" tanto en D1 como en Postgres, así que
-// substr(created_at, 12, 2) es válido en ambos motores sin necesitar
-// strftime (que sql-compat.js no traduce).
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa. substr() es SQL estándar (Postgres lo soporta como alias de
+// substring), así que no necesita traducción en sql-compat.js.
 async function calcularHorasAnaliticas(env, desde) {
   const { results } = await env.DB.prepare(
     `SELECT CAST(substr(created_at, 12, 2) AS INTEGER) AS hora, COUNT(*) AS vistas
@@ -4951,15 +3642,12 @@ async function calcularHorasAnaliticas(env, desde) {
 }
 
 // ---------- Rendimiento por tipo de artículo ----------
-// Mismo patrón (agregado por tabla, cruzado en JS) que
-// calcularAutoresAnaliticas, para no arrastrar el mismo problema de
-// fan-out con un JOIN directo entre articles/article_views/article_reading.
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
 async function calcularTiposAnaliticas(env, desde) {
-  // Mismo fix que calcularCategoriasAnaliticas/calcularAutoresAnaliticas:
-  // sin "WHERE id IN (?,?,?...)" con un parámetro por artículo (rompía
-  // el límite de 100 parámetros de D1 en cuanto había más de 100
-  // artículos con vistas en el rango). Vistas y lecturas se agregan por
-  // separado, sin lista de IDs dinámica.
+  // Mismo fix que calcularCategoriasAnaliticas/calcularAutoresAnaliticas
+  // (ver la versión gemela en worker/src/index.js, D1, para la
+  // explicación completa): sin "WHERE id IN (?,?,?...)" dinámico.
   const { results: vistasPorArticulo } = await env.DB.prepare(
     `SELECT a.id, a.tipo,
             COUNT(v.id) AS vistas,
@@ -5005,8 +3693,8 @@ async function calcularTiposAnaliticas(env, desde) {
 }
 
 // ---------- Engagement por scroll ----------
-// Reparte las lecturas del rango en 4 tramos según scroll_maximo (0-100).
-// Usamos SUM(CASE WHEN...) en una sola pasada en vez de 4 queries.
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
 async function calcularEngagementScrollAnaliticas(env, desde) {
   const fila = await env.DB.prepare(
     `SELECT
@@ -5029,10 +3717,9 @@ async function calcularEngagementScrollAnaliticas(env, desde) {
 }
 
 // ---------- Vistas últimas 24 horas ----------
-// A diferencia de calcularHorasAnaliticas (que agrega por hora del día
-// sobre todo el rango), esto es una serie temporal real de las últimas
-// 24h, en cubos de una hora, para el gráfico de línea del panel. No
-// depende de `desde`/`dias`: siempre son las últimas 24h desde ahora.
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa. datetime('now', '-1 days') lo traduce sql-compat.js a
+// (CURRENT_TIMESTAMP + INTERVAL '-1 days').
 async function calcularUltimas24hAnaliticas(env) {
   const { results } = await env.DB.prepare(
     `SELECT substr(created_at, 1, 13) AS hora_cubo, COUNT(*) AS vistas
@@ -5042,10 +3729,6 @@ async function calcularUltimas24hAnaliticas(env) {
   ).all();
   const porCubo = new Map((results || []).map((f) => [f.hora_cubo, Number(f.vistas) || 0]));
 
-  // Se generan las 24 franjas horarias siempre, aunque no tengan vistas,
-  // para que el eje X del gráfico no salte huecos. hora.slice(11, 16) en
-  // el frontend espera "YYYY-MM-DDTHH:MM", de ahí la 'T' en vez del
-  // espacio que usa created_at en la base de datos.
   const horas = [];
   const ahora = new Date();
   for (let i = 23; i >= 0; i--) {
@@ -5058,9 +3741,8 @@ async function calcularUltimas24hAnaliticas(env) {
 }
 
 // ---------- Buscador de noticia por titular ----------
-// Búsqueda simple por coincidencia parcial de título, con sus métricas
-// del rango de días activo en el panel. LIKE con comodines en ambos
-// lados de `q` funciona igual en SQLite/D1 y Postgres.
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
 async function calcularBuscarNoticiaAnaliticas(env, desde, q) {
   const { results } = await env.DB.prepare(
     `SELECT a.id, a.slug, a.titulo, a.tipo, a.categoria, a.autor_nombre,
@@ -5088,15 +3770,10 @@ async function calcularBuscarNoticiaAnaliticas(env, desde, q) {
 }
 
 // ---------- Rendimiento por categoría ----------
-// Antes esto agregaba article_views por article_id, sacaba la lista de
-// IDs con vistas y volvía a consultar articles con "WHERE id IN
-// (?,?,?...)" bindeando un parámetro por artículo. Con más de 100
-// artículos distintos con vistas en el rango (fácil en 28/90 días con
-// tráfico real), esa consulta superaba el límite de 100 parámetros
-// bindeados por statement de D1 y fallaba -- por eso esta tarjeta (y
-// autores/tipos, mismo patrón) podía quedarse sin datos o dar error
-// mientras el resto del panel iba bien. Ahora se hace todo en una sola
-// consulta con JOIN, sin lista de IDs dinámica.
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa: se quita el "WHERE id IN (?,?,?...)" con un parámetro por
+// artículo (rompía el límite de 100 parámetros bindeados de D1 con
+// tráfico real) en favor de un único JOIN.
 async function calcularCategoriasAnaliticas(env, desde) {
   const { results } = await env.DB.prepare(
     `SELECT a.categoria,
@@ -5120,22 +3797,9 @@ async function calcularCategoriasAnaliticas(env, desde) {
 }
 
 // ---------- Lectores nuevos vs. recurrentes ----------
-// "Recurrente" = visitante_estable con vistas en más de un día distinto
-// dentro del rango. OJO: no se puede usar visitante_hash aquí -- ese
-// hash incluye el día a propósito (ver hashVisitante(), para deduplicar
-// recargas del mismo día sin inflar "visitas únicas"), así que un mismo
-// visitante_hash SIEMPRE tiene un único día asociado y "recurrentes"
-// salía a 0 de forma sistemática. visitante_estable (ver
-// hashVisitanteEstable()) es el mismo tipo de hash no reversible pero
-// SIN el día, así que si la misma persona aparece en más de un día
-// distinto del rango, su visitante_estable sí se repite entre filas de
-// días distintos.
-//
-// Las filas con visitante_estable NULL (vistas registradas antes de
-// esta migración, ver migracion_analiticas_recurrencia.sql) se excluyen
-// -- no hay forma de saber si esas vistas antiguas eran recurrentes o
-// no, así que no se cuentan ni como nuevas ni como recurrentes en vez
-// de contarlas mal.
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa: visitante_hash no sirve para esto (incluye el día a
+// propósito), se usa visitante_estable en su lugar.
 async function calcularRecurrenciaAnaliticas(env, desde) {
   const { results } = await env.DB.prepare(
     `SELECT visitante_estable, COUNT(DISTINCT date(created_at)) AS dias_distintos
@@ -5152,11 +3816,8 @@ async function calcularRecurrenciaAnaliticas(env, desde) {
 }
 
 // ---------- Borrado de datos de tracking ----------
-// Borra article_views (y, en cascada, article_reading, que referencia
-// view_id ON DELETE CASCADE) de un rango de días o de todo el histórico.
-// Solo admin (comprobado en el router, igual que el resto de
-// /api/admin/analiticas/*). Devuelve cuántas filas de article_views se
-// han borrado para que el panel pueda confirmarlo en el toast.
+// Ver la versión gemela en worker/src/index.js (D1) para la explicación
+// completa.
 async function borrarDatosAnaliticas(env, { todo, dias }) {
   if (todo) {
     const fila = await env.DB.prepare(`SELECT COUNT(*) AS n FROM article_views`).first();
@@ -5170,256 +3831,6 @@ async function borrarDatosAnaliticas(env, { todo, dias }) {
   await env.DB.prepare(`DELETE FROM article_views WHERE created_at >= ${desde}`).run();
   return { filas_borradas: Number(fila?.n) || 0 };
 }
-
-/*
- * ================================================================
- * RECORDATORIOS DE INACTIVIDAD DE REDACTORES
- * ================================================================
- * Un redactor activo (users.rol = 'redactor', activo = 1, con email) que
- * pasa 30 días sin subir nada recibe un correo de recordatorio:
- *
- *   - Referencia de inactividad: la fecha de su última noticia (cualquier
- *     tipo, borrador o publicada, ver articles.fecha_publicacion) o, si
- *     nunca ha subido nada, la fecha de creación de su cuenta.
- *   - Aviso 1 al cumplirse 30 días desde esa referencia.
- *   - Avisos 2, 3, 4 y 5: uno cada 5 días desde el aviso anterior.
- *   - El aviso 5 lleva además el texto de incumplimiento de las normas
- *     del medio (apartado 2.1.5, "Compromiso", de la guía del medio).
- *   - 5 días después del aviso 5, si sigue sin subir nada, se manda UN
- *     correo a los admins diciendo que hay que expulsar a ese usuario
- *     (no se expulsa automáticamente: la decisión sigue siendo de un admin).
- *   - Si en cualquier momento sube algo, el ciclo se reinicia (la nueva
- *     referencia es esa noticia y el contador vuelve a 0).
- *
- * Solo corre en el Worker principal (D1), NO en el cron de respaldo de
- * Railway: si corriese en los dos, cada redactor recibiría cada aviso por
- * duplicado y se gastaría el doble del cupo diario de Resend (100/día).
- * Su estado vive en la tabla propia recordatorios_inactividad (ver
- * migracion_recordatorios_inactividad.sql), que NO se sincroniza con
- * Postgres. Una vez al día (a partir de las 10:00 hora de Madrid) se
- * hace una sola pasada; el resto de ticks del cron salen sin tocar D1.
- */
-const INACTIVIDAD_DIAS_HASTA_PRIMER_AVISO = 30;
-const INACTIVIDAD_DIAS_ENTRE_AVISOS = 5;
-const INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO = 5;
-const INACTIVIDAD_DIAS_HASTA_AVISAR_ADMINS = 5;
-const INACTIVIDAD_HORA_MADRID = 10;
-// Tope de correos de redactores por pasada, para no agotar el cupo diario
-// de Resend (p. ej. la primera vez, con muchas cuentas ya vencidas). Lo que
-// no quepa hoy se envía en la pasada de mañana: el estado solo avanza
-// cuando el correo sale bien.
-const INACTIVIDAD_MAX_CORREOS_POR_PASADA = 40;
-const INACTIVIDAD_DIA_MS = 24 * 60 * 60 * 1000;
-const INACTIVIDAD_KV_CLAVE = "recordatorios_inactividad:ultimo_dia";
-let INACTIVIDAD_ULTIMO_DIA_EN_MEMORIA = "";
-
-// Convierte una fecha guardada en D1 ("YYYY-MM-DD HH:MM:SS" en UTC, o ISO
-// con "T") a milisegundos. Devuelve null si no se puede interpretar.
-function msDesdeFechaBD(valor) {
-  if (!valor) return null;
-  let texto = String(valor).trim().replace(" ", "T");
-  if (!/(Z|[+-]\d{2}:?\d{2})$/.test(texto)) texto += "Z";
-  const ms = Date.parse(texto);
-  return Number.isNaN(ms) ? null : ms;
-}
-
-function diaYHoraEnMadrid(instante = new Date()) {
-  const p = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Madrid", hourCycle: "h23",
-    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit",
-  }).formatToParts(instante).reduce((acc, parte) => (acc[parte.type] = parte.value, acc), {});
-  return { dia: `${p.year}-${p.month}-${p.day}`, hora: Number(p.hour) };
-}
-
-// Días naturales (calendario de Madrid) entre dos instantes. Se usa para los
-// intervalos de "5 días" en vez de restar milisegundos: la pasada diaria corre
-// en el primer tick del cron tras las 10:00, con segundos de diferencia de un
-// día a otro, y con una resta exacta de 5*24h un aviso podía retrasarse un día
-// entero por esos segundos.
-function diasNaturalesMadridEntre(msAntes, msDespues) {
-  const dia = (ms) => Date.parse(diaYHoraEnMadrid(new Date(ms)).dia + "T00:00:00Z");
-  return Math.round((dia(msDespues) - dia(msAntes)) / INACTIVIDAD_DIA_MS);
-}
-
-function construirEmailRecordatorioInactividad({ nombre, diasSinSubir, numeroAviso }) {
-  const enlacePanel = `${SITIO_URL}/admin/login.html`;
-  const saludo = nombre ? `Hola ${nombre},` : "Hola,";
-  const despedida = ["Un abrazo,", "El equipo de El Otro Fútbol"];
-  let asunto;
-  let parrafos;
-
-  if (numeroAviso >= INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO) {
-    // Último aviso: tono amable, pero aquí sí va la referencia al apartado
-    // 2.1.5 (Compromiso) de la guía del medio y lo que pasará si no hay
-    // respuesta (a los 5 días se avisa a los admins, ver más abajo).
-    asunto = "Sobre tu colaboración en El Otro Fútbol";
-    parrafos = [
-      `Llevamos ${diasSinSubir} días sin ver ninguna noticia tuya y ya te hemos escrito varias veces. Sabemos que colaboras de forma totalmente voluntaria y que no es ninguna obligación, así que no queremos agobiarte.`,
-      "Aun así, tenemos que comentarte que una inactividad tan prolongada no encaja con el compromiso que aceptaste al unirte al medio, recogido en el apartado 2.1.5 (Compromiso) de la guía del medio.",
-      "Si no puedes o ya no te apetece seguir colaborando, no pasa nada: dínoslo y lo dejamos hablado sin ningún problema. Si prefieres seguir, nos encantaría verte publicar de nuevo. Si en los próximos " + INACTIVIDAD_DIAS_HASTA_AVISAR_ADMINS + " días no sabemos nada de ti, la administración tendrá que valorar tu continuidad en el medio.",
-      `Puedes entrar al panel cuando quieras: ${enlacePanel}`,
-    ];
-  } else if (numeroAviso === 1) {
-    asunto = "¡Te echamos de menos en El Otro Fútbol!";
-    parrafos = [
-      `Hace ya ${diasSinSubir} días que no subes ninguna noticia a El Otro Fútbol y queríamos escribirte para saber cómo estás.`,
-      "Sabemos que colaboras por voluntad propia y que no es ninguna obligación, así que no te lo tomes como un reproche: es solo un recordatorio amistoso. Como en su día te comprometiste a colaborar con el medio, nos gustaría contar contigo cuando puedas y tengas ganas.",
-      "Si estás liado/a o necesitas algo de nuestra parte, dínoslo sin problema.",
-      `Puedes entrar al panel cuando quieras: ${enlacePanel}`,
-    ];
-  } else {
-    asunto = "Un recordatorio amistoso de El Otro Fútbol";
-    parrafos = [
-      `Solo queríamos recordarte que seguimos contando contigo: ya han pasado ${diasSinSubir} días desde tu última noticia.`,
-      "Sabemos que colaboras por voluntad propia y que no es una obligación, así que sin ninguna presión. Simplemente, como te comprometiste con el medio, nos haría ilusión volver a ver tu nombre por aquí cuando te venga bien.",
-      "Si estás en una etapa con poco tiempo, cuéntanoslo y lo entendemos perfectamente.",
-      `Puedes entrar al panel cuando quieras: ${enlacePanel}`,
-    ];
-  }
-
-  // Nota final: quien recibe el correo puede creer que lo escribe una persona
-  // y contestar a la dirección de envío, que nadie lee.
-  const notaAutomatico = "Este es un mensaje automático, por favor no respondas a este correo. Si quieres comentarnos algo, escríbenos por el canal habitual del medio.";
-  const texto = [saludo, "", ...parrafos.flatMap((p) => [p, ""]), ...despedida, "", "--", notaAutomatico].join("\n");
-  const html = [saludo, ...parrafos, despedida.join("<br>")]
-    .map((p, i, todos) => (i === todos.length - 1 ? `<p>${p.split("<br>").map(escapeHtmlEmail).join("<br>")}</p>` : `<p>${escapeHtmlEmail(p)}</p>`))
-    .join("") + `<p style="color:#777;font-size:12px;margin-top:24px">${escapeHtmlEmail(notaAutomatico)}</p>`;
-  return { asunto, texto, html };
-}
-
-async function enviarRecordatoriosInactividadSiToca(env) {
-  const ahora = new Date();
-  const { dia, hora } = diaYHoraEnMadrid(ahora);
-  if (hora < INACTIVIDAD_HORA_MADRID) return;
-  if (INACTIVIDAD_ULTIMO_DIA_EN_MEMORIA === dia) return;
-
-  if (!env.ELOTROFUTBOL_KV) {
-    console.log("Recordatorios de inactividad omitidos: falta el binding ELOTROFUTBOL_KV");
-    return;
-  }
-
-  try {
-    if ((await env.ELOTROFUTBOL_KV.get(INACTIVIDAD_KV_CLAVE)) === dia) {
-      INACTIVIDAD_ULTIMO_DIA_EN_MEMORIA = dia;
-      return;
-    }
-    // Se reclama el día ANTES de trabajar: así un tick del cron que llegue
-    // mientras esta pasada aún corre no la duplica (y no se envían correos
-    // repetidos). Si la pasada falla, se reintenta al día siguiente.
-    await env.ELOTROFUTBOL_KV.put(INACTIVIDAD_KV_CLAVE, dia, { expirationTtl: 3 * INACTIVIDAD_DIA_MS / 1000 });
-    INACTIVIDAD_ULTIMO_DIA_EN_MEMORIA = dia;
-
-    const { results: redactores } = await env.DB.prepare(
-      `SELECT u.id, u.nombre, u.email, u.created_at,
-              (SELECT MAX(a.fecha_publicacion) FROM articles a WHERE a.autor_id = u.id) AS ultima_noticia,
-              r.ref_actividad, r.avisos_enviados, r.ultimo_aviso_at, r.admins_avisados_at
-       FROM users u
-       LEFT JOIN recordatorios_inactividad r ON r.user_id = u.id
-       WHERE u.rol = 'redactor' AND u.activo = 1`
-    ).all();
-
-    const paraAdmins = [];
-    let correosEnviados = 0;
-
-    for (const u of redactores || []) {
-      const email = (u.email || "").trim();
-      if (!email) continue; // sin correo no se le puede avisar (se pide en su primer login)
-
-      const refMs = Math.max(msDesdeFechaBD(u.created_at) ?? 0, msDesdeFechaBD(u.ultima_noticia) ?? 0);
-      if (!refMs) continue;
-
-      // ¿Ha subido algo desde que empezó el ciclo actual? Entonces se reinicia.
-      const refGuardadaMs = msDesdeFechaBD(u.ref_actividad);
-      const hayCicloPrevio = refGuardadaMs !== null && refMs <= refGuardadaMs;
-      const avisos = hayCicloPrevio ? (u.avisos_enviados || 0) : 0;
-      const ultimoAvisoMs = hayCicloPrevio ? msDesdeFechaBD(u.ultimo_aviso_at) : null;
-      const adminsAvisados = hayCicloPrevio && !!u.admins_avisados_at;
-      const diasSinSubir = Math.floor((ahora.getTime() - refMs) / INACTIVIDAD_DIA_MS);
-
-      if (avisos === 0) {
-        if (diasSinSubir < INACTIVIDAD_DIAS_HASTA_PRIMER_AVISO) continue;
-      } else if (avisos < INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO) {
-        if (!ultimoAvisoMs || diasNaturalesMadridEntre(ultimoAvisoMs, ahora.getTime()) < INACTIVIDAD_DIAS_ENTRE_AVISOS) continue;
-      } else {
-        // Ya tiene los 5 avisos: 5 días después del último, se avisa a los admins (una sola vez).
-        if (adminsAvisados || !ultimoAvisoMs) continue;
-        if (diasNaturalesMadridEntre(ultimoAvisoMs, ahora.getTime()) >= INACTIVIDAD_DIAS_HASTA_AVISAR_ADMINS) {
-          paraAdmins.push({ id: u.id, nombre: u.nombre, email, diasSinSubir, refIso: new Date(refMs).toISOString() });
-        }
-        continue;
-      }
-
-      if (correosEnviados >= INACTIVIDAD_MAX_CORREOS_POR_PASADA) continue; // el resto, mañana
-
-      const numeroAviso = avisos + 1;
-      const enviado = await enviarEmailNotificacion(
-        env,
-        construirEmailRecordatorioInactividad({ nombre: u.nombre, diasSinSubir, numeroAviso }),
-        { destinatario: email }
-      );
-      if (!enviado) continue; // el estado no avanza: se reintenta en la próxima pasada
-      correosEnviados++;
-      await env.DB.prepare(
-        `INSERT INTO recordatorios_inactividad (user_id, ref_actividad, avisos_enviados, ultimo_aviso_at, admins_avisados_at, updated_at)
-         VALUES (?, ?, ?, ?, NULL, datetime('now'))
-         ON CONFLICT(user_id) DO UPDATE SET
-           ref_actividad = excluded.ref_actividad,
-           avisos_enviados = excluded.avisos_enviados,
-           ultimo_aviso_at = excluded.ultimo_aviso_at,
-           admins_avisados_at = NULL,
-           updated_at = excluded.updated_at`
-      ).bind(u.id, new Date(refMs).toISOString(), numeroAviso, ahora.toISOString()).run();
-      // Pausa entre correos: Resend limita el ritmo de envío (unas 2 peticiones
-      // por segundo por defecto) y un 429 por ritmo se trataría como fallo de
-      // cuenta, gastando la secundaria sin necesidad.
-      await new Promise((resolver) => setTimeout(resolver, 600));
-    }
-
-    if (paraAdmins.length) await avisarAdminsDeExpulsion(env, paraAdmins, ahora);
-  } catch (err) {
-    console.log("Error en los recordatorios de inactividad de redactores:", err.message);
-  }
-}
-
-// Un único correo a todos los admins con los redactores que hay que
-// expulsar en esta pasada. Si ningún admin tiene email, va a la dirección
-// general del medio.
-async function avisarAdminsDeExpulsion(env, usuarios, ahora) {
-  const { results: admins } = await env.DB.prepare(
-    "SELECT email FROM users WHERE rol = 'admin' AND activo = 1 AND email IS NOT NULL AND TRIM(email) <> ''"
-  ).all();
-  const destinatarios = [...new Set((admins || []).map((a) => a.email.trim()))];
-  if (!destinatarios.length) destinatarios.push(EMAIL_NOTIFICACIONES);
-
-  const lineas = usuarios.map(
-    (u) => `- ${u.nombre} (${u.email}): ${u.diasSinSubir} días sin subir nada; ${INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO} avisos enviados y otros ${INACTIVIDAD_DIAS_HASTA_AVISAR_ADMINS} días sin respuesta.`
-  );
-  const asunto = usuarios.length === 1
-    ? `Se debe expulsar a ${usuarios[0].nombre} por inactividad`
-    : `Se debe expulsar a ${usuarios.length} redactores por inactividad`;
-  const texto = [
-    "Los siguientes redactores han incumplido las normativas del medio (apartado 2.1.5, Compromiso, de la guía del medio): han recibido los 5 avisos de inactividad y siguen sin subir ninguna noticia.",
-    "",
-    ...lineas,
-    "",
-    "Se tiene que expulsar a estos usuarios. La expulsión no es automática: hay que hacerla desde el panel de Usuarios.",
-  ].join("\n");
-  const html = `<p>Los siguientes redactores han incumplido las normativas del medio (apartado 2.1.5, Compromiso, de la guía del medio): han recibido los ${INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO} avisos de inactividad y siguen sin subir ninguna noticia.</p><ul>` +
-    usuarios.map((u) => `<li><strong>${escapeHtmlEmail(u.nombre)}</strong> (${escapeHtmlEmail(u.email)}): ${u.diasSinSubir} días sin subir nada.</li>`).join("") +
-    `</ul><p><strong>Se tiene que expulsar a estos usuarios.</strong> La expulsión no es automática: hay que hacerla desde el panel de Usuarios.</p>`;
-
-  let algunoEnviado = false;
-  for (const destinatario of destinatarios) {
-    if (await enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario })) algunoEnviado = true;
-  }
-  if (!algunoEnviado) return; // se reintenta en la próxima pasada
-
-  const marcas = usuarios.map((u) => env.DB.prepare(
-    "UPDATE recordatorios_inactividad SET admins_avisados_at = ?, updated_at = datetime('now') WHERE user_id = ?"
-  ).bind(ahora.toISOString(), u.id));
-  await env.DB.batch(marcas);
-}
-
 
 export default {
   // Expuestas también como propiedades del handler (no solo usadas
@@ -5437,11 +3848,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
-    // Fijado aquí, al principio de cada petición, para que json() y el
-    // resto de cors(resp) sin origen explícito de este archivo (ver
-    // ORIGEN_PETICION_ACTUAL más arriba) usen el origen real del
-    // visitante en vez de tener que pasarlo a mano en cada uno de los
-    // ~40 sitios que devuelven una respuesta.
     ORIGEN_PETICION_ACTUAL = request.headers.get("Origin");
 
     /*
@@ -5451,7 +3857,7 @@ export default {
      */
 
     if (method === "OPTIONS") {
-      return cors(new Response(null, { status: 204 }), ORIGEN_PETICION_ACTUAL);
+      return cors(new Response(null, { status: 204 }));
     }
 
     /*
@@ -5508,25 +3914,14 @@ export default {
       } catch (err) {
         html = paginaMantenimiento(env.MAINTENANCE_HASTA || null, env.MAINTENANCE_DESDE || null);
       }
-      // Sin cors() aquí, esta respuesta (503, sin cabecera
-      // Access-Control-Allow-Origin) hacía que el navegador la bloqueara
-      // como error de CORS en vez de dejar que el JavaScript de la
-      // página viera el 503 real. Eso ocultaba la causa real detrás de
-      // errores confusos en la consola ("blocked by CORS policy") en vez
-      // de un 503 legible, y en las páginas que comprueban el status
-      // (como el failover de apiFetch) hacía que un fallo de mantenimiento
-      // se tratara como un fallo de RED en vez de un 503 normal -- incluso
-      // así el failover acababa funcionando por el catch, pero de forma
-      // menos predecible y sin poder diagnosticarlo desde la consola del
-      // navegador.
-      return cors(new Response(html, {
+      return new Response(html, {
         status: 503,
         headers: {
           "Content-Type": "text/html; charset=utf-8",
           "Retry-After": "3600",
           "Cache-Control": "no-store",
         },
-      }), ORIGEN_PETICION_ACTUAL);
+      });
     }
 
     /*
@@ -5629,7 +4024,7 @@ export default {
             "Content-Type": "application/xml; charset=UTF-8",
             "Cache-Control": "public, max-age=3600",
           },
-        }), ORIGEN_PETICION_ACTUAL);
+        }));
       } catch (err) {
         // Si la base de datos falla, mejor devolver un sitemap vacío pero
         // válido que un error 500: así un rastreador que llegue en ese
@@ -5637,7 +4032,7 @@ export default {
         return cors(new Response(
           `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9"></urlset>\n`,
           { status: 200, headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "no-store" } }
-        ), ORIGEN_PETICION_ACTUAL);
+        ));
       }
     }
 
@@ -5708,12 +4103,12 @@ export default {
             // desaparezca sin esperar una hora entera.
             "Cache-Control": "public, max-age=600",
           },
-        }), ORIGEN_PETICION_ACTUAL);
+        }));
       } catch (err) {
         return cors(new Response(
           `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="https://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="https://www.google.com/schemas/sitemap-news/0.9"></urlset>\n`,
           { status: 200, headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "no-store" } }
-        ), ORIGEN_PETICION_ACTUAL);
+        ));
       }
     }
 
@@ -5768,14 +4163,14 @@ export default {
             "Content-Type": "application/rss+xml; charset=UTF-8",
             "Cache-Control": "public, max-age=3600",
           },
-        }), ORIGEN_PETICION_ACTUAL);
+        }));
       } catch (err) {
         // Mismo criterio que el sitemap: mejor un feed vacío pero válido
         // que un error 500.
         return cors(new Response(
           `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0"><channel><title>ELOTROFÚTBOLTV</title><link>https://elotrofutbol.media</link><description>Últimas noticias de fútbol modesto.</description></channel></rss>\n`,
           { status: 200, headers: { "Content-Type": "application/rss+xml; charset=UTF-8", "Cache-Control": "no-store" } }
-        ), ORIGEN_PETICION_ACTUAL);
+        ));
       }
     }
 
@@ -6014,27 +4409,23 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
      * ============================================================
      */
 
-    // Subidas de archivos (fotos/vídeos): NO se hace failover a Railway.
-    // Reenviar la subida no sirve de nada (el fallo suele ser del propio
-    // archivo, p. ej. Cloudinary lo rechaza) y además Railway responde
-    // "No autorizado" porque su tabla de sesiones es una réplica con
-    // retraso, lo que tapaba el error real y hacía que unas fotos
-    // subieran y otras no. Se devuelve tal cual lo que diga el principal.
-    const esSubidaDeArchivo = method === "POST" && (path === "/api/media" || path === "/api/subir-imagen");
-    let requestParaFailover;
+    // Cortacircuito por ruta (ver definición arriba, junto a
+    // fetchRailway): si esta ruta+método viene fallando de forma
+    // sostenida en el primario, se salta el intento y se va directo a
+    // Railway, en vez de sumar un intento fallido al primario en CADA
+    // petición mientras dura el problema.
+    const circuitoInfo = await circuitoEstaAbierto(env, method, path);
+    if (circuitoInfo.abierto) {
+      return await fetchRailway(
+        request,
+        path,
+        "CIRCUITO_ABIERTO",
+        env,
+        ctx
+      );
+    }
 
     try {
-      // Se clona el request ANTES de pasarlo a handlePrimary: si el
-      // backend principal lee el body (p. ej. `await request.json()` en
-      // rutas POST/PUT), el stream original queda consumido/bloqueado, y
-      // más abajo, si hace falta failover a Railway, `request.clone()`
-      // sobre un request ya leído lanza "This ReadableStream is
-      // currently locked to a reader" -- eso hacía que el failover
-      // fallara también, dejando la API entera con 502 en cualquier ruta
-      // de escritura. Clonando aquí, antes de tocar nada, el clon
-      // guardado en requestParaFailover conserva su stream intacto pase
-      // lo que pase dentro de handlePrimary.
-      requestParaFailover = request.clone();
       const primaryResponse = await handlePrimary(
         request,
         env,
@@ -6053,7 +4444,14 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
        * Solo hacemos failover ante errores 5xx.
        */
 
-      if (primaryResponse.status < 500 || esSubidaDeArchivo) {
+      if (primaryResponse.status < 500) {
+        // Éxito (o al menos, no es un fallo del servidor): limpia
+        // cualquier contador de fallos que hubiera para esta ruta. Se
+        // hace con ctx.waitUntil porque no es algo que deba retrasar la
+        // respuesta al usuario -es limpieza de estado, no parte de la
+        // respuesta en sí-.
+        ctx.waitUntil(circuitoRegistrarExitoPrimario(env, method, path, circuitoInfo.habiaRegistro));
+
         const headers = new Headers(
           primaryResponse.headers
         );
@@ -6097,8 +4495,15 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         `Activando Railway. Body: ${cuerpoErrorPrimario}`
       );
 
+      // Igual que el éxito de arriba: no debe retrasar la respuesta al
+      // usuario, así que se registra en segundo plano. El failover a
+      // Railway de ESTA petición ya se decide con el contador actual
+      // (antes de sumar este fallo); el efecto de este fallo se nota a
+      // partir de la SIGUIENTE petición a la misma ruta.
+      ctx.waitUntil(circuitoRegistrarFalloPrimario(env, method, path));
+
       return await fetchRailway(
-        requestParaFailover,
+        request,
         path,
         `PRIMARY_${primaryResponse.status}`,
         env,
@@ -6120,15 +4525,10 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         primaryError
       );
 
-      if (esSubidaDeArchivo) {
-        return json({
-          error: "Error interno del servidor al procesar el archivo. Puede ser demasiado pesado.",
-          detail: primaryError && primaryError.message ? primaryError.message : String(primaryError),
-        }, 500);
-      }
+      ctx.waitUntil(circuitoRegistrarFalloPrimario(env, method, path));
 
       return await fetchRailway(
-        requestParaFailover,
+        request,
         path,
         "PRIMARY_EXCEPTION",
         env,
@@ -6144,62 +4544,14 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
   async scheduled(event, env, ctx) {
     ctx.waitUntil(publicarArticulosProgramados(env));
     ctx.waitUntil(iniciarPartidosProgramadosCuyaHoraHaLlegado(env));
-
-    // Reducción de CPU del cron (corre cada minuto, 1440 veces/día):
-    // antes crearDescansoAutomaticoAlMinuto45, crearFinPartidoAutomaticoAlMinuto90,
-    // marcarPartidosColgados y revisarPartidosDesatendidos hacían CADA
-    // UNA su propio SELECT ... WHERE estado = 'en_juego' contra D1 en
-    // cada tick, aunque casi siempre esa tabla está vacía (no hay
-    // partidos en directo la mayor parte del día). Se sustituyen esas 4
-    // consultas por 1 sola aquí, y se le pasa el resultado a las 4
-    // funciones para que no repitan la lectura. Si esa única consulta
-    // sale vacía, ni siquiera se llaman las 3 que solo tienen sentido
-    // con partidos en juego (revisarPartidosDesatendidos sigue
-    // llamándose igual, porque también drena la cola de avisos
-    // pendientes aunque no haya nada 'en_juego' ahora mismo).
-    ctx.waitUntil((async () => {
-      let partidosEnJuego = [];
-      try {
-        const { results } = await env.DB.prepare(
-          `SELECT id, competicion, jornada, equipo_local, equipo_visitante, autor_id, autor_nombre,
-                  inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos,
-                  aviso_desatendido_mitad
-           FROM results WHERE estado = 'en_juego'`
-        ).all();
-        partidosEnJuego = results || [];
-      } catch (err) {
-        console.log("Error leyendo partidos en_juego para el cron:", err.message);
-      }
-
-      if (partidosEnJuego.length) {
-        const corriendo = partidosEnJuego.filter(
-          (p) => p.cronometro_pausado_en === null || p.cronometro_pausado_en === undefined
-        );
-        await crearDescansoAutomaticoAlMinuto45(env, corriendo);
-        await crearFinPartidoAutomaticoAlMinuto90(env, corriendo);
-      }
-
-      // marcarPartidosColgados va ANTES de revisarPartidosDesatendidos:
-      // pasa a 'colgado' los partidos con más de 2000' corriendo, para
-      // que ya no aparezcan como 'en_juego' cuando se ejecute la
-      // revisión de "desatendido" justo después y no se dupliquen los
-      // avisos. Como marcarPartidosColgados puede cambiar el estado en
-      // D1, revisarPartidosDesatendidos vuelve a mirar por sí misma qué
-      // sigue 'en_juego' de verdad en vez de reutilizar la lista de
-      // arriba, salvo cuando esa lista ya estaba vacía (nada que colgar).
-      const idsColgados = partidosEnJuego.length
-        ? await marcarPartidosColgados(env, ctx, partidosEnJuego)
-        : [];
-      const partidosParaDesatendidos = idsColgados.length
-        ? undefined // hubo cambios de estado: que revisarPartidosDesatendidos relea D1
-        : partidosEnJuego;
-      await revisarPartidosDesatendidos(env, ctx, partidosParaDesatendidos);
-    })());
-
+    ctx.waitUntil(crearDescansoAutomaticoAlMinuto45(env));
+    ctx.waitUntil(crearFinPartidoAutomaticoAlMinuto90(env));
+    // marcarPartidosColgados va ANTES de revisarPartidosDesatendidos:
+    // pasa a 'colgado' los partidos con más de 2000' corriendo, para que
+    // ya no aparezcan como 'en_juego' cuando se ejecute la revisión de
+    // "desatendido" justo después y no se dupliquen los avisos.
+    ctx.waitUntil(marcarPartidosColgados(env, ctx).then(() => revisarPartidosDesatendidos(env, ctx)));
     ctx.waitUntil(enviarBoletinSemanalSiToca(env));
-    // Recordatorios a redactores inactivos (una pasada al día; ver
-    // "RECORDATORIOS DE INACTIVIDAD DE REDACTORES" arriba).
-    ctx.waitUntil(enviarRecordatoriosInactividadSiToca(env));
     // Comprobación de cuota de D1 (ver "ALERTA DE CUOTA DIARIA DE D1"
     // más abajo). Se autolimita a una vez por hora internamente, así
     // que es seguro dejarla en el cron de cada minuto.
@@ -6316,6 +4668,210 @@ async function drainPendingWrites(request, env, ctx) {
   return json({ results: resultados });
 }
 
+// ============================================================
+// CORTACIRCUITO DE FAILOVER POR RUTA (server-side, en KV)
+// ============================================================
+//
+// Contexto del problema: sin esto, cada petición individual que llega al
+// Worker mientras UNA ruta concreta está devolviendo 5xx en el primario
+// (p.ej. un bug puntual en /api/polls/portada, o D1 con un problema
+// aislado a esa consulta) intentaba SIEMPRE primero contra el primario
+// -que fallaba- y LUEGO hacía failover a Railway. Con tráfico sostenido a
+// alta frecuencia contra esa misma ruta (un bucle de reintentos del
+// cliente, un bot, o simplemente mucho tráfico normal coincidiendo con el
+// fallo), esto duplica el trabajo en cada petición: un intento fallido al
+// primario más una petición completa a Railway, sin ningún límite. Es lo
+// que se vio en producción el 2026-09-04: ~30 peticiones/segundo a
+// /api/polls/portada, cada una golpeando primario Y Railway, sostenido
+// varios minutos -Railway terminó con "Killed" (OOM) por la carga real
+// generada, no por logs.
+//
+// Nótese que esto es DISTINTO del circuit breaker que ya existe en el
+// navegador (public/js/config.js, eofApiState): aquel vive en memoria de
+// cada pestaña del navegador y solo protege a ESE cliente. Este vive en
+// KV (compartido entre TODOS los isolates del Worker, en todas las
+// regiones) y protege al propio backend de tener que intentar el
+// primario en cada petición de CUALQUIER cliente mientras una ruta está
+// claramente caída.
+//
+// Diseño (a propósito más simple que el del navegador, sin "half-open"):
+//   - Se cuenta, en KV, cuántos 5xx consecutivos ha dado el primario para
+//     una ruta+método concretos (normalizando IDs numéricos en la ruta,
+//     ver normalizarRutaParaCircuito, para que /api/articles/123 y
+//     /api/articles/456 compartan contador -si no, un bucle que varía el
+//     ID nunca acumularía fallos "de la misma ruta").
+//   - Al llegar a CIRCUITO_FALLOS_PARA_ABRIR, se guarda una marca "abierto
+//     hasta <timestamp>" con TTL en KV.
+//   - Mientras el circuito esté abierto para esa ruta, las peticiones
+//     entrantes se envían DIRECTAMENTE a Railway, sin intentar el
+//     primario -así se evita el doble trabajo, y el primario deja de
+//     recibir presión de una ruta que ya se sabe que está fallando,
+//     dándole margen para recuperarse en vez de seguir recibiendo el
+//     mismo volumen de tráfico que causó/acompaña el problema-.
+//   - Pasado CIRCUITO_ABIERTO_MS, la siguiente petición vuelve a intentar
+//     el primario (sin contador de "medio abierto": si vuelve a fallar,
+//     se reabre inmediatamente con el próximo fallo).
+//   - Un solo 5xx aislado NO abre el circuito (evita que un error puntual
+//     tumbe la ruta entera durante 20s); hace falta que se repita.
+//
+// Todo esto es "best effort": si KV falla o no está disponible, se
+// comporta exactamente como antes (intenta primario en cada petición) --
+// nunca debe ser la causa de que una petición no se atienda.
+const CIRCUITO_FALLOS_PARA_ABRIR = 5;
+const CIRCUITO_ABIERTO_MS = 20_000;
+const CIRCUITO_KV_PREFIX = "circuito:";
+
+// Caché en memoria del isolate (no en KV) del último resultado "circuito
+// cerrado, sin registro" para cada ruta+método, con vida muy corta. Un
+// mismo isolate de Cloudflare Workers atiende muchas peticiones seguidas
+// mientras está caliente, y la inmensa mayoría son a las mismas rutas de
+// siempre (home, artículo, resultados...) con el circuito cerrado casi
+// siempre. Sin este caché, cada una de esas peticiones hace su propio
+// get() a KV aunque la respuesta vaya a ser la misma que hace 200ms.
+// Con un TTL de un par de segundos no se pierde capacidad de reacción
+// real (abrir el circuito sigue tardando como mucho eso de más en
+// notarse) pero se evita repetir la misma lectura de KV muchísimas veces
+// por segundo en tráfico alto. Solo se cachea el caso "cerrado y sin
+// registro" (el 99% de las veces): en cuanto haya CUALQUIER registro en
+// KV para una ruta (fallos acumulados, o circuito abierto) se deja de
+// usar este caché para esa ruta y se consulta KV en cada petición, para
+// no arriesgarse a servir un "cerrado" cacheado mientras el circuito
+// real ya está abierto.
+const CIRCUITO_CACHE_ISOLATE_TTL_MS = 2000;
+const circuitoCacheIsolate = new Map();
+
+function normalizarRutaParaCircuito(path) {
+  // Los IDs numéricos varían por petición pero deben compartir contador
+  // (/api/articles/123, /api/articles/456 -> /api/articles/:id). Sin
+  // esto, un bucle contra distintos IDs de una ruta con bug nunca
+  // acumularía suficientes fallos para abrir el circuito.
+  return path.replace(/\/\d+(?=\/|$)/g, "/:id");
+}
+
+function claveCircuito(method, path) {
+  return `${CIRCUITO_KV_PREFIX}${method}:${normalizarRutaParaCircuito(path)}`;
+}
+
+// Devuelve { abierto, habiaRegistro }: "abierto" es lo que ya se usaba
+// para decidir si saltar al failover; "habiaRegistro" indica si existía
+// CUALQUIER entrada en KV para esta ruta+método (esté abierta o solo con
+// fallos acumulados sin llegar a abrir). Se usa para evitar un DELETE de
+// KV innecesario en cada petición exitosa (ver circuitoRegistrarExitoPrimario
+// más abajo): en el caso normal (ruta sana, sin fallos previos) no hay
+// nada que limpiar, así que no hace falta la escritura. Antes se
+// llamaba a delete() en TODAS las peticiones con éxito -es decir,
+// prácticamente todo el tráfico del sitio, al pasar este worker por
+// delante de cada petición- aunque el 99% de las veces no había ninguna
+// clave que borrar; cada delete() cuenta como una operación de
+// escritura en KV igual que un put(), así que esto por sí solo disparaba
+// el consumo de KV muy por encima de lo necesario.
+async function circuitoEstaAbierto(env, method, path) {
+  if (!env.ELOTROFUTBOL_KV) return { abierto: false, habiaRegistro: false };
+  const clave = claveCircuito(method, path);
+  const cacheado = circuitoCacheIsolate.get(clave);
+  if (cacheado && Date.now() < cacheado.expiraEn) {
+    return { abierto: false, habiaRegistro: false };
+  }
+  try {
+    const valor = await env.ELOTROFUTBOL_KV.get(clave);
+    if (!valor) {
+      circuitoCacheIsolate.set(clave, { expiraEn: Date.now() + CIRCUITO_CACHE_ISOLATE_TTL_MS });
+      return { abierto: false, habiaRegistro: false };
+    }
+    const datos = JSON.parse(valor);
+    const abierto = typeof datos.abiertoHasta === "number" && Date.now() < datos.abiertoHasta;
+    return { abierto, habiaRegistro: true };
+  } catch (error) {
+    // No dejar que un fallo leyendo KV bloquee la petición: se comporta
+    // como si el circuito estuviera cerrado (intenta primario, como
+    // siempre se ha hecho).
+    console.warn("[circuito] no se pudo leer estado, se asume cerrado:", error.message);
+    return { abierto: false, habiaRegistro: false };
+  }
+}
+
+async function circuitoRegistrarFalloPrimario(env, method, path) {
+  if (!env.ELOTROFUTBOL_KV) return;
+  const clave = claveCircuito(method, path);
+  // Invalida el caché en memoria del isolate: a partir de ahora esta
+  // ruta sí tiene un registro real en KV (fallos acumulados o circuito
+  // abierto), así que las próximas peticiones deben volver a consultar
+  // KV en cada una, no servir el "cerrado" cacheado (ver
+  // circuitoEstaAbierto y el comentario junto a CIRCUITO_CACHE_ISOLATE_TTL_MS).
+  circuitoCacheIsolate.delete(clave);
+  try {
+    const actual = await env.ELOTROFUTBOL_KV.get(clave);
+    const datos = actual ? JSON.parse(actual) : { fallos: 0, abiertoHasta: 0 };
+    // Si el circuito ya estaba abierto, este fallo no suma al contador de
+    // "fallos consecutivos para abrir" -ya está abierto-, pero si acaba
+    // de expirar el TTL de apertura anterior, se trata como un fallo
+    // nuevo tras haber estado cerrado.
+    const yaAbierto = Date.now() < datos.abiertoHasta;
+    const nuevosFallos = yaAbierto ? datos.fallos : datos.fallos + 1;
+    const abrirAhora = nuevosFallos >= CIRCUITO_FALLOS_PARA_ABRIR;
+    const nuevoEstado = {
+      fallos: abrirAhora ? 0 : nuevosFallos, // se resetea el contador al abrir
+      abiertoHasta: abrirAhora ? Date.now() + CIRCUITO_ABIERTO_MS : datos.abiertoHasta,
+    };
+    // TTL generoso (el doble del tiempo que el circuito puede estar
+    // abierto): suficiente para que la clave sobreviva mientras el
+    // circuito está abierto, pero sin dejar contadores de fallos
+    // colgados en KV indefinidamente si la ruta se recupera y no vuelve
+    // a fallar.
+    await env.ELOTROFUTBOL_KV.put(clave, JSON.stringify(nuevoEstado), {
+      expirationTtl: Math.ceil((CIRCUITO_ABIERTO_MS * 2) / 1000),
+    });
+    if (abrirAhora && !yaAbierto) {
+      console.warn(
+        `[circuito] ABIERTO para ${method} ${normalizarRutaParaCircuito(path)} tras ` +
+        `${CIRCUITO_FALLOS_PARA_ABRIR} fallos consecutivos del primario. ` +
+        `Las próximas peticiones a esta ruta irán directas a Railway durante ${CIRCUITO_ABIERTO_MS / 1000}s.`
+      );
+    }
+  } catch (error) {
+    console.warn("[circuito] no se pudo registrar fallo:", error.message);
+  }
+}
+
+// Solo borra la clave si de verdad existía (habiaRegistro=true), para no
+// gastar una escritura de KV en el caso normal (ruta sana, nunca ha
+// fallado, no hay nada que limpiar) -- ver el comentario en
+// circuitoEstaAbierto. Antes se llamaba siempre, sin comprobar antes si
+// hacía falta.
+async function circuitoRegistrarExitoPrimario(env, method, path, habiaRegistro) {
+  if (!env.ELOTROFUTBOL_KV || !habiaRegistro) return;
+  const clave = claveCircuito(method, path);
+  try {
+    // Un éxito limpia el contador de fallos por completo (no hace falta
+    // esperar un TTL): la ruta ha demostrado estar sana de nuevo.
+    await env.ELOTROFUTBOL_KV.delete(clave);
+  } catch (error) {
+    // No es crítico: el peor caso es que el contador tarde un poco más
+    // en resetearse (el TTL de arriba lo limpia de todas formas).
+  }
+}
+
+// Resumen periódico del volumen de peticiones que van a Railway por
+// tener el circuito abierto (ver fetchRailway más abajo). Vive en
+// memoria del isolate (no en KV): cada isolate de Cloudflare Workers es
+// efímero y de corta vida, así que no hace falta compartir este contador
+// entre isolates -es solo para no generar una línea de log por cada
+// petición mientras dura un mismo isolate atendiendo tráfico hacia una
+// ruta con el circuito abierto-.
+const RESUMEN_FAILOVER_INTERVALO_MS = 30_000;
+const contadorFailoverPorCircuito = { total: 0, timer: null };
+function programarResumenFailoverPorCircuito() {
+  if (contadorFailoverPorCircuito.timer) return;
+  contadorFailoverPorCircuito.timer = setTimeout(() => {
+    console.log(
+      `[FAILOVER] ${contadorFailoverPorCircuito.total} petición(es) enviadas directas a Railway ` +
+      `por circuito abierto en los últimos ${RESUMEN_FAILOVER_INTERVALO_MS / 1000}s.`
+    );
+    contadorFailoverPorCircuito.total = 0;
+    contadorFailoverPorCircuito.timer = null;
+  }, RESUMEN_FAILOVER_INTERVALO_MS);
+}
+
 async function fetchRailway(
   request,
   path,
@@ -6325,19 +4881,53 @@ async function fetchRailway(
 ) {
   // BUG (incidente): antes se usaba `RAILWAY_URL` a secas, una variable
   // que no existía en ningún sitio de este archivo (ni const de módulo, ni
-  // en env/wrangler.toml) -> ReferenceError: RAILWAY_URL is not defined en
-  // cuanto se intentaba hacer failover. Se lee de env.RAILWAY_URL (variable
-  // de wrangler.toml, ver [vars]), con la misma URL pública de Railway que
-  // ya se usaba como valor por defecto en public/js/config.js como
-  // fallback si no está configurada.
+  // en env) -> ReferenceError: RAILWAY_URL is not defined en cuanto se
+  // intentaba hacer failover. Se lee de env.RAILWAY_URL, con la misma URL
+  // pública que ya se usaba como valor por defecto en public/js/config.js
+  // como fallback si no está configurada.
+  //
+  // Además: cuando este mismo archivo corre DENTRO de Railway (importado
+  // por server-railway.js, con env.RUNNING_IN_RAILWAY = true — ver ese
+  // archivo), "hacer failover a Railway" no tiene sentido: Railway ya es
+  // quien está atendiendo la petición. Si su propia consulta a Postgres
+  // falla, reenviarse a su propia URL pública solo crea una petición HTTP
+  // extra contra sí mismo con el mismo resultado. En ese caso se deja que
+  // el error original se propague en vez de reenviar.
+  if (env.RUNNING_IN_RAILWAY) {
+    console.log(
+      `[FAILOVER] Petición dentro de Railway, no se reenvía a sí mismo (${reason})`
+    );
+    throw new Error(
+      `No se puede hacer failover a Railway: ya se está ejecutando en Railway (motivo original: ${reason})`
+    );
+  }
+
   const railwayUrl =
-    (env.RAILWAY_URL || "https://elotro-futbol-api-production-e57c.up.railway.app") +
+    (env.RAILWAY_URL || "https://elotro-futbol-api-production.up.railway.app") +
     path +
     new URL(request.url).search;
 
-  console.log(
-    `[FAILOVER] Railway → ${request.method} ${path} (${reason})`
-  );
+  // Antes: console.log incondicional por CADA petición reenviada a
+  // Railway. Bajo el patrón visto en producción (una ruta fallando de
+  // forma sostenida, ~30 peticiones/segundo durante minutos) esto por sí
+  // solo generaba miles de líneas en wrangler tail. Con reason ===
+  // "CIRCUITO_ABIERTO" (ver circuitoEstaAbierto arriba) puede seguir
+  // habiendo ese mismo volumen de peticiones yendo directas a Railway
+  // mientras el circuito sigue abierto -es justo el caso que el
+  // cortacircuito no puede evitar del todo, solo evita el intento
+  // duplicado contra el primario-, así que aquí también se resume en vez
+  // de loguear una línea por petición cuando la razón es el circuito.
+  // Para el resto de razones (PRIMARY_5xx puntual, excepción, test
+  // manual) sí interesa ver cada una: son mucho menos frecuentes y cada
+  // una es señal de un fallo real distinto.
+  if (reason === "CIRCUITO_ABIERTO") {
+    contadorFailoverPorCircuito.total++;
+    programarResumenFailoverPorCircuito();
+  } else {
+    console.log(
+      `[FAILOVER] Railway → ${request.method} ${path} (${reason})`
+    );
+  }
 
   try {
     /*
@@ -6369,15 +4959,7 @@ async function fetchRailway(
           request.method === "GET" ||
           request.method === "HEAD"
             ? undefined
-            // Antes: request.clone().body. request ya nos llega aquí
-            // como un clon dedicado (ver requestParaFailover en el
-            // handler principal), así que no hace falta clonarlo otra
-            // vez -- y si alguna otra llamada a fetchRailway pasara en
-            // el futuro el request original (ya leído por handlePrimary),
-            // llamar aquí a .clone() sobre un stream ya bloqueado es
-            // justo lo que provocaba "This ReadableStream is currently
-            // locked to a reader" y tumbaba el failover entero.
-            : request.body,
+            : request.clone().body,
 
         redirect: "follow"
       }
@@ -6441,17 +5023,14 @@ async function fetchRailway(
     // la respuesta de Railway con un error de CORS que oculta el error
     // real (que puede ser un 502/503/500 legítimo), como pasaba en
     // producción: la consola mostraba "blocked by CORS policy" en vez del
-    // fallo real de Railway. Se usa la misma whitelist que cors() (ver
-    // ORIGENES_PERMITIDOS más arriba) en vez de un origen fijo, para que
-    // esta ruta de failover no quede más permisiva ni más restrictiva
-    // que el resto de la API.
+    // fallo real de Railway. Se usa la whitelist en vez de un origen fijo.
     if (origenPermitido(ORIGEN_PETICION_ACTUAL)) {
       headers.set("Access-Control-Allow-Origin", ORIGEN_PETICION_ACTUAL);
       headers.set("Vary", "Origin");
     }
     headers.set(
       "Access-Control-Allow-Methods",
-      "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+      "GET,POST,PUT,DELETE,OPTIONS"
     );
     headers.set(
       "Access-Control-Allow-Headers",
@@ -6524,11 +5103,6 @@ async function fetchRailway(
         }
       }
     );
-    // Antes se mandaba "Access-Control-Allow-Origin: *" fijo aquí (sin
-    // esta cabecera el navegador rechaza la respuesta antes de que el
-    // código de la página llegue a verla, y el frontend nunca se entera
-    // de que ambas APIs han caído). Se usa la whitelist en su lugar, por
-    // el mismo motivo que en el resto de esta función.
     if (origenPermitido(ORIGEN_PETICION_ACTUAL)) {
       respuestaFailoverTotal.headers.set("Access-Control-Allow-Origin", ORIGEN_PETICION_ACTUAL);
       respuestaFailoverTotal.headers.set("Vary", "Origin");
@@ -6716,22 +5290,9 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- Login/registro de lector con cuenta de Google ----------
-      // Un único endpoint para ambos casos (a diferencia de
-      // register+login, que son dos pasos separados en el flujo con
-      // contraseña): el botón "Continuar con Google" del frontend manda
-      // aquí el id_token que entrega Google Identity Services, y:
-      //   - si ya existe un lector con ese google_id, es un login normal;
-      //   - si no, pero existe un lector con ese mismo email (se
-      //     registró antes con correo+contraseña), se vincula google_id
-      //     a esa cuenta ya existente (Google ya ha verificado el
-      //     correo, así que es seguro asumir que es la misma persona;
-      //     a partir de ahora puede entrar por cualquiera de los dos
-      //     caminos indistintamente);
-      //   - si no existe ninguno de los dos, se crea la cuenta al vuelo,
-      //     ya verificada (Google es garantía suficiente) y sin
-      //     contraseña (password_hash/salt quedan NULL: puede ponerse
-      //     una más adelante desde su perfil si quiere entrar también
-      //     sin Google, aunque eso no está aún expuesto en el frontend).
+      // Ver el comentario largo en worker/src/index.js (Worker
+      // principal) para la explicación completa del flujo. Réplica
+      // exacta aquí para que funcione también durante un failover.
       if (path === "/api/readers/google" && method === "POST") {
         if (!env.GOOGLE_CLIENT_ID) return json({ error: "El acceso con Google no está configurado" }, 500);
         const { credential } = await request.json();
@@ -6756,26 +5317,15 @@ async function handlePrimary(request, env, ctx) {
         if (!lector) {
           const porEmail = await env.DB.prepare("SELECT * FROM readers WHERE email = ? AND activo = 1").bind(email).first();
           if (porEmail) {
-            // Cuenta ya existente (registrada con correo+contraseña):
-            // se vincula en vez de duplicar. Se aprovecha para marcar el
-            // correo como verificado si no lo estaba ya (viniendo de
-            // Google, lo está).
             await env.DB.prepare(
               "UPDATE readers SET google_id = ?, email_verificado = 1, avatar_url = COALESCE(avatar_url, ?) WHERE id = ?"
             ).bind(googleId, avatarUrl, porEmail.id).run();
             lector = { ...porEmail, google_id: googleId, email_verificado: 1 };
           } else {
-            // password_hash/salt son NOT NULL en el esquema original (no
-            // se ha tocado esa restricción para evitar recrear la tabla
-            // "readers", que tiene claves foráneas desde varias tablas
-            // -- reader_sessions, comments, encuestas, porras...-- y
-            // recrearla obligaría a recrearlas todas en cascada). Para
-            // una cuenta que entra solo con Google no hace falta una
-            // contraseña real: se guarda un hash de una contraseña
-            // aleatoria que nadie conoce ni puede volver a generar, así
-            // que en la práctica equivale a "sin contraseña" (el login
-            // normal por email+contraseña nunca podrá adivinarla) sin
-            // tener que tocar el esquema de la tabla.
+            // Mismo motivo que en worker/src/index.js: se evita depender
+            // de que password_hash/salt permitan NULL (para no obligar a
+            // tocar el esquema también en Postgres si no hace falta) con
+            // un hash de contraseña aleatoria que nadie puede reproducir.
             const saltRelleno = randomSalt();
             const arrRelleno = new Uint8Array(32);
             crypto.getRandomValues(arrRelleno);
@@ -6797,17 +5347,9 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- Login/registro de lector con cuenta de Microsoft ----------
-      // Mismo patrón que /api/readers/google (ver comentario arriba):
-      // un único endpoint para login y registro. El botón "Continuar/
-      // Registrarme con Microsoft" del frontend manda aquí el id_token
-      // que entrega MSAL.js, y:
-      //   - si ya existe un lector con ese microsoft_id, es un login normal;
-      //   - si no, pero existe un lector con ese mismo email (registrado
-      //     antes con correo+contraseña o con Google), se vincula
-      //     microsoft_id a esa cuenta ya existente;
-      //   - si no existe ninguno de los dos, se crea la cuenta al
-      //     vuelo, ya verificada, sin contraseña real (mismo relleno
-      //     aleatorio que en el flujo de Google, ver comentario allí).
+      // Ver el comentario largo en worker/src/index.js (Worker
+      // principal) para la explicación completa del flujo. Réplica
+      // exacta aquí para que funcione también durante un failover.
       if (path === "/api/readers/microsoft" && method === "POST") {
         if (!env.MICROSOFT_CLIENT_ID) return json({ error: "El acceso con Microsoft no está configurado" }, 500);
         const { credential } = await request.json();
@@ -6831,12 +5373,14 @@ async function handlePrimary(request, env, ctx) {
         if (!lector) {
           const porEmail = await env.DB.prepare("SELECT * FROM readers WHERE email = ? AND activo = 1").bind(email).first();
           if (porEmail) {
-            // Cuenta ya existente: se vincula en vez de duplicar.
             await env.DB.prepare(
               "UPDATE readers SET microsoft_id = ?, email_verificado = 1 WHERE id = ?"
             ).bind(microsoftId, porEmail.id).run();
             lector = { ...porEmail, microsoft_id: microsoftId, email_verificado: 1 };
           } else {
+            // Mismo motivo que en el flujo de Google: se evita depender
+            // de que password_hash/salt permitan NULL con un hash de
+            // contraseña aleatoria que nadie puede reproducir.
             const saltRelleno = randomSalt();
             const arrRelleno = new Uint8Array(32);
             crypto.getRandomValues(arrRelleno);
@@ -6858,21 +5402,11 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- Login/registro de lector con cuenta de Discord ----------
-      // A diferencia de Google/Microsoft (que entregan un id_token JWT
-      // ya firmado, verificable sin más pasos), Discord usa OAuth 2.0
-      // "de toda la vida": el navegador va a discord.com, el usuario
-      // autoriza, y Discord redirige de vuelta con un "code" de un solo
-      // uso que hay que canjear por un access_token llamando a la API
-      // de Discord DESDE EL SERVIDOR (con el client_secret, que nunca
-      // debe llegar al navegador). Por eso son dos rutas en vez de una:
-      //   1) /api/readers/discord/iniciar redirige a Discord;
-      //   2) /api/readers/discord/callback recibe el "code" de vuelta,
-      //      lo canjea, pide el perfil, y crea/vincula/loguea al lector
-      //      exactamente igual que /api/readers/google.
-      //
-      // "state" (un valor aleatorio de un solo uso) evita ataques CSRF
-      // sobre el callback: se guarda en una cookie de corta duración al
-      // iniciar y se compara con el que Discord devuelve.
+      // Ver el comentario largo en worker/src/index.js (Worker
+      // principal) para la explicación completa del flujo OAuth 2.0 de
+      // Discord (redirect + code + canje server-side, a diferencia de
+      // Google/Microsoft). Réplica exacta aquí para que funcione
+      // también durante un failover.
       if (path === "/api/readers/discord/iniciar" && method === "GET") {
         if (!env.DISCORD_CLIENT_ID) return json({ error: "El acceso con Discord no está configurado" }, 500);
 
@@ -6889,10 +5423,6 @@ async function handlePrimary(request, env, ctx) {
         });
 
         const headers = new Headers({ Location: `https://discord.com/api/oauth2/authorize?${paramsDiscord}` });
-        // Cookie de corta duración: solo hace falta que sobreviva el
-        // ida-y-vuelta a Discord (unos segundos/minutos), no una sesión
-        // larga. Se guarda también "volver" para no perder a dónde
-        // quería ir el usuario tras iniciar sesión.
         headers.append(
           "Set-Cookie",
           `eof_discord_state=${state}|${encodeURIComponent(volver)}; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax`
@@ -6901,10 +5431,6 @@ async function handlePrimary(request, env, ctx) {
       }
 
       if (path === "/api/readers/discord/callback" && method === "GET") {
-        // Cualquier fallo a partir de aquí redirige a acceso.html con un
-        // mensaje de error legible, en vez de mostrar un JSON pelado:
-        // el usuario ha llegado aquí desde un redirect de Discord, no
-        // desde una llamada fetch() del frontend.
         const irConError = (mensaje) => Response.redirect(
           `${SITIO_URL}/acceso.html?errorDiscord=${encodeURIComponent(mensaje)}`, 302
         );
@@ -6988,248 +5514,12 @@ async function handlePrimary(request, env, ctx) {
 
         const token = await crearSesionLector(env, request, lector);
 
-        // A diferencia de Google/Microsoft (llamadas fetch() que
-        // devuelven JSON al propio frontend), este es un redirect real
-        // del navegador: no hay JS esperando la respuesta al otro lado,
-        // así que el token de sesión se manda en la URL de vuelta y
-        // guardarSesionLector() en el frontend lo recoge de ahí (ver
-        // lector-auth.js). Se limpia la cookie de "state", ya usada.
         const destino = volverGuardado || "index.html";
         const headers = new Headers({
           Location: `${SITIO_URL}/${destino}${destino.includes("?") ? "&" : "?"}sesionDiscord=${token}`,
         });
         headers.append("Set-Cookie", "eof_discord_state=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax");
         return new Response(null, { status: 302, headers });
-      }
-
-      // ---------- Login/registro de lector con cuenta de X ----------
-      // Mismo patrón que Discord (ver comentario justo arriba: redirect
-      // completo, no id_token), pero X exige además PKCE (Proof Key for
-      // Code Exchange) de forma obligatoria en OAuth 2.0, a diferencia
-      // de Discord: se genera un "code_verifier" aleatorio, se manda su
-      // hash ("code_challenge") al autorizar, y el "code_verifier" en
-      // claro al canjear el code por el token, para que solo quien
-      // inició este flujo concreto (no un atacante que intercepte el
-      // code) pueda completarlo.
-      //
-      // OJO -- PENDIENTE DE DECIDIR: el tier gratuito de la API de X no
-      // entrega el email del usuario en el perfil (solo username, id y
-      // nombre), a diferencia de Google/Microsoft/Discord. Por ahora,
-      // igual que con los demás proveedores, se guarda un
-      // password_hash de relleno (sin contraseña real) PERO el campo
-      // "email" se rellena con un valor sintético
-      // (`x-<id>@x.elotrofutbol.media`, no es un correo real ni
-      // entregable) solo para poder cumplir la restricción NOT NULL de
-      // "readers.email" sin tocar el esquema de la tabla. Falta decidir
-      // qué hacer de verdad (pedir el correo aparte en un paso extra
-      // tras el primer login, como ya se hace con redactores, o pasar a
-      // un tier de pago de la API de X que sí de el email real) antes
-      // de dar esto por terminado: mientras tanto, estas cuentas NO
-      // podrán recuperar contraseña por correo ni recibir
-      // notificaciones por email, porque ese campo no es una dirección
-      // real a la que se pueda escribir.
-      if (path === "/api/readers/x/iniciar" && method === "GET") {
-        if (!env.X_CLIENT_ID) return json({ error: "El acceso con X no está configurado" }, 500);
-
-        const state = randomSalt();
-        const codeVerifier = randomSalt() + randomSalt(); // PKCE exige 43-128 caracteres
-        const codeChallenge = base64urlDeHash(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(codeVerifier)));
-        const volver = url.searchParams.get("volver") || "";
-        const redirectUri = `${API_URL}/api/readers/x/callback`;
-
-        const paramsX = new URLSearchParams({
-          client_id: env.X_CLIENT_ID,
-          redirect_uri: redirectUri,
-          response_type: "code",
-          scope: "users.read tweet.read",
-          state,
-          code_challenge: codeChallenge,
-          code_challenge_method: "S256",
-        });
-
-        const headers = new Headers({ Location: `https://x.com/i/oauth2/authorize?${paramsX}` });
-        // Cookie de corta duración: solo hace falta que sobreviva el
-        // ida-y-vuelta a X (unos segundos/minutos). Además de "state" y
-        // "volver" (igual que Discord), aquí también hay que guardar
-        // "codeVerifier" para el canje del token en el callback, ya que
-        // PKCE lo exige y no viaja en la URL de autorización de vuelta.
-        headers.append(
-          "Set-Cookie",
-          `eof_x_state=${state}|${encodeURIComponent(volver)}|${codeVerifier}; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax`
-        );
-        return new Response(null, { status: 302, headers });
-      }
-
-      if (path === "/api/readers/x/callback" && method === "GET") {
-        // Cualquier fallo a partir de aquí redirige a acceso.html con un
-        // mensaje de error legible, en vez de mostrar un JSON pelado:
-        // el usuario ha llegado aquí desde un redirect de X, no desde
-        // una llamada fetch() del frontend.
-        const irConError = (mensaje) => Response.redirect(
-          `${SITIO_URL}/acceso.html?errorX=${encodeURIComponent(mensaje)}`, 302
-        );
-
-        if (!env.X_CLIENT_ID || !env.X_CLIENT_SECRET) return irConError("El acceso con X no está configurado");
-
-        const code = url.searchParams.get("code");
-        const stateRecibido = url.searchParams.get("state");
-        if (!code || !stateRecibido) return irConError("X no ha devuelto los datos esperados");
-
-        const cookieCabecera = request.headers.get("Cookie") || "";
-        const cookieState = cookieCabecera.match(/eof_x_state=([^;]+)/)?.[1];
-        if (!cookieState) return irConError("La sesión de inicio con X ha caducado, inténtalo de nuevo");
-        const [stateGuardado, volverGuardado, codeVerifier] = decodeURIComponent(cookieState).split("|");
-        if (stateGuardado !== stateRecibido) return irConError("No se ha podido verificar el inicio de sesión con X");
-
-        const redirectUri = `${API_URL}/api/readers/x/callback`;
-
-        let tokenData;
-        try {
-          // btoa() falla si CLIENT_ID/CLIENT_SECRET traen algún carácter
-          // fuera de Latin1 (p.ej. un espacio Unicode invisible colado al
-          // copiar el secret desde el portal de X, o cualquier símbolo
-          // no-ASCII): en vez de una Basic Auth codificada a medias o un
-          // 500 sin explicación, se codifica manualmente a UTF-8 primero
-          // y se pasa esos bytes por btoa() carácter a carácter, que es
-          // el patrón estándar para Base64-codificar texto arbitrario en
-          // el navegador/Workers sin usar Buffer (Node), no disponible aquí.
-          const credencialesBasicas = btoa(
-            String.fromCharCode(...new TextEncoder().encode(`${env.X_CLIENT_ID}:${env.X_CLIENT_SECRET}`))
-          );
-          const resToken = await fetch("https://api.x.com/2/oauth2/token", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-              Authorization: `Basic ${credencialesBasicas}`,
-            },
-            body: new URLSearchParams({
-              client_id: env.X_CLIENT_ID,
-              grant_type: "authorization_code",
-              code,
-              redirect_uri: redirectUri,
-              code_verifier: codeVerifier,
-            }),
-          });
-          if (!resToken.ok) throw new Error("token");
-          tokenData = await resToken.json();
-        } catch {
-          return irConError("No se ha podido verificar la cuenta de X");
-        }
-
-        let perfilX;
-        try {
-          const resPerfil = await fetch("https://api.x.com/2/users/me?user.fields=profile_image_url", {
-            headers: { Authorization: `Bearer ${tokenData.access_token}` },
-          });
-          if (!resPerfil.ok) throw new Error("perfil");
-          const cuerpoPerfil = await resPerfil.json();
-          perfilX = cuerpoPerfil.data;
-        } catch {
-          return irConError("No se ha podido obtener tu perfil de X");
-        }
-        if (!perfilX?.id) return irConError("No se ha podido obtener tu perfil de X");
-
-        const xId = perfilX.id;
-        const nombre = perfilX.name || perfilX.username || `Usuario de X`;
-        const avatarUrl = perfilX.profile_image_url
-          ? perfilX.profile_image_url.replace("_normal", "") // X sirve una miniatura pequeña por defecto; se pide el tamaño original quitando el sufijo "_normal" del nombre de archivo.
-          : null;
-        // Ver comentario largo más arriba: X no da un email real en el
-        // tier gratuito, así que se usa uno sintético solo para
-        // cumplir el esquema. NO es una dirección real ni entregable.
-        const email = `x-${xId}@x.elotrofutbol.media`;
-
-        let lector = await env.DB.prepare("SELECT * FROM readers WHERE x_id = ? AND activo = 1").bind(xId).first();
-
-        if (!lector) {
-          const saltRelleno = randomSalt();
-          const arrRelleno = new Uint8Array(32);
-          crypto.getRandomValues(arrRelleno);
-          const passwordRelleno = [...arrRelleno].map((b) => b.toString(16).padStart(2, "0")).join("");
-          const hashRelleno = await hashPassword(passwordRelleno, saltRelleno);
-          const insertado = await env.DB.prepare(
-            `INSERT INTO readers (nombre, email, password_hash, salt, x_id, avatar_url, email_verificado)
-             VALUES (?, ?, ?, ?, ?, ?, 1) RETURNING id`
-          ).bind(nombre, email, hashRelleno, saltRelleno, xId, avatarUrl).first();
-          lector = { id: insertado.id, nombre, email, x_id: xId, avatar_url: avatarUrl, email_verificado: 1 };
-        }
-
-        const token = await crearSesionLector(env, request, lector);
-
-        // A diferencia de Google/Microsoft (llamadas fetch() que
-        // devuelven JSON al propio frontend), este es un redirect real
-        // del navegador: no hay JS esperando la respuesta al otro lado,
-        // así que el token de sesión se manda en la URL de vuelta y
-        // guardarSesionLector() en el frontend lo recoge de ahí (ver
-        // lector-auth.js). Se limpia la cookie de "state", ya usada.
-        const destino = volverGuardado || "index.html";
-        const headers = new Headers({
-          Location: `${SITIO_URL}/${destino}${destino.includes("?") ? "&" : "?"}sesionX=${token}`,
-        });
-        headers.append("Set-Cookie", "eof_x_state=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax");
-        return new Response(null, { status: 302, headers });
-      }
-
-      // ---------- Mantenimiento puntual: reparar nombres corrompidos ----------
-      // Antes de este arreglo, b64urlDecode() decodificaba el payload del
-      // JWT de Google con atob() y lo trataba como si ya fuera texto: como
-      // ese payload viene en UTF-8, cualquier carácter no-ASCII del nombre
-      // (tildes, "à", "ï", "ç"...) quedaba mal interpretado byte a byte y
-      // se guardó así en "readers.nombre" para toda cuenta creada o
-      // vinculada con Google antes de corregir b64urlDecodeTexto().
-      //
-      // Esta ruta re-decodifica esos nombres ya guardados: vuelve a
-      // codificarlos como si fueran Latin-1 (para recuperar los bytes
-      // UTF-8 originales, que es exactamente el error que se cometió al
-      // guardarlos) y los reinterpreta como UTF-8 real. Es un endpoint de
-      // admin, de un solo uso -- llamarlo otra vez sobre nombres ya
-      // arreglados no debería cambiarlos (no tienen bytes ya rotos que
-      // "reparar"), pero conviene borrar esta ruta del código una vez
-      // usada en producción, no dejarla ahí de forma permanente.
-      if (path === "/api/admin/mantenimiento/reparar-nombres-google" && method === "POST") {
-        const payload = await requireAuth(request, env);
-        if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ejecutar esto" }, 403);
-
-        const { simular } = await request.json().catch(() => ({ simular: true }));
-        const soloSimular = simular !== false;
-
-        const { results } = await env.DB.prepare(
-          "SELECT id, nombre FROM readers WHERE google_id IS NOT NULL"
-        ).all();
-
-        const cambios = [];
-        for (const fila of results) {
-          let reparado;
-          try {
-            // Si el nombre guardado tiene el patrón de corrupción, sus
-            // "caracteres" en realidad representan bytes UTF-8 sueltos:
-            // reconvertirlo a bytes (Latin-1, 1 carácter = 1 byte) y
-            // volver a decodificar como UTF-8 deshace el error original.
-            const bytes = Uint8Array.from(fila.nombre, (c) => c.charCodeAt(0));
-            reparado = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-          } catch {
-            // No decodifica como UTF-8 válido: el nombre no tiene el
-            // patrón de corrupción esperado (probablemente ya estaba
-            // bien), así que se deja tal cual.
-            continue;
-          }
-          // Si tras el "viaje de ida y vuelta" el resultado es idéntico al
-          // original, no había nada que reparar (nombre ya correcto,
-          // p. ej. "Juan" no cambia). Solo se cuenta como cambio real
-          // cuando el texto reparado difiere del guardado.
-          if (reparado !== fila.nombre && reparado.trim()) {
-            cambios.push({ id: fila.id, antes: fila.nombre, despues: reparado });
-          }
-        }
-
-        if (!soloSimular) {
-          for (const c of cambios) {
-            await env.DB.prepare("UPDATE readers SET nombre = ? WHERE id = ?").bind(c.despues, c.id).run();
-          }
-        }
-
-        return json({ ok: true, simulado: soloSimular, total_revisados: results.length, cambios });
       }
 
       // ---------- Cerrar sesión de lector ----------
@@ -7349,14 +5639,12 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- Editar perfil propio (lector logueado): nombre + avatar ----------
-      // Faltaba en este Worker (solo existía como /api/me/perfil en
-      // worker-secondary, con otro path): público/cuenta.html la llama
-      // como GET y PUT a /api/readers/me/perfil. El GET está justo
-      // arriba, junto a /api/readers/me. Se reutiliza el mismo patrón
-      // que /api/readers/me/password: requireReaderAuth + devolver un
-      // JWT nuevo (el frontend guarda { token, reader } tras cada
-      // guardado para reflejar el cambio sin tener que volver a iniciar
-      // sesión).
+      // público/cuenta.html la llama como GET y PUT a
+      // /api/readers/me/perfil. El GET está justo arriba, junto a
+      // /api/readers/me. Se reutiliza el mismo patrón que
+      // /api/readers/me/password: requireReaderAuth + devolver un JWT
+      // nuevo (el frontend guarda { token, reader } tras cada guardado
+      // para reflejar el cambio sin tener que volver a iniciar sesión).
       if (path === "/api/readers/me/perfil" && method === "PUT") {
         const payload = await requireReaderAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
@@ -7383,80 +5671,6 @@ async function handlePrimary(request, env, ctx) {
         return json({
           token,
           reader: { id: lector.id, nombre, email: lector.email, email_verificado: !!lector.email_verificado, avatar_url: avatarUrl },
-        });
-      }
-
-      // ---------- Guardar email real (lector logueado con X) ----------
-      // Ver el comentario largo en /api/readers/x/callback: al entrar
-      // con X se guarda un email sintético (x-<id>@x.elotrofutbol.media,
-      // no entregable) porque el tier gratuito de la API de X no da el
-      // email real. Este endpoint es el paso extra pendiente que se
-      // decidió: cuenta.html detecta ese dominio sintético en el email
-      // del lector (ver comprobarEmailPendienteX() en lector-auth.js) y
-      // pide aquí un correo real la primera vez. Mismo patrón que
-      // /api/me/email para redactores, pero sobre "readers" +
-      // requireReaderAuth, y comprobando que el nuevo correo no esté ya
-      // usado por otra cuenta (readers.email es UNIQUE).
-      if (path === "/api/readers/me/email" && method === "PUT") {
-        const payload = await requireReaderAuth(request, env);
-        if (!payload) return json({ error: "No autorizado" }, 401);
-        const { email } = await request.json();
-        const emailNorm = normalizarTexto(email)?.trim().toLowerCase() || "";
-        if (!emailNorm || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
-          return json({ error: "Introduce un correo electrónico válido" }, 400);
-        }
-        if (emailNorm.endsWith("@x.elotrofutbol.media")) {
-          return json({ error: "Introduce tu correo real, no uno generado automáticamente" }, 400);
-        }
-
-        const lector = await env.DB.prepare("SELECT * FROM readers WHERE id = ? AND activo = 1").bind(payload.rid).first();
-        if (!lector) return json({ error: "Cuenta no encontrada" }, 404);
-
-        const yaUsado = await env.DB.prepare("SELECT id FROM readers WHERE email = ? AND id != ?").bind(emailNorm, lector.id).first();
-        if (yaUsado) return json({ error: "Ese correo ya está en uso por otra cuenta" }, 409);
-
-        // Al ser una cuenta de X sin verificación de email propia, se
-        // manda un correo de verificación igual que en el registro
-        // normal, en vez de darlo por verificado a ciegas: así el campo
-        // "email_verificado" sigue significando lo mismo para todas las
-        // cuentas, entren como entren.
-        // Mismo patrón de caducidad (30 min) y página de destino
-        // (verificar-cuenta.html) que /api/readers/reenviar-verificacion,
-        // para reutilizar exactamente el mismo flujo de confirmación que
-        // ya existe en vez de crear uno paralelo.
-        const tokenArr = new Uint8Array(32);
-        crypto.getRandomValues(tokenArr);
-        const verificacionToken = [...tokenArr].map((b) => b.toString(16).padStart(2, "0")).join("");
-        const expira = new Date(Date.now() + 30 * 60 * 1000).toISOString();
-
-        await env.DB.prepare(
-          "UPDATE readers SET email = ?, email_verificado = 0, verificacion_token = ?, verificacion_token_expira = ? WHERE id = ?"
-        ).bind(emailNorm, verificacionToken, expira, lector.id).run();
-
-        const enlace = `${SITIO_URL}/verificar-cuenta.html?token=${verificacionToken}`;
-        ctx.waitUntil(enviarEmailNotificacion(env, {
-          asunto: "Confirma tu correo — ELOTROFÚTBOLTV",
-          texto: `Hola ${lector.nombre},\n\nConfirma tu correo electrónico en ELOTROFÚTBOLTV entrando en este enlace (caduca en 30 minutos):\n${enlace}`,
-          html: plantillaEmail({
-            etiqueta: "Confirmar correo",
-            titulo: "Confirma tu correo electrónico",
-            parrafo: "Has añadido este correo a tu cuenta de ELOTROFÚTBOLTV. Confírmalo para poder recuperar tu contraseña y recibir notificaciones. El enlace caduca en 30 minutos.",
-            boton: { texto: "Confirmar correo", url: enlace },
-          }),
-        }, { destinatario: emailNorm }));
-
-        ctx.waitUntil(registrarActividad(env, request, { uid: lector.id, nombre: lector.nombre, rol: "lector" }, {
-          accion: "editar_email_propio", entidad: "lector", entidad_id: lector.id,
-          descripcion: `${lector.nombre} ha añadido su correo electrónico`,
-        }));
-
-        const token = await createJWT(
-          { rid: lector.id, nombre: lector.nombre, email: emailNorm, sid: payload.sid },
-          env.JWT_SECRET
-        );
-        return json({
-          token,
-          reader: { id: lector.id, nombre: lector.nombre, email: emailNorm, email_verificado: false, avatar_url: lector.avatar_url || null },
         });
       }
 
@@ -7528,7 +5742,7 @@ async function handlePrimary(request, env, ctx) {
         ctx.waitUntil(registrarActividad(env, request, { uid: user.id, nombre: user.nombre, rol: user.rol }, {
           accion: "login", entidad: "sesion", descripcion: `${user.nombre} ha iniciado sesión`,
         }));
-        return json({ token, user: { id: user.id, username: user.username, nombre: user.nombre, rol: user.rol, nivel: user.rol === "admin" ? NIVEL_MAXIMO : (user.nivel || 1), email: user.email || null, avatar_url: user.avatar_url || null, avatar_foco: user.avatar_foco || null, categorias_fijas: parsearCategoriasFijas(user.categorias_fijas) } });
+        return json({ token, user: { id: user.id, username: user.username, nombre: user.nombre, rol: user.rol, nivel: user.rol === "admin" ? NIVEL_MAXIMO : (user.nivel || 1), email: user.email || null, avatar_url: user.avatar_url || null, avatar_foco: user.avatar_foco || null } });
       }
 
       // ---------- GUARDAR EMAIL (primer inicio de sesión) ----------
@@ -8049,14 +6263,14 @@ async function handlePrimary(request, env, ctx) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const { results } = await env.DB.prepare(
-          "SELECT id, nombre, equipo, categorias_fijas, redes_sociales FROM users WHERE activo = 1 ORDER BY nombre"
+          "SELECT id, nombre, equipo, redes_sociales FROM users WHERE activo = 1 ORDER BY nombre"
         ).all();
         const autores = results.map((a) => {
           let redes = {};
           if (a.redes_sociales) {
             try { redes = JSON.parse(a.redes_sociales); } catch { redes = {}; }
           }
-          return { ...a, equipo: parsearEquipos(a.equipo), categorias_fijas: parsearCategoriasFijas(a.categorias_fijas), redes_sociales: undefined, redes };
+          return { ...a, equipo: parsearEquipos(a.equipo), redes_sociales: undefined, redes };
         });
         return json({ autores });
       }
@@ -8310,7 +6524,7 @@ async function handlePrimary(request, env, ctx) {
         if (!payload) return json({ error: "No autorizado" }, 401);
         if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver los usuarios" }, 403);
         const { results } = await env.DB.prepare(
-          "SELECT id, username, nombre, rol, activo, email, equipo, categorias_fijas, avatar_url, nivel, nivel_nota, created_at FROM users ORDER BY nombre"
+          "SELECT id, username, nombre, rol, activo, email, equipo, avatar_url, nivel, nivel_nota, created_at FROM users ORDER BY nombre"
         ).all();
         // El progreso de nivel de TODOS los usuarios se calcula con una
         // sola consulta agregada (antes: una consulta por usuario,
@@ -8323,7 +6537,6 @@ async function handlePrimary(request, env, ctx) {
         const users = await Promise.all(results.map(async (u) => ({
           ...u,
           equipo: parsearEquipos(u.equipo),
-          categorias_fijas: parsearCategoriasFijas(u.categorias_fijas),
           progreso_nivel: await construirProgresoNivel(env, u, conteos.get(u.id)),
         })));
         return json({ users });
@@ -8347,23 +6560,15 @@ async function handlePrimary(request, env, ctx) {
         const hash = await hashPassword(passwordInicial, salt);
         const rol = normalizarRolColaborador(body.rol);
 
-        // Categoría(s) fija(s) (redactor "sin equipo, con categoría
-        // fija", p. ej. Arbitraje): si se asigna alguna, este redactor
-        // no tiene equipo, así que se ignora cualquier "equipo" recibido
-        // en ese caso.
-        const { error: errorCategoriasFijas, categoriasFijas } = validarCategoriasFijas(body.categorias_fijas);
-        if (errorCategoriasFijas) return json({ error: errorCategoriasFijas }, 400);
-
         // El equipo es opcional, pero si se manda alguno hay que elegir
-        // hasta 3 (ver validarEquipos). No aplica si tiene categoría(s) fija(s).
+        // hasta 3 (ver validarEquipos).
         const { error: errorEquipo, equipos: equiposNuevos } = validarEquipos(body.equipo);
         if (errorEquipo) return json({ error: errorEquipo }, 400);
-        const equipoNuevo = (!categoriasFijas.length && equiposNuevos.length) ? JSON.stringify(equiposNuevos) : null;
-        const categoriasFijasNuevo = categoriasFijas.length ? JSON.stringify(categoriasFijas) : null;
+        const equipoNuevo = equiposNuevos.length ? JSON.stringify(equiposNuevos) : null;
 
         await env.DB.prepare(
-          `INSERT INTO users (username, password_hash, salt, nombre, rol, activo, email, equipo, categorias_fijas) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`
-        ).bind(username, hash, salt, body.nombre, rol, body.email ? body.email.trim() : null, equipoNuevo, categoriasFijasNuevo).run();
+          `INSERT INTO users (username, password_hash, salt, nombre, rol, activo, email, equipo) VALUES (?, ?, ?, ?, ?, 1, ?, ?)`
+        ).bind(username, hash, salt, body.nombre, rol, body.email ? body.email.trim() : null, equipoNuevo).run();
 
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "crear_usuario", entidad: "usuario", entidad_id: username,
@@ -8489,48 +6694,28 @@ async function handlePrimary(request, env, ctx) {
         if (id === payload.uid && body.rol && body.rol !== "admin") {
           return json({ error: "No puedes quitarte a ti mismo el rol de administrador" }, 400);
         }
-        // Si se le va a quitar el rol de admin a este usuario (o se le
-        // asigna cualquier otro rol) y era el nivel máximo solo por ser
-        // admin, al pasar a redactor/fotógrafo su nivel real es el que
-        // ya tuviera guardado (por defecto 1); esto ya lo resuelve
-        // obtenerNivelUsuario/construirProgresoNivel leyendo `nivel` de
-        // la fila, así que no hace falta tocar nada más aquí.
         if (id === payload.uid && body.activo === false) {
           return json({ error: "No puedes desactivar tu propia cuenta" }, 400);
         }
 
-        // Categoría(s) fija(s): solo las puede cambiar un admin (misma
-        // ruta). Si no se manda "categorias_fijas" en el body, se deja
-        // la lista que ya tuviera.
-        let categoriasFijasActualizadas = parsearCategoriasFijas(user.categorias_fijas);
-        if (body.categorias_fijas !== undefined) {
-          const { error: errorCategoriasFijas, categoriasFijas } = validarCategoriasFijas(body.categorias_fijas);
-          if (errorCategoriasFijas) return json({ error: errorCategoriasFijas }, 400);
-          categoriasFijasActualizadas = categoriasFijas;
-        }
-        const categoriasFijasParaGuardar = categoriasFijasActualizadas.length ? JSON.stringify(categoriasFijasActualizadas) : null;
-
         // El equipo solo lo puede cambiar un admin (esta ruta ya exige
         // rol admin arriba). Si no se manda "equipo" en el body, se deja
-        // el que ya tuviera; si se manda, se valida que no pase de 3. Un
-        // redactor con categoría(s) fija(s) no tiene equipo: si se le
-        // asigna alguna (aquí o ya la tuviera), el equipo se vacía.
-        let equipoActualizado = categoriasFijasActualizadas.length ? null : user.equipo;
-        if (!categoriasFijasActualizadas.length && body.equipo !== undefined) {
+        // el que ya tuviera; si se manda, se valida que no pase de 3.
+        let equipoActualizado = user.equipo;
+        if (body.equipo !== undefined) {
           const { error: errorEquipo, equipos: equiposNuevos } = validarEquipos(body.equipo);
           if (errorEquipo) return json({ error: errorEquipo }, 400);
           equipoActualizado = equiposNuevos.length ? JSON.stringify(equiposNuevos) : null;
         }
 
         await env.DB.prepare(
-          `UPDATE users SET nombre = ?, rol = ?, activo = ?, email = ?, equipo = ?, categorias_fijas = ? WHERE id = ?`
+          `UPDATE users SET nombre = ?, rol = ?, activo = ?, email = ?, equipo = ? WHERE id = ?`
         ).bind(
           body.nombre !== undefined ? body.nombre : user.nombre,
           body.rol !== undefined ? normalizarRolColaborador(body.rol) : user.rol,
           body.activo === undefined ? user.activo : (body.activo ? 1 : 0),
           body.email !== undefined ? (body.email ? body.email.trim() : null) : user.email,
           equipoActualizado,
-          categoriasFijasParaGuardar,
           id
         ).run();
 
@@ -8592,7 +6777,7 @@ async function handlePrimary(request, env, ctx) {
       // archivo se guarda en Cloudinary tal cual llega —sin recomprimir
       // ni transformar— para no perder ni un ápice de calidad.
       if (path === "/api/media" && method === "POST") {
-        const payload = await requireAuthSubida(request, env);
+        const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
 
         const form = await request.formData();
@@ -8600,59 +6785,20 @@ async function handlePrimary(request, env, ctx) {
         const titulo = (form.get("titulo") || "").toString().trim();
         const descripcion = (form.get("descripcion") || "").toString().trim();
         const club = (form.get("club") || "").toString().trim();
-        // avisoLote=1: esta subida forma parte de una tanda; el correo se manda
-        // UNA vez al final (POST /api/media/aviso-lote), no uno por archivo.
-        const avisoEnLote = (form.get("avisoLote") || "").toString() === "1";
-        // Vinculación automática a la galería del partido (ver Fase 1 del
-        // rediseño): si se manda resultId, esta foto/vídeo se enlaza sola
-        // a match_gallery al terminar de subirse, sin pasar por el paso
-        // aparte de "Galería de partido". "equipo" indica de cuál de los
-        // dos equipos del partido es (para las pestañas de la galería
-        // pública); puede ir vacío si es una foto general del partido.
-        const resultIdRaw = (form.get("resultId") || "").toString().trim();
-        const resultId = resultIdRaw ? parseInt(resultIdRaw) : null;
-        let equipoGaleria = (form.get("equipo") || "").toString().trim().toLowerCase();
-        if (equipoGaleria !== "local" && equipoGaleria !== "visitante") equipoGaleria = null;
-        // Portada elegida por quien sube el vídeo (segundo exacto del que
-        // se extrae el fotograma de portada en la galería). Opcional: si
-        // no se manda, se sigue usando el segundo 1 por defecto.
+        // portadaSegundo: instante (en segundos) del vídeo elegido en el
+        // navegador como fotograma de portada, si se eligió alguno antes
+        // de subir (ver "Elegir portada" en Subir contenido). Solo tiene
+        // sentido para vídeos; en fotos se ignora.
         const portadaSegundoRaw = (form.get("portadaSegundo") || "").toString().trim();
-        let portadaSegundo = null;
-        if (portadaSegundoRaw !== "") {
-          const num = Number(portadaSegundoRaw);
-          if (Number.isFinite(num) && num >= 0) portadaSegundo = num;
-        }
-        // Punto de foco espacial del fotograma de portada del vídeo (qué
-        // parte de la imagen no se debe recortar nunca), mismo formato
-        // "50% 50%" que ya usan las fotos de contenido. Opcional: si no
-        // se manda, se sigue centrando como hasta ahora.
-        const portadaFocoRaw = (form.get("portadaFoco") || "").toString().trim();
-        const portadaFoco = /^\d{1,3}%\s\d{1,3}%$/.test(portadaFocoRaw) ? portadaFocoRaw : null;
-        // Visibilidad elegida por quien sube el contenido: "publico" (por
-        // defecto, aparece en las galerías del sitio) o "privado" (queda
-        // solo en la mediateca del panel, nunca se expone en ningún
-        // endpoint público). Cualquier valor que no sea "privado" exacto
-        // se trata como público, para no dejar nada oculto por error.
-        const visibilidadRaw = (form.get("visibilidad") || "").toString().trim().toLowerCase();
-        const visibilidad = visibilidadRaw === "privado" ? "privado" : "publico";
+        const portadaSegundo = portadaSegundoRaw !== "" && Number.isFinite(Number(portadaSegundoRaw)) && Number(portadaSegundoRaw) >= 0
+          ? Number(portadaSegundoRaw)
+          : null;
 
         if (!file || typeof file === "string") return json({ error: "Falta el archivo" }, 400);
         if (!titulo) return json({ error: "Falta el título" }, 400);
         if (titulo.length > 200) return json({ error: "El título es demasiado largo (máximo 200 caracteres)" }, 400);
         if (descripcion.length > 2000) return json({ error: "La descripción es demasiado larga (máximo 2000 caracteres)" }, 400);
         if (file.size === 0) return json({ error: "El archivo está vacío" }, 400);
-
-        // Si se ha pedido vincular a un partido, se comprueba que existe
-        // ANTES de subir nada a Cloudinary: así, si el id es inválido, se
-        // avisa al momento en vez de subir el archivo para nada.
-        let resultadoGaleria = null;
-        if (resultId) {
-          if (!Number.isInteger(resultId)) return json({ error: "El partido elegido no es válido" }, 400);
-          resultadoGaleria = await env.DB.prepare(
-            "SELECT id, equipo_local, equipo_visitante, fecha_partido, slug FROM results WHERE id = ?"
-          ).bind(resultId).first();
-          if (!resultadoGaleria) return json({ error: "El partido elegido ya no existe" }, 404);
-        }
 
         // Antes de gastar tiempo y ancho de banda subiendo el archivo a
         // Cloudinary, calculamos su hash y comprobamos si ya existe algo
@@ -8700,31 +6846,9 @@ async function handlePrimary(request, env, ctx) {
           subida = await procesarSubidaArchivo(env, file, { permitirVideo: true }, fileBytes);
         } catch (err) {
           if (err.esValidacion) return json({ error: err.message }, 400);
-          // Cloudinary rechaza ESTE archivo (demasiado pesado, demasiados
-          // megapíxeles, formato dañado...): es un problema del archivo, no
-          // un fallo del servidor. Antes se devolvía como 502, y el 5xx
-          // disparaba el failover a Railway, que respondía "No autorizado"
-          // y tapaba la causa real (solo fallaban algunas fotos).
-          if (err.cloudinaryStatus === 400 || err.cloudinaryStatus === 413) {
-            return json({
-              error: `Cloudinary ha rechazado este archivo: ${err.cloudinaryMensaje || "no lo acepta"}`,
-              detail: err.message,
-            }, 400);
-          }
           return json({ error: "No se pudo subir el archivo a Cloudinary. Comprueba tu conexión e inténtalo de nuevo.", detail: err.message }, 502);
         }
-        // Cloudinary analiza el archivo de verdad (no solo el nombre o el
-        // MIME que mande el navegador) y devuelve resourceType ("image" o
-        // "video"): es la fuente más fiable de qué es en realidad el
-        // archivo, así que se usa como base. Antes se recalculaba "a mano"
-        // a partir de file.type/extensión, lo que podía guardar "foto"
-        // para un vídeo si el navegador mandaba un MIME vacío o genérico
-        // (típico en algunos móviles con .mov/.mkv). El cálculo manual se
-        // deja solo como último recurso, por si Cloudinary devolviera algo
-        // inesperado.
-        const esFoto = subida.resourceType
-          ? subida.resourceType === "image"
-          : (esImagenPermitida(file.type) || ((!file.type || file.type === "application/octet-stream") && extensionImagenPermitida(file.name)));
+        const esFoto = esImagenPermitida(file.type) || ((!file.type || file.type === "application/octet-stream") && extensionImagenPermitida(file.name));
 
         // hash_archivo es una columna añadida por una migración manual
         // que hay que ejecutar aparte: si no se ha aplicado en esta base
@@ -8734,60 +6858,28 @@ async function handlePrimary(request, env, ctx) {
         // específicamente porque la columna no existe (mensaje de
         // SQLite o de PostgreSQL, según cuál esté detrás de env.DB aquí),
         // se reintenta sin ella.
-        let mediaInsertado;
+        // portada_segundo/portada_foco son columnas añadidas por una
+        // migración manual (db/migrations/028_media_portada_foco.sql): si
+        // aún no se ha aplicado en esta base de datos, se reintenta el
+        // INSERT sin ellas en vez de perder el archivo ya subido a
+        // Cloudinary. Mismo patrón escalonado que ya existía para
+        // hash_archivo.
         try {
-          mediaInsertado = await env.DB.prepare(
-            `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo, portada_segundo, portada_foco, visibilidad)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          await env.DB.prepare(
+            `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo, portada_segundo)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(
             subida.publicId, subida.resourceType, subida.url,
             titulo, descripcion || null, esFoto ? "foto" : "video",
             file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo,
-            esFoto ? null : portadaSegundo, esFoto ? null : portadaFoco, visibilidad
+            esFoto ? null : portadaSegundo
           ).run();
         } catch (err) {
-          // visibilidad es una columna añadida por una migración manual
-          // (migracion_media_visibilidad.sql): si no se ha ejecutado
-          // todavía en esta base de datos, se reintenta sin ella (el
-          // contenido queda con el valor por defecto de la columna,
-          // "publico", hasta que se aplique la migración).
-          const esColumnaVisibilidadFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /visibilidad/i.test(err.message || "");
-          const esColumnaPortadaFocoFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /portada_foco/i.test(err.message || "");
           const esColumnaPortadaFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /portada_segundo/i.test(err.message || "");
           const esColumnaFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /hash_archivo/i.test(err.message || "");
-          if (esColumnaVisibilidadFaltante) {
+          if (esColumnaPortadaFaltante) {
             try {
-              mediaInsertado = await env.DB.prepare(
-                `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo, portada_segundo, portada_foco)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-              ).bind(
-                subida.publicId, subida.resourceType, subida.url,
-                titulo, descripcion || null, esFoto ? "foto" : "video",
-                file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo,
-                esFoto ? null : portadaSegundo, esFoto ? null : portadaFoco
-              ).run();
-            } catch (err2) {
-              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType, subida.cloudName));
-              return json({ error: "No se pudo guardar el archivo. Inténtalo de nuevo.", detail: err2.message }, 500);
-            }
-          } else if (esColumnaPortadaFocoFaltante) {
-            try {
-              mediaInsertado = await env.DB.prepare(
-                `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo, portada_segundo)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-              ).bind(
-                subida.publicId, subida.resourceType, subida.url,
-                titulo, descripcion || null, esFoto ? "foto" : "video",
-                file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo,
-                esFoto ? null : portadaSegundo
-              ).run();
-            } catch (err2) {
-              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType, subida.cloudName));
-              return json({ error: "No se pudo guardar el archivo. Inténtalo de nuevo.", detail: err2.message }, 500);
-            }
-          } else if (esColumnaPortadaFaltante) {
-            try {
-              mediaInsertado = await env.DB.prepare(
+              await env.DB.prepare(
                 `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
               ).bind(
@@ -8796,12 +6888,12 @@ async function handlePrimary(request, env, ctx) {
                 file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo
               ).run();
             } catch (err2) {
-              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType, subida.cloudName));
+              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType));
               return json({ error: "No se pudo guardar el archivo. Inténtalo de nuevo.", detail: err2.message }, 500);
             }
           } else if (esColumnaFaltante) {
             try {
-              mediaInsertado = await env.DB.prepare(
+              await env.DB.prepare(
                 `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
               ).bind(
@@ -8810,7 +6902,7 @@ async function handlePrimary(request, env, ctx) {
                 file.name, file.type, file.size, payload.uid, payload.nombre, club || null
               ).run();
             } catch (err2) {
-              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType, subida.cloudName));
+              ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType));
               return json({ error: "No se pudo guardar el archivo. Inténtalo de nuevo.", detail: err2.message }, 500);
             }
           } else {
@@ -8819,7 +6911,7 @@ async function handlePrimary(request, env, ctx) {
           // de la base de datos rechaza la segunda, y aquí deshacemos lo
           // ya subido a Cloudinary para no dejar un archivo huérfano.
           const esDuplicadoBD = /unique/i.test(err.message || "");
-          ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType, subida.cloudName));
+          ctx.waitUntil(borrarDeCloudinary(env, subida.publicId, subida.resourceType));
           if (esDuplicadoBD) {
             return json({ error: "Este archivo ya se ha subido (se ha detectado justo ahora, puede que alguien lo subiera al mismo tiempo).", duplicado: true }, 409);
           }
@@ -8827,50 +6919,27 @@ async function handlePrimary(request, env, ctx) {
           }
         }
 
-        // Vinculación automática a la galería del partido elegido: se
-        // intenta como un paso "extra" que no debe tirar abajo la subida
-        // si algo falla (el archivo y su fila en "media" ya están
-        // guardados de todas formas; el redactor siempre puede vincularlo
-        // luego a mano desde "Galería de partido").
-        let galeriaPartidoSlug = null;
-        if (resultadoGaleria && mediaInsertado?.meta?.last_row_id) {
-          try {
-            const maxOrdenFila = await env.DB.prepare(
-              "SELECT COALESCE(MAX(orden), -1) AS max_orden FROM match_gallery WHERE result_id = ?"
-            ).bind(resultadoGaleria.id).first();
-            const siguienteOrden = (maxOrdenFila?.max_orden ?? -1) + 1;
-            await env.DB.prepare(
-              `INSERT INTO match_gallery (result_id, media_id, orden, vinculado_por_id, equipo) VALUES (?, ?, ?, ?, ?)`
-            ).bind(resultadoGaleria.id, mediaInsertado.meta.last_row_id, siguienteOrden, payload.uid, equipoGaleria).run();
-            galeriaPartidoSlug = await slugPartidoUnico(env, resultadoGaleria);
-          } catch (err) {
-            console.error("No se pudo vincular automáticamente la foto a la galería del partido:", err.message);
-          }
-        }
-
-        if (!avisoEnLote) {
-          ctx.waitUntil(enviarEmailNotificacion(env, {
-            asunto: `Nuevo ${esFoto ? "foto" : "vídeo"} subido: ${titulo}`,
-            texto: `${payload.nombre} ha subido "${titulo}" (${esFoto ? "foto" : "vídeo"}) a ELOTROFÚTBOLTV.${club ? `\nClub: ${club}` : ""}${descripcion ? `\nDescripción: ${descripcion}` : ""}\n\nEntra en el panel de administración para verlo y descargarlo.`,
-            html: plantillaEmail({
-              etiqueta: `Nuevo ${esFoto ? "foto" : "vídeo"}`,
-              titulo,
-              parrafo: descripcion || null,
-              filas: [
-                { etiqueta: "Subido por", valor: payload.nombre },
-                { etiqueta: "Club", valor: club },
-              ],
-              boton: { texto: "Ver en el panel", url: `${SITIO_URL}/admin/panel.html` },
-            }),
-          }));
-        }
+        ctx.waitUntil(enviarEmailNotificacion(env, {
+          asunto: `Nuevo ${esFoto ? "foto" : "vídeo"} subido: ${titulo}`,
+          texto: `${payload.nombre} ha subido "${titulo}" (${esFoto ? "foto" : "vídeo"}) a ELOTROFÚTBOLTV.${club ? `\nClub: ${club}` : ""}${descripcion ? `\nDescripción: ${descripcion}` : ""}\n\nEntra en el panel de administración para verlo y descargarlo.`,
+          html: plantillaEmail({
+            etiqueta: `Nuevo ${esFoto ? "foto" : "vídeo"}`,
+            titulo,
+            parrafo: descripcion || null,
+            filas: [
+              { etiqueta: "Subido por", valor: payload.nombre },
+              { etiqueta: "Club", valor: club },
+            ],
+            boton: { texto: "Ver en el panel", url: `${SITIO_URL}/admin/panel.html` },
+          }),
+        }));
 
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "subir_media", entidad: "media", entidad_id: subida.publicId,
           descripcion: `Ha subido ${esFoto ? "una foto" : "un vídeo"}: "${titulo}"`,
         }));
 
-        return json({ ok: true, galeriaPartidoSlug });
+        return json({ ok: true });
       }
 
       // ---------- SUBIR IMAGEN SUELTA (foto de perfil, fotos de una noticia...) ----------
@@ -8880,7 +6949,7 @@ async function handlePrimary(request, env, ctx) {
       // directamente en el campo de foto de perfil o en las fotos de una
       // noticia/crónica sin pasar por ningún listado.
       if (path === "/api/subir-imagen" && method === "POST") {
-        const payload = await requireAuthSubida(request, env);
+        const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
 
         const form = await request.formData();
@@ -8894,50 +6963,6 @@ async function handlePrimary(request, env, ctx) {
         }
       }
 
-      // ---------- AVISO POR CORREO DE UNA TANDA DE SUBIDAS ----------
-      // Cuando se suben varios archivos a la vez, el panel marca cada subida
-      // con avisoLote=1 (ver POST /api/media: en ese caso NO manda correo por
-      // archivo) y, al terminar la tanda, llama aquí UNA sola vez con el
-      // resumen. Así 80 fotos = 1 correo de Resend, no 80. Los datos del
-      // resumen los manda el panel (quien llama ya está autenticado como
-      // colaborador): se limitan y se escapan al pintar el correo.
-      if (path === "/api/media/aviso-lote" && method === "POST") {
-        const payload = await requireAuthSubida(request, env);
-        if (!payload) return json({ error: "No autorizado" }, 401);
-
-        let datos;
-        try { datos = await request.json(); } catch { return json({ error: "Cuerpo inválido" }, 400); }
-        const aEntero = (v) => Math.max(0, Math.min(1000, parseInt(v, 10) || 0));
-        const fotos = aEntero(datos?.fotos);
-        const videos = aEntero(datos?.videos);
-        if (fotos + videos === 0) return json({ ok: true, enviado: false });
-        const tituloLote = String(datos?.titulo || "").trim().slice(0, 150);
-        const clubLote = String(datos?.club || "").trim().slice(0, 100);
-        const descripcionLote = String(datos?.descripcion || "").trim().slice(0, 300);
-
-        const partes = [];
-        if (fotos) partes.push(`${fotos} ${fotos === 1 ? "foto" : "fotos"}`);
-        if (videos) partes.push(`${videos} ${videos === 1 ? "vídeo" : "vídeos"}`);
-        const resumen = partes.join(" y ");
-
-        ctx.waitUntil(enviarEmailNotificacion(env, {
-          asunto: `Nuevas subidas: ${resumen}${tituloLote ? ` (${tituloLote})` : ""}`,
-          texto: `${payload.nombre} ha subido ${resumen} a ELOTROFÚTBOLTV.${tituloLote ? `\nTítulo: ${tituloLote}` : ""}${clubLote ? `\nClub: ${clubLote}` : ""}${descripcionLote ? `\nDescripción: ${descripcionLote}` : ""}\n\nEntra en el panel de administración para verlos y descargarlos.`,
-          html: plantillaEmail({
-            etiqueta: "Nuevas subidas",
-            titulo: `${resumen} subidas`,
-            parrafo: descripcionLote || null,
-            filas: [
-              { etiqueta: "Subido por", valor: payload.nombre },
-              { etiqueta: "Título", valor: tituloLote },
-              { etiqueta: "Club", valor: clubLote },
-            ],
-            boton: { texto: "Ver en el panel", url: `${SITIO_URL}/admin/panel.html` },
-          }),
-        }));
-        return json({ ok: true, enviado: true });
-      }
-
       const mediaMatch = path.match(/^\/api\/media\/(\d+)$/);
 
       // ---------- MEDIA: listado ----------
@@ -8946,113 +6971,50 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/media" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        const base = "SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.nombre_archivo, m.content_type, m.tamano_bytes, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre, m.club, m.created_at, m.portada_segundo, m.portada_foco, m.visibilidad FROM media m LEFT JOIN users u ON u.id = m.autor_id";
-        const baseSinFoco = "SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.nombre_archivo, m.content_type, m.tamano_bytes, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre, m.club, m.created_at, m.portada_segundo FROM media m LEFT JOIN users u ON u.id = m.autor_id";
-        const baseSinPortada = "SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.nombre_archivo, m.content_type, m.tamano_bytes, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre, m.club, m.created_at FROM media m LEFT JOIN users u ON u.id = m.autor_id";
+        const base = "SELECT id, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, created_at, portada_segundo, portada_foco FROM media";
+        const baseSinFoco = "SELECT id, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, created_at, portada_segundo FROM media";
+        const baseSinPortada = "SELECT id, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, created_at FROM media";
         let resultadoMedia;
         try {
           resultadoMedia = payload.rol === "admin"
-            ? await env.DB.prepare(`${base} ORDER BY m.created_at DESC`).all()
-            : await env.DB.prepare(`${base} WHERE m.autor_id = ? ORDER BY m.created_at DESC`).bind(payload.uid).all();
+            ? await env.DB.prepare(`${base} ORDER BY created_at DESC`).all()
+            : await env.DB.prepare(`${base} WHERE autor_id = ? ORDER BY created_at DESC`).bind(payload.uid).all();
         } catch (err) {
-          // portada_segundo / portada_foco son columnas añadidas por
-          // migraciones manuales: si aún no se han ejecutado en esta base
-          // de datos, se reintenta sin ellas en vez de romper el listado.
+          // portada_segundo / portada_foco son columnas añadidas por una
+          // migración manual (db/migrations/028_media_portada_foco.sql):
+          // si aún no se han aplicado en esta base de datos, se reintenta
+          // sin ellas en vez de romper el listado.
           try {
             resultadoMedia = payload.rol === "admin"
-              ? await env.DB.prepare(`${baseSinFoco} ORDER BY m.created_at DESC`).all()
-              : await env.DB.prepare(`${baseSinFoco} WHERE m.autor_id = ? ORDER BY m.created_at DESC`).bind(payload.uid).all();
+              ? await env.DB.prepare(`${baseSinFoco} ORDER BY created_at DESC`).all()
+              : await env.DB.prepare(`${baseSinFoco} WHERE autor_id = ? ORDER BY created_at DESC`).bind(payload.uid).all();
           } catch (err2) {
             resultadoMedia = payload.rol === "admin"
-              ? await env.DB.prepare(`${baseSinPortada} ORDER BY m.created_at DESC`).all()
-              : await env.DB.prepare(`${baseSinPortada} WHERE m.autor_id = ? ORDER BY m.created_at DESC`).bind(payload.uid).all();
+              ? await env.DB.prepare(`${baseSinPortada} ORDER BY created_at DESC`).all()
+              : await env.DB.prepare(`${baseSinPortada} WHERE autor_id = ? ORDER BY created_at DESC`).bind(payload.uid).all();
           }
         }
-        const filas = resultadoMedia.results;
-        // Se añade a cada foto/vídeo, si tiene, el partido al que está
-        // vinculada en match_gallery (result_id + nombres de equipos +
-        // de cuál de los dos es), para que el modal "Editar contenido"
-        // pueda mostrar y permitir cambiar ese vínculo en vez de solo el
-        // campo "club" de texto libre. Se hace con una sola consulta
-        // aparte (en vez de un JOIN en la de arriba) para no complicar
-        // los reintentos por columnas que puedan faltar.
-        if (filas.length) {
-          try {
-            // Por lotes: la mediateca puede tener cientos de archivos y D1
-            // rechaza consultas con más de 100 variables (?).
-            const enlaces = await selectPorLotesDeIds(
-              env,
-              filas.map((f) => f.id),
-              (marcadores) =>
-                `SELECT mg.id AS enlace_id, mg.media_id, mg.equipo, mg.result_id,
-                        r.equipo_local, r.equipo_visitante, r.slug
-                 FROM match_gallery mg
-                 JOIN results r ON r.id = mg.result_id
-                 WHERE mg.media_id IN (${marcadores})`
-            );
-            const porMediaId = new Map(enlaces.map((e) => [e.media_id, e]));
-            // El slug de un partido se genera "bajo demanda" (puede que un
-            // partido con galería todavía no lo tenga si nadie ha abierto
-            // aún su enlace público): se calcula aquí una sola vez por
-            // partido distinto, para que el botón "Compartir" de la
-            // mediateca tenga siempre una URL válida.
-            const resultadosSinSlug = new Map();
-            for (const e of enlaces) {
-              if (!e.slug && !resultadosSinSlug.has(e.result_id)) resultadosSinSlug.set(e.result_id, e);
-            }
-            for (const e of resultadosSinSlug.values()) {
-              const slugGenerado = await slugPartidoUnico(env, { id: e.result_id, equipo_local: e.equipo_local, equipo_visitante: e.equipo_visitante, fecha_partido: null, slug: null });
-              for (const otro of enlaces) if (otro.result_id === e.result_id) otro.slug = slugGenerado;
-            }
-            for (const f of filas) {
-              const e = porMediaId.get(f.id);
-              if (e) {
-                f.match_gallery_id = e.enlace_id;
-                f.resultado_id = e.result_id;
-                f.equipo_galeria = e.equipo || null;
-                f.resultado_equipo_local = e.equipo_local;
-                f.resultado_equipo_visitante = e.equipo_visitante;
-                f.resultado_slug = e.slug || null;
-                f.galeria_url = e.slug ? `${SITIO_URL}/galeria/${e.slug}` : null;
-              }
-            }
-          } catch (err) {
-            console.error("No se pudo cargar el partido vinculado de cada media (se continúa sin ese dato):", err.message);
-          }
-        }
-        return json({ media: filas });
+        return json({ media: resultadoMedia.results });
       }
 
       // ---------- MEDIA: editar título/club/descripción ----------
-      // Puede editar un archivo la persona que lo subió (comparando
-      // autor_id con el usuario autenticado), o un admin sobre
-      // cualquier archivo aunque sea de otra persona; no se puede
-      // sustituir el archivo en sí, solo sus datos.
+      // Solo puede editar un archivo la persona que lo subió (comparando
+      // autor_id con el usuario autenticado); no se puede sustituir el
+      // archivo en sí, solo sus datos.
       if (mediaMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const id = parseInt(mediaMatch[1]);
         const registro = await env.DB.prepare("SELECT autor_id, tipo FROM media WHERE id = ?").bind(id).first();
         if (!registro) return json({ error: "No encontrado" }, 404);
-        if (payload.rol !== "admin" && registro.autor_id !== payload.uid) {
+        if (registro.autor_id !== payload.uid) {
           return json({ error: "Solo la persona que subió este contenido puede editarlo" }, 403);
         }
         const body = await request.json();
         const titulo = (body.titulo || "").toString().trim();
         if (!titulo) return json({ error: "Falta el título" }, 400);
         const descripcion = (body.descripcion || "").toString().trim();
-        // "club" (texto libre) y el vínculo a un partido (match_gallery)
-        // son mutuamente excluyentes: si se manda resultId, el club se
-        // ignora aquí (igual que al subir, ver /api/media POST), porque
-        // el equipo ya se deduce del propio partido vinculado.
         const club = (body.club || "").toString().trim();
-        const resultIdRaw = body.resultId === undefined || body.resultId === null ? "" : body.resultId.toString().trim();
-        const resultId = resultIdRaw ? parseInt(resultIdRaw) : null;
-        let equipoGaleria = (body.equipo || "").toString().trim().toLowerCase();
-        if (equipoGaleria !== "local" && equipoGaleria !== "visitante") equipoGaleria = null;
-        if (resultId !== null && !Number.isInteger(resultId)) {
-          return json({ error: "El partido elegido no es válido" }, 400);
-        }
         // portadaSegundo: el instante (en segundos) del vídeo que se usa
         // como fotograma de portada en la galería de contenido subido.
         // Solo tiene sentido para vídeos; en fotos se ignora.
@@ -9072,37 +7034,19 @@ async function handlePrimary(request, env, ctx) {
         if (typeof focoRaw === "string" && /^\d{1,3}%\s\d{1,3}%$/.test(focoRaw.trim())) {
           portadaFoco = focoRaw.trim();
         }
-        // Si se vincula a un partido, el club de texto libre se anula (el
-        // equipo ya se deduce del partido), igual que al subir.
-        const clubGuardado = resultId ? null : (club || null);
-        // Visibilidad: igual criterio que al subir (ver POST /api/media),
-        // cualquier valor que no sea "privado" exacto se guarda como
-        // "publico".
-        const visibilidadRaw = (body.visibilidad || "").toString().trim().toLowerCase();
-        const visibilidad = visibilidadRaw === "privado" ? "privado" : "publico";
         try {
           await env.DB.prepare(
-            "UPDATE media SET titulo = ?, descripcion = ?, club = ?, portada_segundo = ?, portada_foco = ?, visibilidad = ? WHERE id = ?"
-          ).bind(titulo, descripcion || null, clubGuardado, portadaSegundo, portadaFoco, visibilidad, id).run();
+            "UPDATE media SET titulo = ?, descripcion = ?, club = ?, portada_segundo = ?, portada_foco = ? WHERE id = ?"
+          ).bind(titulo, descripcion || null, club || null, portadaSegundo, portadaFoco, id).run();
         } catch (err) {
-          const esColumnaVisibilidadFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /visibilidad/i.test(err.message || "");
           const esColumnaFocoFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /portada_foco/i.test(err.message || "");
           const esColumnaFaltante = /no such column|no column named|column .* does not exist/i.test(err.message || "") && /portada_segundo/i.test(err.message || "");
-          if (esColumnaVisibilidadFaltante) {
-            try {
-              await env.DB.prepare(
-                "UPDATE media SET titulo = ?, descripcion = ?, club = ?, portada_segundo = ?, portada_foco = ? WHERE id = ?"
-              ).bind(titulo, descripcion || null, clubGuardado, portadaSegundo, portadaFoco, id).run();
-              console.error("No se pudo guardar visibilidad (falta migración migracion_media_visibilidad.sql):", err.message);
-            } catch (err2) {
-              throw err2;
-            }
-          } else if (esColumnaFocoFaltante) {
+          if (esColumnaFocoFaltante) {
             try {
               await env.DB.prepare(
                 "UPDATE media SET titulo = ?, descripcion = ?, club = ?, portada_segundo = ? WHERE id = ?"
-              ).bind(titulo, descripcion || null, clubGuardado, portadaSegundo, id).run();
-              console.error("No se pudo guardar portada_foco (falta migración migracion_media_portada_foco.sql):", err.message);
+              ).bind(titulo, descripcion || null, club || null, portadaSegundo, id).run();
+              console.error("No se pudo guardar portada_foco (falta migración 028_media_portada_foco.sql):", err.message);
             } catch (err2) {
               throw err2;
             }
@@ -9111,57 +7055,12 @@ async function handlePrimary(request, env, ctx) {
             // resto de campos igualmente y se avisa del detalle solo por log.
             await env.DB.prepare(
               "UPDATE media SET titulo = ?, descripcion = ?, club = ? WHERE id = ?"
-            ).bind(titulo, descripcion || null, clubGuardado, id).run();
-            console.error("No se pudo guardar portada_segundo/portada_foco (falta migración migracion_media_portada.sql):", err.message);
+            ).bind(titulo, descripcion || null, club || null, id).run();
+            console.error("No se pudo guardar portada_segundo/portada_foco (falta migración 028_media_portada_foco.sql):", err.message);
           } else {
             throw err;
           }
         }
-
-        // ---------- Vínculo con la galería de partido (match_gallery) ----------
-        // Se gestiona aparte del UPDATE de arriba porque no es una simple
-        // columna de "media": es una fila (o ausencia de fila) en otra
-        // tabla. Tres casos posibles:
-        //  1) Se elige un partido y antes no había ninguno vinculado ->
-        //     se crea el enlace.
-        //  2) Se elige un partido y ya había uno vinculado (al mismo
-        //     partido o a otro distinto) -> se actualiza el enlace
-        //     existente (result_id + equipo) en vez de duplicar filas.
-        //  3) Se quita el partido (resultId vacío) habiendo uno antes ->
-        //     se borra el enlace.
-        // Al ser "extra" (igual que en /api/media POST), un fallo aquí no
-        // debe tirar abajo el resto de cambios ya guardados en "media".
-        try {
-          const enlaceExistente = await env.DB.prepare(
-            "SELECT id, result_id FROM match_gallery WHERE media_id = ?"
-          ).bind(id).first();
-
-          if (resultId) {
-            const resultadoDestino = await env.DB.prepare(
-              "SELECT id FROM results WHERE id = ?"
-            ).bind(resultId).first();
-            if (!resultadoDestino) return json({ error: "El partido elegido ya no existe" }, 404);
-
-            if (enlaceExistente) {
-              await env.DB.prepare(
-                "UPDATE match_gallery SET result_id = ?, equipo = ? WHERE id = ?"
-              ).bind(resultId, equipoGaleria, enlaceExistente.id).run();
-            } else {
-              const maxOrdenFila = await env.DB.prepare(
-                "SELECT COALESCE(MAX(orden), -1) AS max_orden FROM match_gallery WHERE result_id = ?"
-              ).bind(resultId).first();
-              const siguienteOrden = (maxOrdenFila?.max_orden ?? -1) + 1;
-              await env.DB.prepare(
-                `INSERT INTO match_gallery (result_id, media_id, orden, vinculado_por_id, equipo) VALUES (?, ?, ?, ?, ?)`
-              ).bind(resultId, id, siguienteOrden, payload.uid, equipoGaleria).run();
-            }
-          } else if (enlaceExistente) {
-            await env.DB.prepare("DELETE FROM match_gallery WHERE id = ?").bind(enlaceExistente.id).run();
-          }
-        } catch (err) {
-          console.error("No se pudo actualizar el vínculo con la galería del partido al editar media:", err.message);
-        }
-
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "editar_media", entidad: "media", entidad_id: id,
           descripcion: `Ha editado el contenido "${titulo}"`,
@@ -9190,20 +7089,18 @@ async function handlePrimary(request, env, ctx) {
           accion: "descargar_media", entidad: "media", entidad_id: id,
           descripcion: `Ha descargado el archivo "${registro.nombre_archivo}"`,
         }));
-        return cors(new Response(objeto.body, { headers }), ORIGEN_PETICION_ACTUAL);
+        return cors(new Response(objeto.body, { headers }));
       }
 
       // ---------- MEDIA: eliminar (solo admins) ----------
       if (mediaMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede eliminar contenido" }, 403);
         const id = parseInt(mediaMatch[1]);
-        const registro = await env.DB.prepare("SELECT cloudinary_public_id, cloudinary_resource_type, cloudinary_url, autor_id FROM media WHERE id = ?").bind(id).first();
+        const registro = await env.DB.prepare("SELECT cloudinary_public_id, cloudinary_resource_type FROM media WHERE id = ?").bind(id).first();
         if (!registro) return json({ error: "No encontrado" }, 404);
-        if (payload.rol !== "admin" && registro.autor_id !== payload.uid) {
-          return json({ error: "Solo puedes eliminar contenido que hayas subido tú" }, 403);
-        }
-        await borrarDeCloudinary(env, registro.cloudinary_public_id, registro.cloudinary_resource_type, cloudNameDeUrlCloudinary(registro.cloudinary_url));
+        await borrarDeCloudinary(env, registro.cloudinary_public_id, registro.cloudinary_resource_type);
         await env.DB.prepare("DELETE FROM media WHERE id = ?").bind(id).run();
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "eliminar_media", entidad: "media", entidad_id: id,
@@ -9213,26 +7110,10 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- GALERÍA DE PARTIDO (match_gallery) ----------
-      // Vincula imágenes ya existentes en "media" con un partido de
-      // "results" (Bloque B, Fase 10 del plan de colaboradores). No
-      // sube ningún archivo nuevo (eso lo sigue haciendo /api/media,
-      // igual que hasta ahora): esto solo crea/borra/reordena el
-      // enlace entre una imagen ya subida y un partido.
-      //
-      // Permisos (ver puedeGestionarGaleria en el bloque de roles):
-      //  - Consultar la galería de un partido: admin, fotógrafo o
-      //    redactor (el redactor no sube, pero sí necesita poder verla
-      //    para elegir imágenes al escribir una noticia, Fase 12).
-      //  - Vincular/reordenar/desvincular: admin o fotógrafo, sobre
-      //    CUALQUIER partido (no solo "los suyos"): la autoría de cada
-      //    imagen ya queda registrada en media.autor_id para el
-      //    crédito de foto (Fase 14), así que restringir además la
-      //    galería por partido no aporta nada y solo estorbaría si
-      //    varios fotógrafos cubren el mismo encuentro.
-      //  - Desvincular una imagen en concreto: además de lo anterior,
-      //    el propio fotógrafo que la vinculó siempre puede quitarla
-      //    (igual que en /api/media, aunque aquí ya no hace falta ser
-      //    admin para quitar SU PROPIO enlace).
+      // Espejo exacto de los endpoints equivalentes en worker/src/index.js
+      // (D1): ver ahí la explicación completa de permisos y diseño.
+      // Requiere la tabla creada en Postgres por la migración
+      // db/migrations/027_match_gallery.sql.
       const galeriaPartidoMatch = path.match(/^\/api\/results\/(\d+)\/galeria$/);
 
       if (galeriaPartidoMatch && method === "GET") {
@@ -9242,31 +7123,18 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: "No tienes acceso a la galería de partidos" }, 403);
         }
         const resultId = parseInt(galeriaPartidoMatch[1]);
-        const resultado = await env.DB.prepare(
-          "SELECT id, equipo_local, equipo_visitante, fecha_partido, slug FROM results WHERE id = ?"
-        ).bind(resultId).first();
+        const resultado = await env.DB.prepare("SELECT id FROM results WHERE id = ?").bind(resultId).first();
         if (!resultado) return json({ error: "Partido no encontrado" }, 404);
         const { results } = await env.DB.prepare(
-          `SELECT mg.id, mg.orden, mg.created_at, mg.equipo,
+          `SELECT mg.id, mg.orden, mg.created_at,
                   m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
-                  m.tipo, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
+                  m.tipo, m.autor_id, m.autor_nombre
            FROM match_gallery mg
            JOIN media m ON m.id = mg.media_id
-           LEFT JOIN users u ON u.id = m.autor_id
            WHERE mg.result_id = ?
            ORDER BY mg.orden ASC, mg.created_at ASC`
         ).bind(resultId).all();
-        // El link público solo tiene sentido si ya hay al menos una foto
-        // vinculada; no se genera un slug "en vacío" para un partido sin
-        // galería todavía.
-        const slug = results.length ? await slugPartidoUnico(env, resultado) : (resultado.slug || null);
-        return json({
-          galeria: results,
-          equipoLocal: resultado.equipo_local,
-          equipoVisitante: resultado.equipo_visitante,
-          slug,
-          urlPublica: slug ? `${SITIO_URL}/galeria/${slug}` : null,
-        });
+        return json({ galeria: results });
       }
 
       if (galeriaPartidoMatch && method === "POST") {
@@ -9280,23 +7148,11 @@ async function handlePrimary(request, env, ctx) {
         if (!resultado) return json({ error: "Partido no encontrado" }, 404);
 
         const body = await request.json().catch(() => ({}));
-        // Admite vincular una imagen sola (mediaId) o varias de golpe
-        // (mediaIds), para no obligar al frontend a hacer una llamada
-        // por cada foto al subir una tanda entera desde el panel del
-        // fotógrafo.
         const mediaIds = Array.isArray(body.mediaIds)
           ? body.mediaIds.map((x) => parseInt(x)).filter((x) => Number.isInteger(x))
           : (Number.isInteger(parseInt(body.mediaId)) ? [parseInt(body.mediaId)] : []);
         if (!mediaIds.length) return json({ error: "Falta mediaId o mediaIds" }, 400);
-        // De qué equipo son estas fotos ('local', 'visitante' o vacío
-        // para foto general), igual criterio que en POST /api/media.
-        let equipoGaleria = (body.equipo || "").toString().trim().toLowerCase();
-        if (equipoGaleria !== "local" && equipoGaleria !== "visitante") equipoGaleria = null;
 
-        // Siguiente número de orden libre, para que las imágenes nuevas
-        // se añadan al final de la galería en vez de mezclarse con las
-        // que ya estuvieran (el fotógrafo puede reordenar después con
-        // el PUT de más abajo).
         const maxOrdenFila = await env.DB.prepare(
           "SELECT COALESCE(MAX(orden), -1) AS max_orden FROM match_gallery WHERE result_id = ?"
         ).bind(resultId).first();
@@ -9312,14 +7168,11 @@ async function handlePrimary(request, env, ctx) {
           }
           try {
             await env.DB.prepare(
-              `INSERT INTO match_gallery (result_id, media_id, orden, vinculado_por_id, equipo) VALUES (?, ?, ?, ?, ?)`
-            ).bind(resultId, mediaId, siguienteOrden, payload.uid, equipoGaleria).run();
+              `INSERT INTO match_gallery (result_id, media_id, orden, vinculado_por_id) VALUES (?, ?, ?, ?)`
+            ).bind(resultId, mediaId, siguienteOrden, payload.uid).run();
             vinculadas.push(mediaId);
             siguienteOrden++;
           } catch (err) {
-            // El índice único (result_id, media_id) rechaza vincular
-            // dos veces la misma imagen al mismo partido: no es un
-            // error real, simplemente ya estaba.
             if (/unique/i.test(err.message || "")) {
               errores.push({ mediaId, error: "Ya estaba en la galería de este partido" });
             } else {
@@ -9339,9 +7192,6 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true, vinculadas, errores });
       }
 
-      // ---------- GALERÍA DE PARTIDO: reordenar ----------
-      // Recibe el orden completo deseado como lista de ids de
-      // match_gallery (no de media), más simple que mandar deltas.
       if (galeriaPartidoMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
@@ -9353,9 +7203,6 @@ async function handlePrimary(request, env, ctx) {
         const orden = Array.isArray(body.orden) ? body.orden.map((x) => parseInt(x)).filter((x) => Number.isInteger(x)) : [];
         if (!orden.length) return json({ error: "Falta el nuevo orden (lista de ids)" }, 400);
 
-        // Solo se tocan filas que de verdad pertenezcan a este partido,
-        // para que no se pueda colar el id de una fila de otra galería
-        // desde el body.
         for (let i = 0; i < orden.length; i++) {
           await env.DB.prepare(
             "UPDATE match_gallery SET orden = ? WHERE id = ? AND result_id = ?"
@@ -9364,32 +7211,7 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true });
       }
 
-      // ---------- GALERÍA DE PARTIDO: desvincular una imagen ----------
-      // Borra solo el enlace en match_gallery; la imagen sigue
-      // existiendo en "media" (para borrarla del todo se usa
-      // DELETE /api/media/:id, ya existente, solo accesible a admin).
       const galeriaItemMatch = path.match(/^\/api\/match-gallery\/(\d+)$/);
-
-      // ---------- GALERÍA DE PARTIDO: cambiar el equipo de una foto ----------
-      // Permite corregir a posteriori de qué equipo es una foto ya
-      // vinculada (p. ej. si se subió sin elegir equipo, o se eligió mal),
-      // sin tener que desvincularla y volver a subirla.
-      if (galeriaItemMatch && method === "PATCH") {
-        const payload = await requireAuth(request, env);
-        if (!payload) return json({ error: "No autorizado" }, 401);
-        if (!puedeGestionarGaleria(payload)) {
-          return json({ error: "Un redactor no puede editar la galería de un partido" }, 403);
-        }
-        const id = parseInt(galeriaItemMatch[1]);
-        const enlace = await env.DB.prepare("SELECT id FROM match_gallery WHERE id = ?").bind(id).first();
-        if (!enlace) return json({ error: "No encontrado" }, 404);
-        const body = await request.json().catch(() => ({}));
-        let equipoGaleria = (body.equipo || "").toString().trim().toLowerCase();
-        if (equipoGaleria !== "local" && equipoGaleria !== "visitante") equipoGaleria = null;
-        await env.DB.prepare("UPDATE match_gallery SET equipo = ? WHERE id = ?").bind(equipoGaleria, id).run();
-        return json({ ok: true });
-      }
-
       if (galeriaItemMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
@@ -9408,193 +7230,9 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true });
       }
 
-      // ---------- GALERÍA DE PARTIDO: vista pública (Fase 2 galería) ----------
-      // Sin autenticación, a diferencia de GET /api/results/:id/galeria de
-      // arriba (que es la vista de gestión del panel). Se consulta por
-      // slug (no por id) porque es el formato de la URL pública
-      // compartible (/galeria/:slug, ver public/_worker.js). Devuelve las
-      // fotos ya agrupadas por equipo para que el frontend público solo
-      // tenga que pintar las pestañas, sin repetir esa lógica en JS.
-      const galeriaPublicaMatch = path.match(/^\/api\/results\/galeria\/([^/]+)$/);
-      if (galeriaPublicaMatch && method === "GET") {
-        const slug = decodeURIComponent(galeriaPublicaMatch[1]);
-        const resultado = await env.DB.prepare(
-          "SELECT id, equipo_local, equipo_visitante, escudo_local_url, escudo_visitante_url, goles_local, goles_visitante, penaltis_local, penaltis_visitante, fecha_partido, estado, competicion, jornada, slug FROM results WHERE slug = ?"
-        ).bind(slug).first();
-        if (!resultado) return json({ error: "Galería no encontrada" }, 404);
-        // Vista pública, sin autenticar: solo se devuelve lo marcado como
-        // "publico". Lo marcado como "privado" existe igualmente en
-        // match_gallery (para que el equipo de redacción lo siga viendo
-        // y gestionando desde el panel), pero nunca sale por aquí.
-        let filas;
-        try {
-          ({ results: filas } = await env.DB.prepare(
-            `SELECT mg.equipo, m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
-                    m.tipo, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
-             FROM match_gallery mg
-             JOIN media m ON m.id = mg.media_id
-             LEFT JOIN users u ON u.id = m.autor_id
-             WHERE mg.result_id = ? AND m.visibilidad = 'publico'
-             ORDER BY mg.orden ASC, mg.created_at ASC`
-          ).bind(resultado.id).all());
-        } catch (err) {
-          // Columna "visibilidad" aún no migrada en esta base de datos:
-          // se reintenta sin el filtro (todo se trata como público, que
-          // es el comportamiento que había antes de esta función).
-          ({ results: filas } = await env.DB.prepare(
-            `SELECT mg.equipo, m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
-                    m.tipo, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
-             FROM match_gallery mg
-             JOIN media m ON m.id = mg.media_id
-             LEFT JOIN users u ON u.id = m.autor_id
-             WHERE mg.result_id = ?
-             ORDER BY mg.orden ASC, mg.created_at ASC`
-          ).bind(resultado.id).all());
-        }
-        // Agrupado en servidor: "local"/"visitante" con su nombre de
-        // equipo ya resuelto, y "general" para fotos sin equipo asignado
-        // (p.ej. del estadio o del ambiente, no de un equipo en concreto).
-        // Un grupo con cero fotos no se incluye, así el frontend puede
-        // usar directamente Object.keys(grupos) para decidir qué
-        // pestañas mostrar.
-        const grupos = {};
-        const agregarAGrupo = (clave, nombre) => {
-          const deEseGrupo = filas.filter((f) => (f.equipo || null) === clave);
-          if (deEseGrupo.length) grupos[clave || "general"] = { nombre, fotos: deEseGrupo };
-        };
-        agregarAGrupo("local", resultado.equipo_local);
-        agregarAGrupo("visitante", resultado.equipo_visitante);
-        agregarAGrupo(null, "General");
-        return json({
-          partido: resultado,
-          totalFotos: filas.length,
-          grupos,
-        });
-      }
-
-      // ---------- GALERÍA GENERAL DEL SITIO: vista pública ----------
-      // Sin autenticación, a diferencia de GET /api/media (panel), que
-      // exige login y además solo enseña a cada redactor/fotógrafo lo
-      // suyo (o todo, si es admin). Aquí, al revés: se enseña TODO lo
-      // marcado como "publico" (igual criterio que la galería de un
-      // partido en concreto, ver galeriaPublicaMatch más arriba), sin
-      // importar quién lo subió ni a qué partido esté vinculado -es la
-      // "portada" de toda la mediateca, no la de un partido. Paginado
-      // con LIMIT+1 (se piden 25 pero se comprueba si llegó la 25) para
-      // saber si hay más sin tener que lanzar un COUNT(*) aparte.
-      if (path === "/api/media/publica" && method === "GET") {
-        const TAM_PAGINA = 24;
-        const pagina = Math.max(1, parseInt(url.searchParams.get("pagina"), 10) || 1);
-        const tipoFiltro = url.searchParams.get("tipo"); // "foto" | "video" | null (todo)
-        const offset = (pagina - 1) * TAM_PAGINA;
-
-        const condicionTipo = tipoFiltro === "foto" || tipoFiltro === "video" ? "AND m.tipo = ?" : "";
-        const bindsBase = tipoFiltro === "foto" || tipoFiltro === "video" ? [tipoFiltro] : [];
-
-        let filas;
-        try {
-          ({ results: filas } = await env.DB.prepare(
-            `SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.club, m.created_at,
-                    COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
-             FROM media m
-             LEFT JOIN users u ON u.id = m.autor_id
-             WHERE m.visibilidad = 'publico' ${condicionTipo}
-             ORDER BY m.created_at DESC LIMIT ? OFFSET ?`
-          ).bind(...bindsBase, TAM_PAGINA + 1, offset).all());
-        } catch (err) {
-          // Columna "visibilidad" aún no migrada en esta base de datos:
-          // se reintenta sin el filtro, igual criterio que en el resto
-          // de sitios que ya tocan esta columna (todo se trata como
-          // público, que es el comportamiento previo a la migración).
-          ({ results: filas } = await env.DB.prepare(
-            `SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.club, m.created_at,
-                    COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
-             FROM media m
-             LEFT JOIN users u ON u.id = m.autor_id
-             WHERE 1=1 ${condicionTipo}
-             ORDER BY m.created_at DESC LIMIT ? OFFSET ?`
-          ).bind(...bindsBase, TAM_PAGINA + 1, offset).all());
-        }
-
-        const hayMas = filas.length > TAM_PAGINA;
-        if (hayMas) filas.length = TAM_PAGINA;
-
-        // A cada foto/vídeo se le adjunta, si lo tiene, el partido al
-        // que está vinculado en match_gallery (equipos + slug), para
-        // poder ofrecer un "Ver partido" desde la galería general sin
-        // que el frontend tenga que hacer una consulta aparte por foto.
-        if (filas.length) {
-          try {
-            const { results: enlaces } = await env.DB.prepare(
-              `SELECT mg.media_id, r.equipo_local, r.equipo_visitante, r.slug
-               FROM match_gallery mg
-               JOIN results r ON r.id = mg.result_id
-               WHERE mg.media_id IN (${filas.map(() => "?").join(",")})`
-            ).bind(...filas.map((f) => f.id)).all();
-            const porMediaId = new Map(enlaces.map((e) => [e.media_id, e]));
-            for (const f of filas) {
-              const e = porMediaId.get(f.id);
-              if (e && e.slug) {
-                f.partido = { equipo_local: e.equipo_local, equipo_visitante: e.equipo_visitante, slug: e.slug };
-              }
-            }
-          } catch (err) {
-            console.error("No se pudo cargar el partido vinculado de la galería general (se continúa sin ese dato):", err.message);
-          }
-        }
-
-        return json({ media: filas, pagina, hayMas });
-      }
-
-      // ---------- GALERÍA/IMÁGENES DE UNA NOTICIA (article_media, Fase 12) ----------
-      // Consulta lo que ya se vinculó a una noticia (para pintarlo en el
-      // editor, Fase 13, o en la noticia pública, Fase 14). No hace falta
-      // endpoint aparte para vincular: se manda junto con el resto del
-      // formulario en POST/PUT /api/articles (ver sincronizarArticleMedia).
-      const articuloMediaMatch = path.match(/^\/api\/articles\/(\d+)\/media$/);
-      if (articuloMediaMatch && method === "GET") {
-        const payload = await requireAuth(request, env);
-        if (!payload) return json({ error: "No autorizado" }, 401);
-        const articleId = parseInt(articuloMediaMatch[1]);
-        let results;
-        try {
-          ({ results } = await env.DB.prepare(
-            `SELECT am.id, am.orden, m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
-                    m.tipo, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre, m.portada_segundo, m.portada_foco
-             FROM article_media am
-             JOIN media m ON m.id = am.media_id
-             LEFT JOIN users u ON u.id = m.autor_id
-             WHERE am.article_id = ?
-             ORDER BY am.orden ASC`
-          ).bind(articleId).all());
-        } catch (err) {
-          // portada_segundo / portada_foco son columnas añadidas por
-          // migraciones manuales: si aún no se han ejecutado en esta base
-          // de datos, se reintenta sin ellas en vez de romper la consulta.
-          ({ results } = await env.DB.prepare(
-            `SELECT am.id, am.orden, m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
-                    m.tipo, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
-             FROM article_media am
-             JOIN media m ON m.id = am.media_id
-             LEFT JOIN users u ON u.id = m.autor_id
-             WHERE am.article_id = ?
-             ORDER BY am.orden ASC`
-          ).bind(articleId).all());
-        }
-        return json({ media: results });
-      }
-
       // ---------- ARTICLES: lista pública / creación ----------
       // ---------- Banner flotante de "última hora" (público) ----------
-      // Lo consulta layout.js desde CUALQUIER página del sitio (es la
-      // única llamada que hace falta para saber si hay que pintar el
-      // banner). Se resuelve con el propio WHERE de la consulta: en
-      // cuanto pasen las 2h de banner_urgente_hasta, deja de devolver
-      // nada sin que haga falta ningún cron ni tarea aparte que la
-      // desactive. Solo puede haber una noticia con banner activo a la
-      // vez desde el panel (ver PUT/POST más abajo, que no fuerzan esto
-      // a nivel de base de datos, pero si hubiera más de una por lo que
-      // sea, se devuelve solo la más reciente).
+      // Ver el comentario gemelo en worker/src/index.js.
       if (path === "/api/articles/banner-urgente" && method === "GET") {
         const fila = await env.DB.prepare(
           `SELECT slug, titulo, categoria FROM articles
@@ -9608,11 +7246,6 @@ async function handlePrimary(request, env, ctx) {
           url: urlNoticia(fila.categoria, fila.slug),
         });
       }
-      // Desactivar el banner sin tener que reenviar todo el formulario
-      // de edición de la noticia (pensado para el botón "Quitar" del
-      // listado del panel, ver Fase 2). Mismo criterio de permisos que
-      // activarlo desde el PUT normal: admin o redactor Nivel 2+, y
-      // además tiene que poder editar esa noticia en concreto.
       const desactivarBannerMatch = path.match(/^\/api\/articles\/(\d+)\/banner-urgente$/);
       if (desactivarBannerMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
@@ -9680,9 +7313,9 @@ async function handlePrimary(request, env, ctx) {
         // con la LONGITUD del contenido traducido, no su texto: se pide
         // como "contenido_XX_len" y se traduce a un booleano equivalente
         // a tener contenido, sin transferir el HTML entero.
-        let query = `SELECT id, slug, titulo, subtitulo, contenido, tipo, categoria, categorias_adicionales, club, imagen_url, imagenes,
+        let query = `SELECT id, slug, titulo, subtitulo, contenido, tipo, categoria, club, imagen_url, imagenes,
             resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado,
-            estado_borrador, programado_para, fecha_preferencia_desde, fecha_preferencia_hasta, slug_congelado, fecha_publicacion, created_at, updated_at,
+            estado_borrador, programado_para, slug_congelado, fecha_publicacion, created_at, updated_at,
             titulo_eu, LENGTH(contenido_eu) AS contenido_eu_len,
             titulo_ca, LENGTH(contenido_ca) AS contenido_ca_len,
             titulo_gl, LENGTH(contenido_gl) AS contenido_gl_len,
@@ -9794,14 +7427,6 @@ async function handlePrimary(request, env, ctx) {
           ? (body.estado_borrador === "terminado" ? "terminado" : "en_proceso")
           : null;
 
-        // Preferencia de publicación del REDACTOR: rango de fechas (día,
-        // sin hora) puramente orientativo que puede acompañar al borrador
-        // cuando se marca como "terminado", para que quien lo revise
-        // sepa en qué días conviene publicarlo. Solo aplica junto a un
-        // borrador "terminado" (si no se guarda como terminado, o si se
-        // publica/programa directamente, no tiene sentido conservarla).
-        const preferenciaFechas = normalizarPreferenciaFechas(estadoBorrador === "terminado" ? body : null);
-
         // Un borrador guardado como "en proceso" (todavía se está
         // escribiendo) no tiene por qué cumplir los límites de longitud:
         // esos límites solo aplican a lo que se publica o se marca como
@@ -9832,12 +7457,11 @@ async function handlePrimary(request, env, ctx) {
         }
         const resultadoId = body.resultado_id ? parseInt(body.resultado_id, 10) : null;
 
-        // Club(es) (y, para previa/crónica, categoría) del artículo: para
-        // previa/crónica ambos se derivan siempre del resultado vinculado
-        // (los dos equipos y la competición del partido), no de los
-        // selectores del panel (ver resolverClubArticulo). Para el resto
-        // de tipos no cambia nada.
-        const { error: errorClub, club: clubFinal, categoria: categoriaAutomatica } = await resolverClubArticulo(env, body.tipo, resultadoId, body.club);
+        // Club(es) del artículo: para previa/crónica se derivan siempre
+        // del resultado vinculado (ambos equipos del partido), no del
+        // selector de club del panel (ver resolverClubArticulo). Para el
+        // resto de tipos no cambia nada.
+        const { error: errorClub, club: clubFinal } = await resolverClubArticulo(env, body.tipo, resultadoId, body.club);
         if (errorClub) return json({ error: errorClub }, 400);
 
         // Autor de la noticia: por defecto quien la está subiendo, pero se
@@ -9846,33 +7470,10 @@ async function handlePrimary(request, env, ctx) {
         // usuarios (y no en el JWT) para firmar con el nombre actual y
         // para no poder "firmar" con un nombre inventado.
         const idAutorElegido = body.autor_id ? parseInt(body.autor_id, 10) : payload.uid;
-        const autorElegido = await env.DB.prepare("SELECT id, nombre, categorias_fijas FROM users WHERE id = ? AND activo = 1")
+        const autorElegido = await env.DB.prepare("SELECT id, nombre FROM users WHERE id = ? AND activo = 1")
           .bind(idAutorElegido).first();
         const autorId = autorElegido ? autorElegido.id : payload.uid;
         const autorNombre = autorElegido ? autorElegido.nombre : payload.nombre;
-
-        // Si el autor final tiene categoría(s) fija(s), la categoría de la
-        // noticia debe respetarlas (se valida/fuerza aquí, se aplica al
-        // hacer el INSERT más abajo con "categoriaFinal").
-        const categoriasFijasAutor = parsearCategoriasFijas(autorElegido ? autorElegido.categorias_fijas : null);
-        // Para previa/crónica la categoría ya viene resuelta desde el
-        // resultado vinculado (categoriaAutomatica, ver
-        // resolverClubArticulo): se usa esa en vez de la que mande el
-        // body, pero sigue pasando por validarCategoriaSegunAutor para
-        // que, si el autor tiene categoría(s) fija(s), se siga
-        // respetando esa restricción.
-        const { error: errorCategoriaAutor, categoria: categoriaFinal } = validarCategoriaSegunAutor(
-          categoriasFijasAutor, categoriaAutomatica !== undefined ? categoriaAutomatica : body.categoria
-        );
-        if (errorCategoriaAutor) return json({ error: errorCategoriaAutor }, 400);
-
-        // Categoría(s) adicional(es): simples etiquetas informativas
-        // aparte de la principal (que es la única que forma el link y la
-        // única que filtra en categoria.html). Ver validarCategoriasAdicionales.
-        const { error: errorCategoriasAdicionales, categoriasAdicionales } = validarCategoriasAdicionales(
-          body.categorias_adicionales, categoriaFinal, categoriasFijasAutor
-        );
-        if (errorCategoriasAdicionales) return json({ error: errorCategoriasAdicionales }, 400);
 
         // Segundo autor (coautor) opcional: una noticia se puede firmar
         // entre dos personas. Solo aporta el nombre extra; no cambia
@@ -9907,46 +7508,33 @@ async function handlePrimary(request, env, ctx) {
           ? JSON.stringify(body.ficha_tecnica)
           : null;
 
-        // Banner urgente: solo puede activarlo (a mano, al crear la
-        // noticia) un admin o un redactor de Nivel 2+ -- igual de
-        // criterio que programar publicación, más arriba -- para que un
-        // redactor recién llegado no pueda ponerse a sí mismo en el
-        // banner de toda la web. body.banner_urgente = true lo activa;
-        // cualquier otro valor (incluido no mandar el campo) lo deja
-        // desactivado. La fecha de caducidad la calcula el propio SQL
-        // con datetime('now', '+2 hours'), nunca un valor del cliente.
-        // nivelUsuario puede seguir sin calcular aquí (solo se resuelve
-        // más arriba si body.publicado !== false), así que se completa
-        // bajo demanda antes de decidir el permiso del banner.
+        // Banner urgente: mismo criterio que en worker/src/index.js (ver
+        // comentario allí) -- solo admin o redactor Nivel 2+ puede
+        // activarlo, y la duración la calcula el servidor.
         if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
         const puedeActivarBanner = payload.rol === "admin" || nivelUsuario >= 2;
         const activarBanner = puedeActivarBanner && body.banner_urgente === true;
 
-        const filaArticuloCreado = await env.DB.prepare(
-          `INSERT INTO articles (slug, titulo, subtitulo, contenido, tipo, categoria, categorias_adicionales, club, imagen_url, imagenes, resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado, estado_borrador, programado_para, fecha_preferencia_desde, fecha_preferencia_hasta, slug_congelado, fecha_publicacion, updated_at,
+        await env.DB.prepare(
+          `INSERT INTO articles (slug, titulo, subtitulo, contenido, tipo, categoria, club, imagen_url, imagenes, resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado, estado_borrador, programado_para, slug_congelado, fecha_publicacion, updated_at,
             titulo_eu, subtitulo_eu, contenido_eu, titulo_ca, subtitulo_ca, contenido_ca, titulo_gl, subtitulo_gl, contenido_gl, titulo_en, subtitulo_en, contenido_en, origin_write_id, ficha_tecnica, banner_urgente, banner_urgente_hasta)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${calcularBannerUrgenteHasta(activarBanner)}) RETURNING id`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${calcularBannerUrgenteHasta(activarBanner)})`
         ).bind(
           slug, body.titulo, body.subtitulo || null, body.contenido,
-          body.tipo || "noticia", categoriaFinal, categoriasAdicionales.length ? JSON.stringify(categoriasAdicionales) : null, clubFinal,
+          body.tipo || "noticia", body.categoria || "hypermotion", clubFinal,
           imagenPortada, imagenes.length ? JSON.stringify(imagenes) : null, resultadoId,
           autorId, autorNombre, coautorId, coautorNombre,
-          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, preferenciaFechas.desde, preferenciaFechas.hasta, slugCongelado,
+          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, slugCongelado,
           programadoPara || body.fecha_publicacion || new Date().toISOString(),
           traducciones.titulo_eu, traducciones.subtitulo_eu, traducciones.contenido_eu,
           traducciones.titulo_ca, traducciones.subtitulo_ca, traducciones.contenido_ca,
           traducciones.titulo_gl, traducciones.subtitulo_gl, traducciones.contenido_gl,
           traducciones.titulo_en, traducciones.subtitulo_en, traducciones.contenido_en,
           origenWriteId, fichaTecnica, activarBanner ? 1 : 0
-        ).first();
-
-        // Fase 12: galería/imágenes sueltas vinculadas a la noticia (aparte
-        // de "imagenes", que van dentro del propio texto). Solo se guarda
-        // algo si el redactor mandó media_ids y/o galeria_resultado_id.
-        await sincronizarArticleMedia(env, filaArticuloCreado.id, body);
+        ).run();
 
         const publicado = body.publicado !== false;
-        const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista" }[body.tipo] || "Artículo";
+        const tipoLabel = { noticia: "Noticia", cronica: "Crónica", opinion: "Opinión", entrevista: "Entrevista" }[body.tipo] || "Artículo";
         const firmaAutores = coautorNombre ? `${autorNombre} y ${coautorNombre}` : autorNombre;
         if (programadoPara) {
           // No se manda aviso por email al programarla: se mandará el
@@ -9963,7 +7551,7 @@ async function handlePrimary(request, env, ctx) {
               filas: [
                 { etiqueta: "Autor", valor: firmaAutores },
                 { etiqueta: "Subida por", valor: payload.nombre },
-                { etiqueta: "Categoría", valor: clubArticuloLegible(clubFinal) || body.categoria },
+                { etiqueta: "Categoría", valor: body.club || body.categoria },
               ],
               boton: { texto: "Ver la noticia", url: urlNoticia(body.categoria, slug) },
             }),
@@ -9977,10 +7565,9 @@ async function handlePrimary(request, env, ctx) {
           // no confundirlo con una publicacion real. Si el redactor ha
           // dicho que todavía la está escribiendo ("en_proceso") no se
           // manda ningún correo, para no generar avisos de más.
-          const textoPreferenciaFechas = formatearPreferenciaFechasEmail(preferenciaFechas);
           ctx.waitUntil(enviarEmailNotificacion(env, {
             asunto: `Nuevo borrador terminado: ${body.titulo}`,
-            texto: `${payload.nombre} ha guardado el borrador "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmado por ${firmaAutores}, marcándolo como terminado. Todavía no está publicado.${textoPreferenciaFechas ? ` Preferencia de fecha del redactor: ${textoPreferenciaFechas}.` : ""}`,
+            texto: `${payload.nombre} ha guardado el borrador "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmado por ${firmaAutores}, marcándolo como terminado. Todavía no está publicado.`,
             html: plantillaEmail({
               etiqueta: "Borrador terminado",
               titulo: body.titulo,
@@ -9988,8 +7575,7 @@ async function handlePrimary(request, env, ctx) {
               filas: [
                 { etiqueta: "Autor", valor: firmaAutores },
                 { etiqueta: "Guardado por", valor: payload.nombre },
-                { etiqueta: "Categoría", valor: clubArticuloLegible(clubFinal) || body.categoria },
-                ...(textoPreferenciaFechas ? [{ etiqueta: "Preferencia de fecha", valor: textoPreferenciaFechas }] : []),
+                { etiqueta: "Categoría", valor: body.club || body.categoria },
               ],
             }),
           }));
@@ -10002,7 +7588,7 @@ async function handlePrimary(request, env, ctx) {
             : `Ha ${publicado ? "publicado" : "guardado el borrador de"} "${tipoLabel.toLowerCase()}": "${body.titulo}"${estadoBorrador ? ` (${estadoBorrador === "terminado" ? "terminado" : "en proceso"})` : ""}${esUltimaHora ? " (Última hora)" : ""}`,
         }));
 
-        return json({ ok: true, slug, publicado, estado_borrador: estadoBorrador, programado_para: programadoPara, fecha_preferencia_desde: preferenciaFechas.desde, fecha_preferencia_hasta: preferenciaFechas.hasta, avisos_traduccion: avisosTraduccion });
+        return json({ ok: true, slug, publicado, estado_borrador: estadoBorrador, programado_para: programadoPara, avisos_traduccion: avisosTraduccion });
       }
 
       // ---------- ARTICLE individual ----------
@@ -10075,127 +7661,44 @@ async function handlePrimary(request, env, ctx) {
           article.imagenes = [];
         }
 
-        // ficha_tecnica se guarda en la columna como texto JSON (ver
-        // /api/articles POST/PUT más arriba), pero el frontend
-        // (fichaTecnicaArticuloHTML, public/js/config.js) espera un
-        // objeto: sin este parseo llegaba como string y la función la
-        // descartaba silenciosamente (typeof ficha !== "object"), por lo
-        // que la ficha técnica nunca se veía en ninguna crónica.
-        try {
-          article.ficha_tecnica = (article.tipo === "cronica" && article.ficha_tecnica) ? JSON.parse(article.ficha_tecnica) : null;
-        } catch {
-          article.ficha_tecnica = null;
-        }
-
         // Si la noticia/crónica está vinculada a un partido, se adjunta
         // aquí su marcador para que la web lo pueda mostrar.
-        //
-        // CACHÉ EN KV: este endpoint es público y se llama en CADA visita
-        // a una crónica/previa (sin autenticación, sin límite de tráfico
-        // propio), y antes hacía 3 consultas D1 (results, match_events,
-        // alineaciones) por cada una de esas visitas. En las métricas de
-        // D1 de sep-2026 esto sumaba decenas de miles de lecturas/día solo
-        // por tráfico público normal. El TTL se adapta al estado del
-        // partido en vez de ser fijo: "en_juego" cambia de verdad segundo
-        // a segundo (goles, tarjetas, minuto), así que ahí se mantiene
-        // corto para que el marcador se vea al día; el resto de estados
-        // (programado, retrasado, finalizado, anulado) prácticamente no
-        // cambian una vez fijados, así que un TTL mucho más largo no
-        // pierde nada en la práctica y evita repetir la consulta (y la
-        // escritura en KV) en cada visita/recarga dentro de esa ventana.
-        // Antes el TTL era fijo en 30s también para partidos ya
-        // terminados/por jugar, lo que en tráfico alto disparaba muchas
-        // más escrituras a KV de las necesarias (KV cobra por escritura,
-        // no solo por lectura). Se cachea por resultado_id, no por
-        // artículo, para que varias crónicas del mismo partido compartan
-        // la misma entrada.
         if (article.resultado_id) {
-          const cacheKeyPartido = `articulo-partido:${article.resultado_id}`;
-          let datosPartido = null;
-          if (env.ELOTROFUTBOL_KV) {
-            try {
-              datosPartido = await env.ELOTROFUTBOL_KV.get(cacheKeyPartido, "json");
-            } catch (err) {
-              console.error("[cache-articulo-partido] fallo al leer KV, se consulta D1:", err);
-            }
+          const resultado = await env.DB.prepare("SELECT * FROM results WHERE id = ?").bind(article.resultado_id).first();
+          if (resultado) {
+            // Se adjuntan también los goles/tarjetas del partido (tabla
+            // match_events) para poder mostrar el detalle completo
+            // (goles, tarjetas, estadio...) directamente dentro de la
+            // noticia, no solo el marcador.
+            const { results: eventos } = await env.DB.prepare(
+              "SELECT * FROM match_events WHERE resultado_id = ? ORDER BY minuto ASC, minuto_extra ASC, orden ASC"
+            ).bind(article.resultado_id).all();
+            resultado.eventos = eventos || [];
           }
-          if (!datosPartido) {
-            const resultado = await env.DB.prepare("SELECT * FROM results WHERE id = ?").bind(article.resultado_id).first();
-            if (resultado) {
-              // Se adjuntan también los goles/tarjetas del partido (tabla
-              // match_events) para poder mostrar el detalle completo
-              // (goles, tarjetas, estadio...) directamente dentro de la
-              // noticia, no solo el marcador.
-              const { results: eventos } = await env.DB.prepare(
-                "SELECT * FROM match_events WHERE resultado_id = ? ORDER BY minuto ASC, minuto_extra ASC, orden ASC"
-              ).bind(article.resultado_id).all();
-              resultado.eventos = eventos || [];
-            }
-            const alineaciones = await obtenerAlineaciones(env, "result_id", article.resultado_id);
-            datosPartido = { resultado: resultado || null, alineaciones };
-            if (env.ELOTROFUTBOL_KV) {
-              try {
-                const ttlPartido = resultado && resultado.estado === "en_juego" ? 30 : 3600;
-                await env.ELOTROFUTBOL_KV.put(cacheKeyPartido, JSON.stringify(datosPartido), { expirationTtl: ttlPartido });
-              } catch (err) {
-                console.error("[cache-articulo-partido] fallo al guardar (no crítico):", err);
-              }
-            }
-          }
-          article.resultado = datosPartido.resultado;
-          article.alineaciones = datosPartido.alineaciones;
-          // Enlace a la galería pública del partido: a diferencia del
-          // modal de "Resultados" (GET /api/results/:id, más abajo), en
-          // la crónica SIEMPRE se quiere invitar a la galería aunque
-          // todavía no tenga fotos subidas, para animar a fotógrafos y
-          // aficionados a visitarla/rellenarla. Por eso aquí ya no se
-          // condiciona url_galeria a que exista al menos una foto: se
-          // genera (y persiste) el slug del partido de todas formas.
-          // galeria_disponible sí distingue si ya hay fotos reales, para
-          // que el frontend pueda variar el texto/aspecto de la llamada
-          // a la acción ("Ver galería" vs "Sé el primero en verla"/"aún
-          // sin fotos"). foto_portada_galeria (primera foto por orden)
-          // permite pintar una miniatura real en vez de un icono
-          // genérico cuando ya hay contenido. No se guarda nada de esto
-          // dentro de "datosPartido" (que sí se cachea en KV) porque la
-          // galería puede recibir fotos nuevas en cualquier momento y no
-          // queremos servir un estado desactualizado durante todo el TTL
-          // del resto del marcador.
-          if (article.resultado) {
-            const portada = await env.DB.prepare(
-              `SELECT m.cloudinary_url AS cloudinary_url
-               FROM match_gallery mg JOIN media m ON m.id = mg.media_id
-               WHERE mg.result_id = ? AND m.tipo = 'foto'
-               ORDER BY mg.orden ASC, mg.created_at ASC LIMIT 1`
-            ).bind(article.resultado_id).first();
-            article.resultado.url_galeria = `${SITIO_URL}/galeria/${await slugPartidoUnico(env, article.resultado)}`;
-            article.resultado.galeria_disponible = !!portada;
-            article.resultado.foto_portada_galeria = portada ? portada.cloudinary_url : null;
-          }
+          article.resultado = resultado || null;
         } else {
           article.resultado = null;
-          // Sin partido vinculado, las alineaciones (si las hay) son
-          // propias de la noticia (article_id), no compartidas -no tiene
-          // sentido cachearlas aquí: no sufren el mismo problema de
-          // volumen que las ligadas a un partido con tráfico público alto.
-          article.alineaciones = await obtenerAlineaciones(env, "article_id", article.id);
         }
 
+        // Si la noticia está vinculada a un partido, las alineaciones son
+        // una única entidad compartida colgada del partido (result_id),
+        // no de la noticia: así una noticia y su partido siempre muestran
+        // exactamente la misma alineación, sin duplicados ni versiones
+        // desincronizadas entre sí. Solo cuando NO hay partido vinculado
+        // la noticia puede tener alineaciones propias (article_id).
+        article.alineaciones = article.resultado_id
+          ? await obtenerAlineaciones(env, "result_id", article.resultado_id)
+          : await obtenerAlineaciones(env, "article_id", article.id);
+
         // Fase 14: galería de fotos del fotógrafo vinculada a esta noticia
-        // (tabla puente article_media, ver Fase 12/13). Se adjunta aquí,
-        // en el mismo endpoint público que ya sirve la noticia, para no
-        // añadir una segunda petición en cada carga -es tráfico público,
-        // igual que el resto de este endpoint. El crédito se construye
-        // con el autor real de la foto (autor_nombre de la tabla media,
-        // normalmente el fotógrafo que la subió), no con el autor de la
-        // noticia, para que quede bien atribuida.
+        // (tabla puente article_media). Mismo criterio que en el worker
+        // principal, para que ambos devuelvan la misma respuesta pública.
         if (article.id) {
           const { results: mediaArticulo } = await env.DB.prepare(
             `SELECT am.orden, m.id AS media_id, m.cloudinary_url, m.descripcion,
-                    m.tipo, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
+                    m.tipo, m.autor_id, m.autor_nombre
              FROM article_media am
              JOIN media m ON m.id = am.media_id
-             LEFT JOIN users u ON u.id = m.autor_id
              WHERE am.article_id = ?
              ORDER BY am.orden ASC`
           ).bind(article.id).all();
@@ -10224,11 +7727,8 @@ async function handlePrimary(request, env, ctx) {
         const slugOId = typeof body.slug === "string" ? body.slug : "";
         if (!slugOId) return json({ error: "Falta el slug de la noticia" }, 400);
 
-        // Bots/crawlers/herramientas SEO que ejecutan JS: no cuentan como
-        // vista real. Se responde 204 sin insertar nada -- así el propio
-        // bot no reintenta pensando que ha fallado, pero el panel de
-        // analíticas nunca ve esta petición. Ver esUserAgentBot() arriba
-        // para el porqué (era la causa principal de "vistas en exceso").
+        // Ver la explicación completa en worker/src/index.js (D1): bots
+        // que ejecutan JS inflaban "páginas vistas".
         if (esUserAgentBot(request.headers.get("User-Agent"))) {
           return new Response(null, { status: 204 });
         }
@@ -10242,10 +7742,6 @@ async function handlePrimary(request, env, ctx) {
         const visitanteEstable = await hashVisitanteEstable(request, env);
         const { fuente, dominio } = clasificarFuenteTrafico(request.headers.get("Referer"), SITIO_URL);
         const dispositivo = clasificarDispositivo(request.headers.get("User-Agent"));
-        // Idioma en el que se está leyendo la noticia (lo manda el
-        // cliente según el selector de idioma de noticia.html; "es" si
-        // no se especifica). Se valida contra una lista cerrada para que
-        // esta columna nunca reciba texto arbitrario.
         const IDIOMAS_VALIDOS = ["es", "eu", "ca", "gl", "en"];
         const idioma = IDIOMAS_VALIDOS.includes(body.idioma) ? body.idioma : "es";
 
@@ -10262,10 +7758,8 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- Tracking: vista de un partido (minuto-a-minuto) ----------
-      // Mismo criterio que /api/track/view, para poder sacar "partidos
-      // más seguidos" en el panel de analíticas (ver
-      // calcularPartidosMasSeguidosAnaliticas más abajo). Una fila por
-      // carga de la página pública de un partido (minuto-a-minuto.html).
+      // Ver la versión gemela en worker/src/index.js (D1) para la
+      // explicación completa.
       if (path === "/api/track/result-view" && method === "POST") {
         const body = await request.json().catch(() => ({}));
         const resultId = parseInt(body.result_id, 10);
@@ -10342,7 +7836,7 @@ async function handlePrimary(request, env, ctx) {
         // Solo el autor (o coautor, o un admin, o alguien con una
         // solicitud de edición aprobada y vigente para esta noticia)
         // puede editarla.
-        const articuloParaPermiso = await env.DB.prepare("SELECT slug, autor_id, coautor_id, publicado, estado_borrador, fecha_publicacion, slug_congelado, resultado_id, tipo, categoria, categorias_adicionales, club, ficha_tecnica, banner_urgente FROM articles WHERE id = ?").bind(id).first();
+        const articuloParaPermiso = await env.DB.prepare("SELECT slug, autor_id, coautor_id, publicado, estado_borrador, fecha_publicacion, slug_congelado, resultado_id, tipo, categoria, club, ficha_tecnica, banner_urgente FROM articles WHERE id = ?").bind(id).first();
         if (!articuloParaPermiso) return json({ error: "Noticia no encontrada" }, 404);
         if (!(await puedeEditar(env, payload, "articulo", id, articuloParaPermiso.autor_id, articuloParaPermiso.coautor_id))) {
           return json({ error: "No puedes editar esta noticia porque no es tuya. Solicita permiso al autor o a un administrador." }, 403);
@@ -10416,10 +7910,6 @@ async function handlePrimary(request, env, ctx) {
           ? (body.estado_borrador === "terminado" ? "terminado" : "en_proceso")
           : null;
 
-        // Preferencia de publicación del redactor (ver mismo criterio al
-        // crear, más arriba).
-        const preferenciaFechas = normalizarPreferenciaFechas(estadoBorrador === "terminado" ? body : null);
-
         // Un borrador "en proceso" no tiene por qué cumplir los límites de
         // longitud todavía (ver mismo criterio al crear la noticia).
         if (body.contenido !== undefined && estadoBorrador !== "en_proceso") {
@@ -10450,59 +7940,10 @@ async function handlePrimary(request, env, ctx) {
         const idAutorElegido = body.autor_id
           ? parseInt(body.autor_id, 10)
           : (articuloActual ? articuloActual.autor_id : payload.uid);
-        const autorElegido = await env.DB.prepare("SELECT id, nombre, categorias_fijas FROM users WHERE id = ? AND activo = 1")
+        const autorElegido = await env.DB.prepare("SELECT id, nombre FROM users WHERE id = ? AND activo = 1")
           .bind(idAutorElegido).first();
         const autorId = autorElegido ? autorElegido.id : (articuloActual ? articuloActual.autor_id : payload.uid);
         const autorNombre = autorElegido ? autorElegido.nombre : (articuloActual ? articuloActual.autor_nombre : payload.nombre);
-
-        // Club (y, para previa/crónica, categoría): para previa/crónica
-        // ambos se derivan siempre del resultado vinculado (ver
-        // resolverClubArticulo), usando el tipo y el resultado_id finales
-        // de esta edición (el nuevo si se manda, o el que ya tenía la
-        // noticia si no se toca ese campo). Para el resto de tipos, el
-        // club se toma del body si se manda ese campo; si no se manda en
-        // absoluto (undefined), se conserva el que ya tenía la noticia,
-        // para que una edición que no toca el club (p. ej. solo corregir
-        // el título) no lo borre. Se calcula ANTES que la categoría
-        // porque, para previa/crónica, la categoría depende de este
-        // mismo resultado.
-        const tipoFinal = body.tipo !== undefined ? body.tipo : articuloParaPermiso.tipo;
-        const resultadoIdFinal = body.resultado_id !== undefined ? resultadoId : articuloParaPermiso.resultado_id;
-        const { error: errorClub, club: clubFinal, categoria: categoriaAutomatica } = await resolverClubArticulo(
-          env, tipoFinal, resultadoIdFinal,
-          body.club !== undefined ? body.club : articuloParaPermiso.club
-        );
-        if (errorClub) return json({ error: errorClub }, 400);
-
-        // Igual que al crear: si el autor final tiene categoría(s) fija(s),
-        // la categoría de la noticia debe respetarlas. Para previa/crónica
-        // se usa la categoriaAutomatica ya resuelta arriba (del resultado
-        // vinculado); para el resto de tipos, la que venga en el body, o
-        // si no llega, la que ya tuviera la noticia (para no reventar
-        // ediciones que no tocan la categoría).
-        const categoriasFijasAutor = parsearCategoriasFijas(autorElegido ? autorElegido.categorias_fijas : null);
-        const { error: errorCategoriaAutor, categoria: categoriaFinal } = validarCategoriaSegunAutor(
-          categoriasFijasAutor,
-          categoriaAutomatica !== undefined
-            ? categoriaAutomatica
-            : (body.categoria !== undefined ? body.categoria : articuloParaPermiso.categoria)
-        );
-        if (errorCategoriaAutor) return json({ error: errorCategoriaAutor }, 400);
-
-        // Categoría(s) adicional(es): igual que la categoría principal, se
-        // usan las que vengan en el body si se manda ese campo; si no se
-        // manda en absoluto, se conservan las que ya tuviera la noticia
-        // (para que una edición que no las toca no las borre). Se
-        // revalidan siempre contra la categoría principal final (puede
-        // haber cambiado en esta misma edición) y contra las categorías
-        // fijas del autor.
-        const { error: errorCategoriasAdicionales, categoriasAdicionales } = validarCategoriasAdicionales(
-          body.categorias_adicionales !== undefined
-            ? body.categorias_adicionales
-            : parsearCategoriasAdicionales(articuloParaPermiso.categorias_adicionales),
-          categoriaFinal, categoriasFijasAutor
-        );
-        if (errorCategoriasAdicionales) return json({ error: errorCategoriasAdicionales }, 400);
 
         // Segundo autor (coautor) opcional, igual que al crear. Si se
         // manda explícitamente "coautor_id: null" (o vacío) se quita el
@@ -10558,13 +7999,22 @@ async function handlePrimary(request, env, ctx) {
         // si se manda el campo, se guarda tal cual (o se borra si llega
         // vacío/null); si no se manda en absoluto, se conserva la que ya
         // hubiera (p. ej. una edición que solo toca el título no debe
-        // borrar la ficha técnica ya rellenada). Reutiliza "tipoFinal",
-        // ya calculado más arriba para resolver el club (ver
-        // resolverClubArticulo); antes se recalculaba aquí por segunda
-        // vez con el mismo criterio salvo el caso body.tipo === "" (que
-        // aquí caía a "noticia" y arriba se respetaba tal cual), un
-        // matiz sin efecto práctico porque el frontend nunca manda "tipo"
-        // vacío.
+        // borrar la ficha técnica ya rellenada).
+        const tipoFinal = body.tipo || articuloParaPermiso.tipo || "noticia";
+        // Categoría y club: se usan los que vengan en el body si se manda
+        // ese campo; si no se manda en absoluto (undefined), se conserva
+        // lo que ya tenía la noticia, para que una edición que no los
+        // toca (p. ej. solo corregir el título) no los borre.
+        const categoriaFinal = body.categoria !== undefined ? body.categoria : (articuloParaPermiso.categoria || "hypermotion");
+        // Club: para previa/crónica se deriva siempre del resultado
+        // vinculado (ver resolverClubArticulo), usando el tipo y el
+        // resultado_id finales de esta edición.
+        const resultadoIdFinal = body.resultado_id !== undefined ? resultadoId : articuloParaPermiso.resultado_id;
+        const { error: errorClub, club: clubFinal } = await resolverClubArticulo(
+          env, tipoFinal, resultadoIdFinal,
+          body.club !== undefined ? body.club : articuloParaPermiso.club
+        );
+        if (errorClub) return json({ error: errorClub }, 400);
         let fichaTecnica = articuloParaPermiso.ficha_tecnica || null;
         if (Object.prototype.hasOwnProperty.call(body, "ficha_tecnica")) {
           fichaTecnica = (tipoFinal === "cronica" && body.ficha_tecnica && Object.keys(body.ficha_tecnica).length)
@@ -10574,21 +8024,12 @@ async function handlePrimary(request, env, ctx) {
           fichaTecnica = null;
         }
 
-        // Banner urgente al editar: mismo permiso que al crear (admin o
-        // Nivel 2+). Si el campo no se manda en absoluto, se conserva
-        // el estado que ya tuviera la noticia (para que una edición que
-        // no toca el banner -p.ej. corregir una errata- no lo apague
-        // sin querer). Si se manda explícitamente true/false, manda eso:
-        //   - true  -> (re)activa y reinicia el plazo a 2h desde ahora.
-        //   - false -> lo desactiva ya (ver también el endpoint aparte
-        //     más abajo, pensado para desactivarlo sin tener que volver
-        //     a mandar todo el formulario de la noticia).
+        // Banner urgente al editar: mismo criterio que al crear (admin o
+        // Nivel 2+). Si el campo no se manda, se conserva el estado que
+        // ya tuviera la noticia.
         let bannerUrgenteFinal = articuloParaPermiso.banner_urgente ? 1 : 0;
         let bannerUrgenteHastaSQL = null; // null = no tocar esta columna
         if (Object.prototype.hasOwnProperty.call(body, "banner_urgente")) {
-          // nivelUsuario puede seguir sin calcular aquí (solo se resuelve
-          // más arriba en ciertos casos, ver "programar publicación"), así
-          // que se completa bajo demanda antes de decidir el permiso.
           if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
           const puedeActivarBanner = payload.rol === "admin" || nivelUsuario >= 2;
           const activarBanner = puedeActivarBanner && body.banner_urgente === true;
@@ -10597,15 +8038,15 @@ async function handlePrimary(request, env, ctx) {
         }
 
         await env.DB.prepare(
-          `UPDATE articles SET slug=?, titulo=?, subtitulo=?, contenido=?, tipo=?, categoria=?, categorias_adicionales=?, club=?, imagen_url=?, imagenes=?, resultado_id=?, autor_id=?, autor_nombre=?, coautor_id=?, coautor_nombre=?, destacado=?, publicado=?, estado_borrador=?, programado_para=?, fecha_preferencia_desde=?, fecha_preferencia_hasta=?, slug_congelado=?, fecha_publicacion=?, updated_at=datetime('now'),
+          `UPDATE articles SET slug=?, titulo=?, subtitulo=?, contenido=?, tipo=?, categoria=?, club=?, imagen_url=?, imagenes=?, resultado_id=?, autor_id=?, autor_nombre=?, coautor_id=?, coautor_nombre=?, destacado=?, publicado=?, estado_borrador=?, programado_para=?, slug_congelado=?, fecha_publicacion=?, updated_at=datetime('now'),
             titulo_eu=?, subtitulo_eu=?, contenido_eu=?, titulo_ca=?, subtitulo_ca=?, contenido_ca=?, titulo_gl=?, subtitulo_gl=?, contenido_gl=?, titulo_en=?, subtitulo_en=?, contenido_en=?, ficha_tecnica=?, banner_urgente=?${bannerUrgenteHastaSQL !== null ? `, banner_urgente_hasta=${bannerUrgenteHastaSQL}` : ""}
            WHERE id=?`
         ).bind(
           slug, body.titulo, body.subtitulo || null, body.contenido, body.tipo || "noticia",
-          categoriaFinal, categoriasAdicionales.length ? JSON.stringify(categoriasAdicionales) : null, clubFinal || null, imagenPortada,
+          categoriaFinal, clubFinal || null, imagenPortada,
           imagenes.length ? JSON.stringify(imagenes) : null, resultadoId,
           autorId, autorNombre, coautorId, coautorNombre,
-          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, preferenciaFechas.desde, preferenciaFechas.hasta, slugCongeladoFinal,
+          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, slugCongeladoFinal,
           fechaPublicacionFinal,
           traducciones.titulo_eu, traducciones.subtitulo_eu, traducciones.contenido_eu,
           traducciones.titulo_ca, traducciones.subtitulo_ca, traducciones.contenido_ca,
@@ -10614,12 +8055,6 @@ async function handlePrimary(request, env, ctx) {
           fichaTecnica, bannerUrgenteFinal, id
         ).run();
         await registrarRedirectSiCambia(env, id, articuloParaPermiso.slug, slug);
-
-        // Fase 12: igual que al crear, sincroniza la galería/imágenes
-        // sueltas vinculadas a la noticia si el redactor mandó media_ids
-        // y/o galeria_resultado_id; si no manda ninguno de los dos, deja
-        // la que ya hubiera guardada tal cual.
-        await sincronizarArticleMedia(env, id, body);
 
         // Si esta edición vincula por primera vez la noticia a un
         // partido (no lo tenía antes y ahora sí), cualquier alineación
@@ -10657,12 +8092,11 @@ async function handlePrimary(request, env, ctx) {
         // publicación por otro sitio del flujo).
         const yaEstabaTerminado = articuloParaPermiso.estado_borrador === "terminado";
         if (body.publicado === false && estadoBorrador === "terminado" && !yaEstabaTerminado) {
-          const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista" }[body.tipo] || "Artículo";
+          const tipoLabel = { noticia: "Noticia", cronica: "Crónica", opinion: "Opinión", entrevista: "Entrevista" }[body.tipo] || "Artículo";
           const firmaAutores = coautorNombre ? `${autorNombre} y ${coautorNombre}` : autorNombre;
-          const textoPreferenciaFechas = formatearPreferenciaFechasEmail(preferenciaFechas);
           ctx.waitUntil(enviarEmailNotificacion(env, {
             asunto: `Borrador terminado: ${body.titulo}`,
-            texto: `${payload.nombre} ha editado y marcado como terminado el borrador "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmado por ${firmaAutores}. Todavía no está publicado.${textoPreferenciaFechas ? ` Preferencia de fecha del redactor: ${textoPreferenciaFechas}.` : ""}`,
+            texto: `${payload.nombre} ha editado y marcado como terminado el borrador "${body.titulo}" (${tipoLabel}) en ELOTROFÚTBOLTV, firmado por ${firmaAutores}. Todavía no está publicado.`,
             html: plantillaEmail({
               etiqueta: "Borrador terminado",
               titulo: body.titulo,
@@ -10670,8 +8104,7 @@ async function handlePrimary(request, env, ctx) {
               filas: [
                 { etiqueta: "Autor", valor: firmaAutores },
                 { etiqueta: "Guardado por", valor: payload.nombre },
-                { etiqueta: "Categoría", valor: clubArticuloLegible(clubFinal) || body.categoria },
-                ...(textoPreferenciaFechas ? [{ etiqueta: "Preferencia de fecha", valor: textoPreferenciaFechas }] : []),
+                { etiqueta: "Categoría", valor: body.club || body.categoria },
               ],
             }),
           }));
@@ -10681,7 +8114,7 @@ async function handlePrimary(request, env, ctx) {
           accion: "editar_articulo", entidad: "articulo", entidad_id: id,
           descripcion: `Ha editado la noticia/crónica "${body.titulo}"${estadoBorrador ? ` (${estadoBorrador === "terminado" ? "borrador terminado" : "borrador en proceso"})` : ""}${esEdicionAjenaPorNivel4 ? " (revisión de contenido ajeno, Nivel 4)" : ""}`,
         }));
-        return json({ ok: true, slug, publicado: body.publicado === false ? 0 : 1, estado_borrador: estadoBorrador, programado_para: programadoPara, fecha_preferencia_desde: preferenciaFechas.desde, fecha_preferencia_hasta: preferenciaFechas.hasta, avisos_traduccion: avisosTraduccion });
+        return json({ ok: true, slug, publicado: body.publicado === false ? 0 : 1, estado_borrador: estadoBorrador, programado_para: programadoPara, avisos_traduccion: avisosTraduccion });
       }
 
       if (articleMatch && method === "DELETE") {
@@ -10768,10 +8201,12 @@ async function handlePrimary(request, env, ctx) {
         // autor, entidad, resuelta_por) con un .map(async ...) -con el
         // límite de 200 filas de arriba, hasta 800 queries individuales
         // en una sola petición HTTP-. Es exactamente el patrón "N+1" que
-        // más RAM/CPU consume en D1: cada prepare().bind().first() es su
-        // propio round-trip. Se sustituye por un puñado de consultas por
-        // LOTES con "IN (...)", una única vez para todas las filas, y
-        // luego se cruzan en memoria con Maps (barato, ya en el Worker).
+        // más RAM/CPU consume: cada prepare().bind().first() es su propio
+        // round-trip. Se sustituye por un puñado de consultas por LOTES
+        // con "IN (...)", una única vez para todas las filas, y luego se
+        // cruzan en memoria con Maps (barato, ya en el Worker). Mismo
+        // arreglo aplicado en worker/src/index.js (API principal): debe
+        // mantenerse igual en ambas para el failover.
         const idsUsuarios = [...new Set(
           results.flatMap((s) => [s.solicitante_id, s.autor_id, s.resuelta_por_id]).filter((id) => id != null)
         )];
@@ -11536,7 +8971,8 @@ async function handlePrimary(request, env, ctx) {
         // obtenerEncuestaConResultados (N+1, sin LIMIT, crece con el
         // histórico de encuestas). Se sustituye por UNA sola consulta que
         // trae ya agregadas las opciones+votos de TODAS las encuestas del
-        // listado, y se reparte en memoria con un Map por poll_id.
+        // listado, y se reparte en memoria con un Map por poll_id. Mismo
+        // arreglo aplicado en worker/src/index.js (API principal).
         const idsEncuestas = encuestas.map((p) => p.id);
         const opcionesPorEncuesta = new Map(idsEncuestas.map((id) => [id, []]));
         if (idsEncuestas.length) {
@@ -11942,12 +9378,6 @@ async function handlePrimary(request, env, ctx) {
         }
 
         // ---------- Search Console (Google) ----------
-        // Ruta separada de las anteriores porque NO lee D1/article_views:
-        // pide datos directamente a la API de Google Search Console con
-        // una cuenta de servicio. Antes esta ruta no existía en el
-        // Worker (el frontend la llamaba pero siempre recibía 404, que
-        // el panel mostraba como "Error de conexión" en la tarjeta de
-        // Search Console) -- ver calcularGscAnaliticas más abajo.
         if (path === "/api/admin/analiticas/gsc") {
           const { datos } = await conCacheKV(env, cacheKey, CACHE_ANALITICAS_TTL_SEGUNDOS, () =>
             calcularGscAnaliticas(env, dias)
@@ -11980,11 +9410,6 @@ async function handlePrimary(request, env, ctx) {
         }
 
         // ---------- Vistas últimas 24 horas ----------
-        // No se cachea con conCacheKV/TTL de 10 min como el resto: es una
-        // serie temporal en vivo (el propio gráfico se llama "últimas 24h")
-        // y con TTL largo mostraría datos ya desfasados en cuanto pasa
-        // más de un cubo horario. Se cachea aparte, 60s, para que un
-        // autorefresco del panel no golpee D1 en cada recarga.
         if (path === "/api/admin/analiticas/ultimas-24h") {
           const { datos } = await conCacheKV(env, `analiticas-cache:${path}`, 60, () =>
             calcularUltimas24hAnaliticas(env)
@@ -11993,9 +9418,6 @@ async function handlePrimary(request, env, ctx) {
         }
 
         // ---------- Buscador de noticia por titular ----------
-        // Sin caché: es una búsqueda interactiva con un término variable
-        // (`q`), así que cachear por `q` no ahorraría casi nunca (cada
-        // tecleo cambia la clave) y solo complicaría la invalidación.
         if (path === "/api/admin/analiticas/buscar-noticia") {
           const q = (url.searchParams.get("q") || "").trim();
           if (!q) return json({ noticias: [] });
@@ -12023,13 +9445,8 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- Borrado de datos de tracking (destructivo) ----------
-      // Ruta separada del bloque GET de arriba porque es DELETE, no
-      // acepta ?dias= con el mismo capado a RANGO_ANALITICAS_MAX_DIAS
-      // (el modal del panel deja borrar "todo el histórico" a propósito)
-      // y no debe cachearse nunca en KV. Sigue exigiendo admin igual que
-      // el resto de /api/admin/analiticas/*, y sigue contando para el
-      // cortacircuitos de rutas pesadas de más arriba (proterRutaPesada
-      // se aplica por prefijo de path, no por método).
+      // Ver la versión gemela en worker/src/index.js (D1) para la
+      // explicación completa.
       if (path === "/api/admin/analiticas/datos" && method === "DELETE") {
         const payload = await requireAuth(request, env, url);
         if (!payload || payload.rol !== "admin") return json({ error: "Solo un administrador puede borrar las analíticas" }, 403);
@@ -12279,20 +9696,20 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // Segunda Federación: composición OFICIAL completa de los 5 grupos
-      // (90 clubes), temporada 2026/27. MISMA lista que
+      // (90 clubes), temporada 2026/27. MISMA lista que en el worker
+      // principal (worker/src/index.js) y que
       // TODOS_LOS_CLUBES_SEGUNDA_FEDERACION en public/js/clubs.js -- si
-      // se actualiza una hay que actualizar la otra (no se puede
-      // compartir el archivo tal cual porque este worker es backend y
-      // clubs.js es del frontend). Cada verano, cuando la RFEF redefine
-      // los grupos, hay que revisar y actualizar ambas listas.
+      // se actualiza una hay que actualizar las tres (no se puede
+      // compartir el archivo porque este worker-secondary es el backend
+      // de respaldo en Railway y necesita el mismo comportamiento
+      // durante un failover). Cada verano, cuando la RFEF redefine los
+      // grupos, hay que revisar y actualizar las tres listas.
       //
       // OJO: este cálculo automático es solo un VALOR POR DEFECTO. Si
       // el panel de admin manda explícitamente un body.grupo (porque el
       // redactor lo ha escrito o corregido a mano), esa elección manual
-      // SIEMPRE prevalece y nunca se pisa aquí -- así, un equipo nuevo,
-      // un alias de nombre no reconocido, o un cambio de última hora de
-      // la RFEF no dejan el partido sin grupo (ver grupoAGuardar /
-      // grupoAGuardarEdicion, donde se aplica esta prioridad).
+      // SIEMPRE prevalece y nunca se pisa aquí -- ver grupoAGuardar /
+      // grupoAGuardarEdicion más abajo.
       const GRUPO_SEGUNDA_FEDERACION_POR_EQUIPO = {
         // Grupo 1
         "Deportivo Alavés B": "Grupo 1",
@@ -12423,19 +9840,6 @@ async function handlePrimary(request, env, ctx) {
       }
 
       if (path === "/api/results" && method === "GET") {
-        // Un partido "finalizado" automáticamente por el cron sin que
-        // ningún redactor lo haya cubierto (finalizado_no_cubierto = 1,
-        // ver más arriba) no debe verse en ningún sitio de la web
-        // pública -resultados, calendario, portada, ficha de equipo,
-        // porras...- hasta que un redactor lo cubra de verdad (lo que
-        // limpia ese flag a 0, ver PUT /api/results/:id). Debe seguir
-        // siendo visible para el panel de admin, que es precisamente
-        // donde el redactor tiene que verlo para poder cubrirlo. Este
-        // mismo endpoint GET /api/results lo usan tanto la web pública
-        // (sin token) como el panel (con token de sesión de
-        // redactor/admin), así que basta con distinguir por eso: si no
-        // hay una sesión de staff válida, se ocultan.
-        const esStaff = !!(await requireAuth(request, env, url));
         const competicion = url.searchParams.get("competicion");
         const estado = url.searchParams.get("estado");
         const grupo = url.searchParams.get("grupo");
@@ -12445,26 +9849,15 @@ async function handlePrimary(request, env, ctx) {
         const club = url.searchParams.get("club");
         // Filtro opcional por fecha mínima del partido ("YYYY-MM-DD"),
         // pensado para pedir "solo la temporada en curso" sin depender de
-        // un LIMIT fijo. Antes, /clasificacion.html pedía siempre
-        // "?limit=500" y confiaba en que esos 500 partidos más recientes
-        // (por fecha_partido) fueran suficientes para cubrir toda la
-        // temporada actual del grupo/competición elegido. Como en la base
-        // de datos se acumulan TODAS las temporadas jugadas de cada grupo
-        // (no hay ningún campo "temporada", ver schema.sql), en cuanto un
-        // grupo llevaba ya varias temporadas acumuladas y su total de
-        // partidos superaba los 500, el LIMIT recortaba los más antiguos
-        // -- y si ese corte caía dentro de la temporada actual (p.ej. las
-        // primeras jornadas), esos partidos desaparecían de la
-        // clasificación calculada en el cliente, dándola incompleta. El
-        // fallo era intermitente porque depende de cuántos partidos
-        // históricos tenga acumulados cada grupo en cada momento, no de
-        // nada que cambie en el código. Con "desde_fecha" el frontend
-        // puede acotar por fecha de inicio de temporada en vez de por
-        // "cuenta los últimos N", así el resultado no depende del volumen
-        // histórico acumulado. Se incluyen también los partidos con
-        // fecha_partido NULL (normalmente recién creados/sin programar
-        // todavía, casi siempre de la temporada en curso) para no
-        // perderlos por no tener fecha con la que compararlos.
+        // un LIMIT fijo. Ver el comentario gemelo en worker/src/index.js
+        // (mismo endpoint, backend principal) para la explicación completa
+        // de por qué era necesario: sin esto, la clasificación calculada
+        // en /clasificacion.html podía salir incompleta de forma
+        // intermitente en cuanto un grupo acumulaba más de "limit"
+        // partidos entre varias temporadas sin archivar. Se incluyen
+        // también los partidos con fecha_partido NULL (normalmente
+        // recién creados/sin programar todavía) para no perderlos por no
+        // tener fecha con la que compararlos.
         const desdeFecha = url.searchParams.get("desde_fecha");
         // El límite era fijo (100) e ignoraba el "?limit=" que ya mandaba
         // el frontend (el panel de admin pide 200 para no dejarse partidos
@@ -12474,16 +9867,9 @@ async function handlePrimary(request, env, ctx) {
         // (sin inicio_cronometro_at), así que el cronómetro no arrancaba
         // nunca aunque el backend sí lo hubiera guardado bien.
         const limitParam = parseInt(url.searchParams.get("limit"), 10);
-        // Bajado de 2000 a 500: un límite tan alto sin filtros (competición,
-        // estado, fecha) provocaba escaneos de cientos de filas por llamada
-        // -ver métricas de D1 de sep-2026, "SELECT * FROM results" era la
-        // consulta más cara de toda la cuota diaria-. 500 partidos ya cubre
-        // sobradamente cualquier vista razonable del panel; si algún caso
-        // real necesita más, mejor paginar con desde_fecha que subir esto.
-        const limit = Number.isInteger(limitParam) && limitParam > 0 && limitParam <= 500 ? limitParam : 100;
+        const limit = Number.isInteger(limitParam) && limitParam > 0 && limitParam <= 2000 ? limitParam : 100;
         let query = "SELECT * FROM results WHERE 1=1";
         const binds = [];
-        if (!esStaff) { query += " AND finalizado_no_cubierto = 0"; }
         if (competicion) { query += " AND competicion = ?"; binds.push(competicion); }
         if (desdeFecha) { query += " AND (fecha_partido >= ? OR fecha_partido IS NULL)"; binds.push(desdeFecha); }
         if (estado) { query += " AND estado = ?"; binds.push(estado); }
@@ -12503,36 +9889,7 @@ async function handlePrimary(request, env, ctx) {
         // en la propia consulta). Se ordena por fecha_partido en su lugar,
         // que es lo relevante para "traer los partidos más recientes" y no
         // deja huecos según la jornada de cada competición.
-        // Orden opcional "?orden=cercania" (lo usa el panel de admin):
-        //  1) EN JUEGO primero, 2) POR JUGAR (programado/retrasado) y
-        //  3) TERMINADOS (finalizado/anulado) y cualquier otro estado.
-        // Dentro de cada bloque, por cercanía a la hora actual de Madrid
-        // (fecha_partido se guarda en hora de Madrid, sin zona), y a
-        // igual distancia primero el que aún no ha empezado. Los que no
-        // tienen fecha (o no parseable) van al final de su bloque. Al
-        // ordenar en SQL, el LIMIT recorta lo MÁS LEJANO a la hora
-        // actual en vez de lo más antiguo, así los programados próximos
-        // nunca quedan fuera aunque haya más de 500 partidos. Sin el
-        // parámetro se mantiene el orden de siempre (fecha DESC), que es
-        // el que espera la web pública (clasificación, calendario...).
-        if (url.searchParams.get("orden") === "cercania") {
-          const pm = new Intl.DateTimeFormat("en-CA", {
-            timeZone: "Europe/Madrid", hourCycle: "h23",
-            year: "numeric", month: "2-digit", day: "2-digit",
-            hour: "2-digit", minute: "2-digit", second: "2-digit",
-          }).formatToParts(new Date()).reduce((acc, x) => (acc[x.type] = x.value, acc), {});
-          const ahoraMadrid = `${pm.year}-${pm.month}-${pm.day} ${pm.hour}:${pm.minute}:${pm.second}`;
-          query += ` ORDER BY
-            CASE estado WHEN 'en_juego' THEN 0 WHEN 'programado' THEN 1 WHEN 'retrasado' THEN 1 ELSE 2 END,
-            CASE WHEN julianday(fecha_partido) IS NULL THEN 1 ELSE 0 END,
-            ABS(julianday(fecha_partido) - julianday(?)),
-            CASE WHEN julianday(fecha_partido) >= julianday(?) THEN 0 ELSE 1 END,
-            id
-            LIMIT ${limit}`;
-          binds.push(ahoraMadrid, ahoraMadrid);
-        } else {
-          query += ` ORDER BY fecha_partido DESC LIMIT ${limit}`;
-        }
+        query += ` ORDER BY fecha_partido DESC LIMIT ${limit}`;
         const { results } = await env.DB.prepare(query).bind(...binds).all();
         // Se añade el instante del último evento (gol, tarjeta, cambio...)
         // registrado en el minuto a minuto de cada partido, para que el
@@ -12546,25 +9903,12 @@ async function handlePrimary(request, env, ctx) {
         if (idsEnJuego.length) {
           const placeholders = idsEnJuego.map(() => "?").join(",");
           const { results: ultimosEventos } = await env.DB.prepare(
-            `SELECT resultado_id, MAX(created_at) AS ultimo_evento_at,
-                    MAX(CASE WHEN tipo = 'fin_descanso' THEN 1 ELSE 0 END) AS segunda_parte_iniciada
-             FROM match_events
+            `SELECT resultado_id, MAX(created_at) AS ultimo_evento_at FROM match_events
              WHERE resultado_id IN (${placeholders}) GROUP BY resultado_id`
           ).bind(...idsEnJuego).all();
           const mapaUltimoEvento = {};
-          // segunda_parte_iniciada (1/0): ya existe el evento "fin_descanso",
-          // es decir, el partido va por la 2ª parte y un reloj corriendo
-          // entre el min. 55 y el 100 es normal (ver avisoPartidoDesatendido
-          // en admin.js y evaluarSituacionDesatendida).
-          const mapaSegundaParte = {};
-          ultimosEventos.forEach(e => {
-            mapaUltimoEvento[e.resultado_id] = e.ultimo_evento_at;
-            mapaSegundaParte[e.resultado_id] = Number(e.segunda_parte_iniciada) === 1 ? 1 : 0;
-          });
-          results.forEach(r => {
-            r.ultimo_evento_at = mapaUltimoEvento[r.id] || null;
-            r.segunda_parte_iniciada = mapaSegundaParte[r.id] || 0;
-          });
+          ultimosEventos.forEach(e => { mapaUltimoEvento[e.resultado_id] = e.ultimo_evento_at; });
+          results.forEach(r => { r.ultimo_evento_at = mapaUltimoEvento[r.id] || null; });
         }
         return json({ results });
       }
@@ -12763,43 +10107,6 @@ async function handlePrimary(request, env, ctx) {
             (body.goles_local === undefined || body.goles_local === null || body.goles_visitante === undefined || body.goles_visitante === null)) {
           return json({ error: "Falta el marcador (goles de ambos equipos)" }, 400);
         }
-        // No se deja crear un resultado de una jornada que ya ha terminado.
-        // Se considera "pasada" cuando el calendario de jornadas
-        // (tabla jornadas_calendario) tiene registrada esa jornada para la
-        // competición/grupo y su fecha_fin es anterior al día de hoy
-        // (hora de Madrid; la fecha_fin es inclusiva, así que durante el
-        // último día de la jornada todavía se puede crear). Si el
-        // calendario no conoce esa jornada, o la competición no usa
-        // jornadas (amistoso), no hay forma de saber si está pasada y se
-        // deja crear como siempre. Solo aplica al crear (POST), no al editar.
-        {
-          if (body.competicion !== "amistoso") {
-            const jornadaNum = parseInt(body.jornada, 10);
-            if (Number.isInteger(jornadaNum)) {
-              const grupoJornada = body.competicion === "segunda_federacion"
-                ? (body.grupo || grupoAutomaticoSegundaFederacion(body.competicion, body.equipo_local, body.equipo_visitante))
-                : (body.grupo || null);
-              const filaJornada = await env.DB.prepare(
-                `SELECT MAX(fecha_fin) AS fecha_fin FROM jornadas_calendario
-                 WHERE competicion = ? AND (grupo IS ? OR grupo = ?) AND jornada = ?`
-              ).bind(body.competicion, grupoJornada, grupoJornada, jornadaNum).first();
-              if (filaJornada && filaJornada.fecha_fin) {
-                // "en-CA" formatea directamente como YYYY-MM-DD.
-                const hoyMadrid = new Intl.DateTimeFormat("en-CA", {
-                  timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit",
-                }).format(new Date());
-                if (String(filaJornada.fecha_fin) < hoyMadrid) {
-                  return json({
-                    error: `La jornada ${jornadaNum} ya ha pasado (terminó el ${filaJornada.fecha_fin}). No se pueden crear resultados de una jornada pasada.`,
-                    jornada_pasada: true,
-                    jornada: jornadaNum,
-                    fecha_fin_jornada: filaJornada.fecha_fin,
-                  }, 400);
-                }
-              }
-            }
-          }
-        }
         // Comprobación de duplicados (ver detectarPartidoDuplicado).
         // El caso bloqueante (mismo enfrentamiento en la misma jornada)
         // NO se puede saltar con "confirmar_duplicado": ese flag solo
@@ -12819,14 +10126,10 @@ async function handlePrimary(request, env, ctx) {
         const flashscoreUrl = flashscoreUrlValido(body.competicion, body.estado, body.flashscore_url);
         // El grupo de Segunda Federación se rellena automáticamente (ver
         // grupoAutomaticoSegundaFederacion arriba) SOLO cuando el panel
-        // no manda ya un grupo explícito: si el redactor lo ha escrito o
-        // corregido a mano, esa elección manual prevalece siempre. Antes
-        // se pisaba con el cálculo automático incondicionalmente, y como
-        // ese cálculo solo reconocía unos pocos equipos, cualquier
-        // partido de un grupo no cubierto (p.ej. Grupo 1 o Grupo 3) se
-        // quedaba con grupo=null aunque el panel lo hubiera guardado
-        // bien -- de ahí el bug de "el grupo no se guarda". En el resto
-        // de competiciones se sigue respetando siempre lo que mande el
+        // no manda ya un grupo explícito; si el redactor lo ha escrito o
+        // corregido a mano, esa elección manual prevalece siempre (ver
+        // comentario extenso en worker/src/index.js). En el resto de
+        // competiciones se sigue respetando siempre lo que mande el
         // panel, igual que antes.
         const grupoCalculado = grupoAutomaticoSegundaFederacion(body.competicion, body.equipo_local, body.equipo_visitante);
         const grupoAGuardar = body.competicion === "segunda_federacion"
@@ -12872,13 +10175,6 @@ async function handlePrimary(request, env, ctx) {
         const id = parseInt(resultMatch[1]);
         const resultado = await env.DB.prepare("SELECT * FROM results WHERE id = ?").bind(id).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
-        // Mismo criterio que en la lista (GET /api/results): un partido
-        // finalizado automáticamente sin cubrir no debe poder consultarse
-        // desde la web pública ni siquiera pidiendo su id directamente,
-        // solo el panel (staff autenticado) puede verlo.
-        if (resultado.finalizado_no_cubierto && !(await requireAuth(request, env, url))) {
-          return json({ error: "Resultado no encontrado" }, 404);
-        }
         resultado.alineaciones = await obtenerAlineaciones(env, "result_id", id);
         // Si hay una (o varias) noticia ya publicada vinculada a este
         // partido (crónica, previa...), se adjunta aquí para poder
@@ -12894,17 +10190,6 @@ async function handlePrimary(request, env, ctx) {
            ORDER BY fecha_publicacion DESC LIMIT 5`
         ).bind(id).all();
         resultado.noticias_vinculadas = noticiasVinculadas || [];
-        // Enlace a la galería pública del partido (Fase 2 galería), solo
-        // si ya tiene al menos una foto vinculada: igual criterio que en
-        // GET /api/results/:id/galeria (panel), no se genera un slug "en
-        // vacío" para un partido sin galería todavía, ni se ofrece un
-        // enlace que llevaría a una página sin fotos.
-        const hayGaleria = await env.DB.prepare(
-          "SELECT 1 FROM match_gallery WHERE result_id = ? LIMIT 1"
-        ).bind(id).first();
-        resultado.url_galeria = hayGaleria
-          ? `${SITIO_URL}/galeria/${await slugPartidoUnico(env, resultado)}`
-          : null;
         return json({ resultado });
       }
       if (resultMatch && method === "PUT") {
@@ -12948,20 +10233,14 @@ async function handlePrimary(request, env, ctx) {
         // si luego el partido se reprograma o se juega con normalidad).
         const fechaRetrasado = body.estado === "retrasado" ? (body.fecha_partido_retrasado || null) : null;
         // Mismo cálculo automático del grupo que en la creación (POST),
-        // y con la misma prioridad: si el panel manda body.grupo (el
-        // redactor lo ha puesto o corregido a mano), se respeta siempre;
-        // el cálculo automático solo actúa como valor por defecto cuando
-        // no viene nada. Ver el comentario extenso en el POST de arriba.
+        // con la misma prioridad: si el panel manda body.grupo a mano,
+        // se respeta siempre; el cálculo automático es solo el valor
+        // por defecto cuando no viene nada (ver POST de arriba).
         const grupoCalculadoEdicion = grupoAutomaticoSegundaFederacion(body.competicion, body.equipo_local, body.equipo_visitante);
         const grupoAGuardarEdicion = body.competicion === "segunda_federacion"
           ? (body.grupo || grupoCalculadoEdicion)
           : (body.grupo || null);
         await env.DB.prepare(
-          // finalizado_no_cubierto se limpia a 0 en cualquier guardado
-          // manual desde este formulario: si un redactor está editando
-          // el partido (aunque sea para dejarlo igual), ya lo está
-          // "cubriendo" -- el aviso solo tiene sentido mientras nadie ha
-          // vuelto a tocar el partido desde que lo cerró el cron.
           `UPDATE results SET competicion=?, grupo=?, jornada=?, equipo_local=?, equipo_visitante=?, goles_local=?, goles_visitante=?, penaltis_local=?, penaltis_visitante=?, fecha_partido=?, estado=?, ubicacion=?, flashscore_url=?, escudo_local_url=?, escudo_visitante_url=?, fecha_partido_retrasado=?, finalizado_no_cubierto=0 WHERE id=?`
         ).bind(
           body.competicion, grupoAGuardarEdicion, body.jornada, body.equipo_local, body.equipo_visitante,
@@ -13022,7 +10301,6 @@ async function handlePrimary(request, env, ctx) {
           accion: "editar_resultado", entidad: "resultado", entidad_id: id,
           descripcion: `Ha editado el partido "${body.equipo_local} vs ${body.equipo_visitante}" (J${body.jornada})`,
         }));
-        ctx.waitUntil(invalidarCacheArticuloPartido(env, id));
         return json({ ok: true });
       }
 
@@ -13041,20 +10319,16 @@ async function handlePrimary(request, env, ctx) {
         try {
           await env.DB.prepare("DELETE FROM results WHERE id = ?").bind(id).run();
         } catch (err) {
-          // Antes de la migración migracion_fk_resultado_id_set_null.sql,
-          // articles.resultado_id no tenía ON DELETE CASCADE/SET NULL:
-          // si el partido tenía una noticia/crónica vinculada, D1
-          // rechazaba el DELETE con SQLITE_CONSTRAINT_FOREIGNKEY. Ese
-          // error se devolvía sin capturar como un 500 genérico, que
-          // apiFetch (public/js/config.js) interpreta como "servidor
-          // caído" y reintenta en la secundaria -- que falla igual por
-          // la misma restricción -- y cuyo error, mal propagado, acababa
-          // forzando un logout() en el panel aunque la sesión fuera
-          // válida. Se detecta aquí explícitamente y se devuelve un 409
-          // con un mensaje claro, tanto si la migración aún no se ha
-          // aplicado como salvaguarda genérica ante cualquier otra FK
-          // futura que apunte a "results".
-          if (/FOREIGN KEY constraint failed/i.test(err.message || "")) {
+          // Mismo caso que en worker/src/index.js (ver comentario allí):
+          // articles.resultado_id sin ON DELETE CASCADE/SET NULL hacía
+          // que este DELETE fallara con una violación de foreign key
+          // (en Postgres: código 23503 / "violates foreign key
+          // constraint"), devuelta antes como 500 y confundida con una
+          // caída del servidor. Se detecta aquí también para que el
+          // failover PRIMARY->SECONDARY no reintente en balde un DELETE
+          // que va a fallar igual en ambas bases, y para que el panel no
+          // acabe forzando un logout por un error que no es de sesión.
+          if (err.code === "23503" || /foreign key constraint/i.test(err.message || "")) {
             return json({
               error: "No se puede eliminar: hay una noticia o crónica vinculada a este partido. Quita el enlace al partido desde esa noticia (o bórrala) y vuelve a intentarlo.",
             }, 409);
@@ -13104,7 +10378,6 @@ async function handlePrimary(request, env, ctx) {
             ? `Ha marcado a "${mvpJugador}" como MVP del partido "${resultado.equipo_local} vs ${resultado.equipo_visitante}"`
             : `Ha quitado el MVP del partido "${resultado.equipo_local} vs ${resultado.equipo_visitante}"`,
         }));
-        ctx.waitUntil(invalidarCacheArticuloPartido(env, id));
         return json({ ok: true });
       }
 
@@ -13865,12 +11138,8 @@ async function handlePrimary(request, env, ctx) {
           // partido se reabre más adelante por otra vía que no pase por
           // iniciarCronometroPartido(), no debe arrastrar avisos de una
           // "vida" anterior del partido. finalizado_no_cubierto se pone
-          // explícitamente a 0: este es el cierre MANUAL (el redactor ha
-          // pulsado "Fin del partido" de verdad), a diferencia del cierre
-          // automático de crearFinPartidoAutomaticoAlMinuto90 que sí lo
-          // marca a 1 -- así, si el cron ya había cerrado el partido solo
-          // y luego se reabre y se vuelve a cerrar a mano, el aviso
-          // "FINALIZADO NO CUBIERTO" desaparece del panel.
+          // explícitamente a 0: cierre MANUAL (ver mismo comentario en
+          // worker/src/index.js).
           await env.DB.prepare("UPDATE results SET estado = 'finalizado', aviso_desatendido_mitad = NULL, finalizado_no_cubierto = 0 WHERE id = ?").bind(resultadoId).run();
         }
         if (body.tipo === "partido_retrasado") {
@@ -13880,20 +11149,13 @@ async function handlePrimary(request, env, ctx) {
           await env.DB.prepare("UPDATE results SET estado = 'anulado', cronometro_pausado_en = COALESCE(cronometro_pausado_en, ?) WHERE id = ?")
             .bind(parseInt(body.minuto, 10) || 0, resultadoId).run();
         }
-        // Cualquier evento nuevo que se añada a mano es, por definición,
-        // el redactor cubriendo el partido: si venía de un cierre
-        // automático (finalizado_no_cubierto = 1), deja de tener sentido
-        // el aviso "FINALIZADO NO CUBIERTO" en el panel -- alguien ya se
-        // ha puesto a revisarlo/completarlo. No se restringe a
-        // "fin_partido" (ver ese caso más arriba, que además cambia el
-        // estado): cualquier tipo de evento cuenta como "ya lo estoy
-        // mirando".
+        // Cualquier evento nuevo cuenta como "ya se está cubriendo" (ver
+        // mismo razonamiento en worker/src/index.js).
         await env.DB.prepare("UPDATE results SET finalizado_no_cubierto = 0 WHERE id = ?").bind(resultadoId).run();
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "crear_evento_partido", entidad: "resultado", entidad_id: resultadoId,
           descripcion: `Ha añadido un evento (${body.tipo}) al partido con id ${resultadoId}`,
         }));
-        ctx.waitUntil(invalidarCacheArticuloPartido(env, resultadoId));
         return json({ ok: true, id: meta.last_row_id });
       }
 
@@ -13935,10 +11197,9 @@ async function handlePrimary(request, env, ctx) {
         ).run();
         await recalcularMarcadorDesdeEventos(env, resultadoId);
         await recalcularPenaltisDesdeEventos(env, resultadoId);
-        // Editar un evento existente también cuenta como "ya lo estoy
-        // cubriendo" (ver mismo razonamiento en el POST de arriba).
+        // Editar un evento existente también cuenta como "ya se está
+        // cubriendo".
         await env.DB.prepare("UPDATE results SET finalizado_no_cubierto = 0 WHERE id = ?").bind(resultadoId).run();
-        ctx.waitUntil(invalidarCacheArticuloPartido(env, resultadoId));
         return json({ ok: true });
       }
 
@@ -13958,11 +11219,8 @@ async function handlePrimary(request, env, ctx) {
         await env.DB.prepare("DELETE FROM match_events WHERE id=? AND resultado_id=?").bind(eventoId, resultadoId).run();
         await recalcularMarcadorDesdeEventos(env, resultadoId);
         await recalcularPenaltisDesdeEventos(env, resultadoId);
-        // Borrar un evento (p.ej. corrigiendo un dato mal metido) también
-        // cuenta como "ya lo estoy cubriendo" (ver mismo razonamiento en
-        // el POST de arriba).
+        // Borrar un evento también cuenta como "ya se está cubriendo".
         await env.DB.prepare("UPDATE results SET finalizado_no_cubierto = 0 WHERE id = ?").bind(resultadoId).run();
-        ctx.waitUntil(invalidarCacheArticuloPartido(env, resultadoId));
         return json({ ok: true });
       }
 
@@ -14060,19 +11318,6 @@ async function handlePrimary(request, env, ctx) {
           }
         }
         return json({ ok: true, revisados: partidos.length, actualizados });
-      }
-
-      // ---------- Widgets embebibles para lectores (iframe en webs externas) ----------
-      // Cada ruta /widgets/* devuelve una página HTML completa y autocontenida
-      // (sin dependencias externas, sin cookies/sesión) pensada para insertarse
-      // con <iframe src="https://elotrofutbol.media/widgets/..."> en cualquier
-      // web ajena. No se usa cors()/json() aquí: es HTML servido directamente,
-      // así que no hace falta whitelist de orígenes (el iframe simplemente
-      // carga la URL como cualquier navegación normal) ni autenticación (todo
-      // lo que muestran estos widgets ya es público en el propio sitio). Todas
-      // comparten estilos base y el script de auto-resize (widgetBaseHtml).
-      if (path.startsWith("/widgets/")) {
-        return widgetsRouter(path, url, env);
       }
 
       return json({ error: "Ruta no encontrada" }, 404);

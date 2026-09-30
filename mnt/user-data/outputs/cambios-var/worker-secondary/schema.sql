@@ -110,19 +110,6 @@ CREATE TABLE articles (
   -- cuando la noticia no está programada (se ha publicado directamente, se
   -- ha guardado como borrador normal, o ya se ha publicado la programada).
   programado_para TEXT,
-  -- Preferencia de publicación del REDACTOR (no una programación real,
-  -- solo una sugerencia orientativa para quien vaya a revisar/publicar
-  -- la noticia). Formato "YYYY-MM-DD" (fecha simple, sin hora) o
-  -- "YYYY-MM-DDTHH:MM" (con hora opcional); se rellenan opcionalmente al
-  -- marcar el borrador como "terminado" (ver estado_borrador).
-  -- "...desde" es la fecha (y hora, si se indicó) a partir de la cual al
-  -- redactor le gustaría que se publicase, y "...hasta" el límite de ese
-  -- rango; se pueden rellenar las dos, o solo "desde" para pedir "a
-  -- partir de tal día" sin límite superior. No afecta a publicado ni
-  -- dispara nada automático: es solo informativa, se limpia cuando la
-  -- noticia se publica.
-  fecha_preferencia_desde TEXT,
-  fecha_preferencia_hasta TEXT,
   -- Se pone a 1 en cuanto la noticia se publica por primera vez (a mano o
   -- porque el disparador programado la publica sola). Mientras esté a 0
   -- (borrador o programada, nunca publicada todavía), el slug se
@@ -247,16 +234,10 @@ CREATE TABLE results (
   -- cubrir. Se usa para pintar el aviso "FINALIZADO NO CUBIERTO" en la
   -- tabla de Resultados del panel admin (ver migracion_fin_no_cubierto.sql).
   finalizado_no_cubierto INTEGER NOT NULL DEFAULT 0,
-  -- URL bonita y estable para la galería pública de este partido (ver
-  -- migracion_galeria_partido_equipo_slug.sql). NULL hasta que el
-  -- partido recibe su primera foto de galería.
-  slug TEXT,
   FOREIGN KEY (autor_id) REFERENCES users(id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_results_external_id
   ON results(external_id) WHERE external_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_results_slug
-  ON results(slug) WHERE slug IS NOT NULL;
 
 -- Alias de nombres de equipo entre la API externa de relleno automático
 -- y el nombre "oficial" del sitio (ver public/js/clubs.js).
@@ -277,29 +258,6 @@ CREATE TABLE IF NOT EXISTS sync_partidos_auto (
   ultimo_error TEXT
 );
 INSERT OR IGNORE INTO sync_partidos_auto (id, ultimo_sync_at) VALUES (1, NULL);
-
--- Cola de avisos de "partido posiblemente sin cubrir" pendientes de
--- enviarse en un único email resumen (ver migracion_avisos_desatendidos_cola.sql
--- para el porqué). NO se sincroniza con Postgres: cada backend lleva la suya.
-CREATE TABLE IF NOT EXISTS avisos_desatendidos_cola (
-  resultado_id INTEGER PRIMARY KEY,
-  partido TEXT NOT NULL,
-  jornada INTEGER,
-  redactor TEXT,
-  motivo_corto TEXT NOT NULL,
-  encolado_ms INTEGER NOT NULL
-);
-
--- Estado de los recordatorios automáticos a redactores inactivos (ver
--- migracion_recordatorios_inactividad.sql). NO se sincroniza con Postgres.
-CREATE TABLE IF NOT EXISTS recordatorios_inactividad (
-  user_id INTEGER PRIMARY KEY,
-  ref_actividad TEXT NOT NULL,
-  avisos_enviados INTEGER NOT NULL DEFAULT 0,
-  ultimo_aviso_at TEXT,
-  admins_avisados_at TEXT,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
 
 -- Eventos de un partido (goles, tarjetas, cambios, descansos...) que se
 -- muestran en el detalle al clicar un resultado en resultados.html, y
@@ -392,22 +350,17 @@ CREATE TABLE media (
 CREATE INDEX idx_media_created ON media(created_at);
 CREATE UNIQUE INDEX idx_media_hash_unico ON media(hash_archivo) WHERE hash_archivo IS NOT NULL;
 
--- Galería de partido (ver migracion_match_gallery.sql para el
--- contexto completo y el porqué del diseño como tabla puente en vez
--- de una columna en "media"): vincula imágenes de "media" con un
--- partido concreto de "results", permitiendo que una misma imagen
--- pertenezca a varios partidos.
+-- Galería de partido (ver migracion_match_gallery.sql / db/migrations/
+-- 027_match_gallery.sql para el contexto completo y el porqué del
+-- diseño como tabla puente en vez de una columna en "media"): vincula
+-- imágenes de "media" con un partido concreto de "results",
+-- permitiendo que una misma imagen pertenezca a varios partidos.
 CREATE TABLE match_gallery (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   result_id INTEGER NOT NULL,
   media_id INTEGER NOT NULL,
   orden INTEGER NOT NULL DEFAULT 0,
   vinculado_por_id INTEGER,
-  -- De qué equipo es esta foto dentro de ESTE partido concreto: 'local',
-  -- 'visitante' o NULL (foto general, sin equipo asignado). Alimenta las
-  -- pestañas por equipo de la galería pública (ver
-  -- migracion_galeria_partido_equipo_slug.sql).
-  equipo TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (result_id) REFERENCES results(id) ON DELETE CASCADE,
   FOREIGN KEY (media_id) REFERENCES media(id) ON DELETE CASCADE,
@@ -416,24 +369,6 @@ CREATE TABLE match_gallery (
 CREATE UNIQUE INDEX idx_match_gallery_unico ON match_gallery(result_id, media_id);
 CREATE INDEX idx_match_gallery_result ON match_gallery(result_id, orden);
 CREATE INDEX idx_match_gallery_media ON match_gallery(media_id);
-
--- Galería/imágenes vinculadas a una noticia (ver
--- migracion_article_media.sql para el contexto completo, Fase 12): la
--- galería completa de un partido y/o imágenes sueltas de "media" que un
--- redactor adjunta a una noticia/crónica, aparte de las fotos que ya
--- lleve insertadas dentro del propio texto (articles.imagenes).
-CREATE TABLE article_media (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  article_id INTEGER NOT NULL,
-  media_id INTEGER NOT NULL,
-  orden INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE CASCADE,
-  FOREIGN KEY (media_id) REFERENCES media(id) ON DELETE CASCADE
-);
-CREATE UNIQUE INDEX idx_article_media_unico ON article_media(article_id, media_id);
-CREATE INDEX idx_article_media_article ON article_media(article_id, orden);
-CREATE INDEX idx_article_media_media ON article_media(media_id);
 
 -- Sesiones activas por usuario (ver migracion_sesiones.sql para el
 -- detalle): permite listarlas y cerrarlas en remoto desde el panel,

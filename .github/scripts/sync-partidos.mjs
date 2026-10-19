@@ -58,8 +58,10 @@ for (const liga of ligas) {
         vacias = 0;
         totalEventos += eventos.length;
         const res = await worker("POST", "", { clave: liga.clave, ronda, eventos });
-        const { ejemplos = [], ...resto } = res.resumen || {};
+        const { ejemplos = [], cambios = [], nuevos = [], ...resto } = res.resumen || {};
+        resto.modificados = cambios.length;
         console.log(`  ronda ${ronda}: ${eventos.length} eventos`, JSON.stringify(resto));
+        for (const c of cambios) console.log(`     ✎ ${c.partido}: ${Object.entries(c.campos).map(([k, [a, b]]) => `${k} ${a} -> ${b}`).join(", ")}`);
         for (const e of ejemplos) console.log(`     · ${e}`);
       }
       if (!totalEventos) { fallos++; console.error(`  AVISO ${liga.clave}: TheSportsDB no devolvio ningun partido. Revisa el ID de liga (${liga.leagueId}) y la temporada (${temporada}).`); }

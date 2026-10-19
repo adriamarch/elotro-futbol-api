@@ -11822,7 +11822,7 @@ async function syncCargarAlias(env, ctr, cache) {
 // Aplica los eventos de UNA liga: resuelve nombres, deduplica contra los
 // partidos existentes y escribe solo lo que cambia. Devuelve contadores.
 async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cache) {
-  const resumen = { version: "prioridad-v3", eventos: eventos.length, insertados: 0, actualizados: 0, cubiertos_redaccion: 0, sin_hora_api: 0, ejemplos: [], sin_alias: [], omitidos: 0, error: null };
+  const resumen = { version: "prioridad-v3", eventos: eventos.length, insertados: 0, actualizados: 0, cubiertos_redaccion: 0, sin_hora_api: 0, ejemplos: [], nuevos: [], cambios: [], sin_alias: [], omitidos: 0, error: null };
   if (!eventos.length) return resumen;
 
   const alias = await syncCargarAlias(env, ctr, cache);
@@ -11933,6 +11933,7 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
       const pk = `${syncClaveEquipo(local.nombre)}|${syncClaveEquipo(visitante.nombre)}`;
       porPareja.set(pk, [...(porPareja.get(pk) || []), { ...nuevo, equipo_local: local.nombre, equipo_visitante: visitante.nombre, fecha_partido: fechaLocal }]);
       resumen.insertados++;
+      if (resumen.nuevos.length < 30) resumen.nuevos.push(`${local.nombre} - ${visitante.nombre} (J${jornada}, ${fechaLocal || "sin fecha"})`);
       continue;
     }
 
@@ -11976,6 +11977,11 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
     }
     const campos = Object.keys(cambios);
     if (!campos.length) continue;
+    const visibles = campos.filter((c) => c !== "external_id");
+    if (visibles.length && resumen.cambios.length < 30) {
+      resumen.cambios.push({ id: fila.id, partido: `${fila.equipo_local} - ${fila.equipo_visitante}`, campos: Object.fromEntries(visibles.map((c) => [c, [fila[c] ?? null, cambios[c]]])) });
+    }
+    else if (!visibles.length) resumen.reenlazados = (resumen.reenlazados || 0) + 1;
     sentencias.push(env.DB.prepare(
       `UPDATE results SET ${campos.map((c) => `${c} = ?`).join(", ")} WHERE id = ?`
     ).bind(...campos.map((c) => cambios[c]), fila.id));
@@ -11995,6 +12001,17 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
         try { ctr.sub++; await s.run(); } catch (e2) { resumen.omitidos++; console.error("[sync-partidos] fila omitida:", e2.message); }
       }
     }
+  }
+  // Historial de acciones del panel: solo si de verdad cambio algo visible.
+  if (resumen.insertados || resumen.cambios.length) {
+    ctr.sub++;
+    const claveLiga = syncClaveLiga(liga);
+    await registrarActividad(env, null, { uid: null, nombre: "Relleno automático (TheSportsDB)", rol: "sistema" }, {
+      accion: "relleno_automatico", entidad: "resultado",
+      entidad_id: resumen.cambios.length === 1 && !resumen.insertados ? resumen.cambios[0].id : null,
+      descripcion: `Relleno automático ${claveLiga.replace("|", " ")} · jornada ${ronda ?? "?"}: ${resumen.insertados} nuevos, ${resumen.cambios.length} modificados`,
+      detalle: { liga: claveLiga, ronda, temporada, nuevos: resumen.nuevos, cambios: resumen.cambios },
+    });
   }
   return resumen;
 }

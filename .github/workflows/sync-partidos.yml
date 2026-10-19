@@ -1,0 +1,34 @@
+name: Relleno automático de partidos (TheSportsDB)
+
+# TheSportsDB responde 403 a las peticiones que salen de Cloudflare Workers.
+# Este workflow las hace desde GitHub y entrega los eventos al Worker
+# (POST /api/admin/sync-partidos/ingestar), que aplica las reglas de siempre.
+#
+# Secrets del repositorio:
+#   SYNC_API_URL        https://tu-dominio.com   (el Worker principal)
+#   SYNC_INGEST_TOKEN   cadena aleatoria larga; el MISMO valor como secreto del Worker
+#   THESPORTSDB_API_KEY (opcional) clave premium
+on:
+  schedule:
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-partidos
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Descargar y entregar partidos
+        run: node .github/scripts/sync-partidos.mjs
+        env:
+          SYNC_API_URL: ${{ secrets.SYNC_API_URL }}
+          SYNC_INGEST_TOKEN: ${{ secrets.SYNC_INGEST_TOKEN }}
+          THESPORTSDB_API_KEY: ${{ secrets.THESPORTSDB_API_KEY }}

@@ -81,7 +81,7 @@ INSERT INTO _tmp_grupo_por_equipo (equipo, grupo) VALUES
   ('UE Olot', 'Grupo 2'),
   ('CD Ebro', 'Grupo 2'),
   ('Peña Sport', 'Grupo 2'),
-  ('Utebo', 'Grupo 2'),
+  ('Utebo FC', 'Grupo 2'),
   ('Reus FC Reddis', 'Grupo 2'),
   ('Atlético Osasuna B', 'Grupo 2'),
   ('SD Logroñés', 'Grupo 2'),

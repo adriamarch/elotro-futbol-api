@@ -1,0 +1,14 @@
+-- Push del tiempo añadido: marca si ya se avisó.
+--
+-- El aviso push del añadido sale cuando el reloj llega al 45' (1ª parte) o al
+-- 90' (2ª), aunque el redactor lo anuncie antes (p. ej. en el 43'). Si se
+-- anuncia antes, queda pendiente y lo envía el cron al llegar a ese minuto.
+--
+--   anadido_avisado: 0 = pendiente de avisar, 1 = ya avisado,
+--                    NULL = sin dato (no se avisa desde el cron).
+--
+-- Sin esta columna todo sigue funcionando; solo se pierde el aviso diferido
+-- (el que se anuncia ya dentro del añadido sale igualmente).
+--
+--   wrangler d1 execute elotrofutbol --remote --file=migracion_anadido_avisado.sql
+ALTER TABLE results ADD COLUMN anadido_avisado INTEGER;

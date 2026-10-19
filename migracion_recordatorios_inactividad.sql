@@ -7,7 +7,7 @@
 --                      redactor sube algo después, la referencia real pasa
 --                      a ser posterior y el ciclo se reinicia solo.
 --   avisos_enviados    0-5. Al 5º aviso el texto lleva el incumplimiento del
---                      apartado 2.1.5 (Compromiso) de la guía del medio.
+--                      apartado 3.6 (Compromiso) de la guía del medio.
 --   ultimo_aviso_at    cuándo salió el último aviso (ISO, UTC); de ahí se
 --                      cuentan los 5 días hasta el siguiente aviso o hasta
 --                      avisar a los admins.

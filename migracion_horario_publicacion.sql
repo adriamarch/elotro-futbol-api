@@ -1,0 +1,14 @@
+-- Migración: horario de publicación editable por admins (Funcionalidades >
+-- Horario) y marca de "fuera de calendario" en las noticias.
+--
+-- El horario en sí vive en settings (clave 'horario_publicacion'), no
+-- necesita tabla nueva. Aquí solo se añade la marca por noticia:
+--
+-- fuera_calendario: 0/1. A 1 si la noticia se publicó en un día en el que
+-- su tipo no estaba permitido por el horario. Se publica igualmente en la
+-- web, pero no se sube a redes sociales (el panel oculta "Compartir").
+-- Se calcula en el servidor al publicar; nunca la manda el cliente.
+--
+-- Ejecutar con:
+--   wrangler d1 execute elotrofutbol --remote --file=./migracion_horario_publicacion.sql
+ALTER TABLE articles ADD COLUMN fuera_calendario INTEGER NOT NULL DEFAULT 0;

@@ -1,0 +1,15 @@
+-- Historial de avisos de inactividad (detalle de cada aviso en Usuarios).
+--
+-- Añade a recordatorios_inactividad una columna JSON con un elemento por
+-- aviso enviado en el ciclo actual:
+--   [{"numero":1,"enviado_at":"2026-10-01T08:00:12.000Z","dias_sin_subir":31}, ...]
+-- Los avisos anteriores a esta migración no tienen entrada: el panel muestra
+-- su fecha como estimada (último aviso menos 5 días por cada aviso previo).
+--
+-- Va en la propia tabla (y no en una nueva) para que viaje con la sincronización
+-- D1 -> Postgres, que copia todas las columnas.
+--
+-- En D1 un ALTER repetido da "duplicate column name" (ignorable).
+-- Ejecutar con:
+--   wrangler d1 execute elotrofutbol --remote --file=./migracion_recordatorios_inactividad_historial.sql
+ALTER TABLE recordatorios_inactividad ADD COLUMN historial_avisos TEXT;

@@ -72,7 +72,7 @@ INSERT INTO _tmp_estadio_por_equipo (equipo, estadio) VALUES
   ('UE Olot', 'Municipal d''Olot'),
   ('CD Ebro', 'Pedro Sancho'),
   ('Peña Sport', 'San Francisco (Tafalla)'),
-  ('Utebo', 'Municipal de Utebo'),
+  ('Utebo FC', 'Municipal de Utebo'),
   ('Reus FC Reddis', 'Municipal de Reus'),
   ('Atlético Osasuna B', 'Tajonar'),
   ('SD Logroñés', 'Pradoviejo'),

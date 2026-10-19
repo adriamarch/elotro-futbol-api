@@ -16,6 +16,7 @@ function entre(ini, fin) {
 // Tramos reales del Worker (nada reescrito a mano)
 const codigo = [
   entre("function escapeHtmlEmail(", "\n}\n") + "\n}\n",
+  entre("const TONOS_EMAIL", "function plantillaEmail("),
   entre("function plantillaEmail(", "\n// ---------- Newsletter"),
   entre("const UMBRAL_PRIMERA_PARTE_SIN_DESCANSO", "// Umbral de partido \"colgado\""),
   entre("function minutoEnVivoServidor(", "// ---------- Avisos de partidos sin cubrir"),

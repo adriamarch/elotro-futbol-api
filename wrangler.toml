@@ -132,7 +132,12 @@ MICROSOFT_CLIENT_ID = "b277667e-e92d-49d2-821b-d7c36bf9a1cb"
 # como Redirect URI. Crear la app y usar OAuth2 es gratis y sin
 # aprobación previa.
 DISCORD_CLIENT_ID = "1546272810253680751"
-DISCORD_CLIENT_SECRET = "GyOOC8vBwCuHxBaZhbNHNMIo9D13iBqn"
+# DISCORD_CLIENT_SECRET NO va aquí (este archivo está versionado): se
+# define como secret real con "wrangler secret put DISCORD_CLIENT_SECRET"
+# (y en Railway como variable de entorno del servicio). El valor que
+# estuvo escrito en este archivo quedó expuesto en el historial de git:
+# hay que REGENERARLO en https://discord.com/developers/applications
+# (OAuth2 > Reset Secret) y guardar el nuevo solo como secret.
 # Client ID y Client Secret de la app de X (antigua Twitter) para
 # "Iniciar sesión con X" (lectores, ver /api/readers/x/iniciar y
 # /api/readers/x/callback en src/index.js). Igual que con Discord, aquí
@@ -153,13 +158,25 @@ DISCORD_CLIENT_SECRET = "GyOOC8vBwCuHxBaZhbNHNMIo9D13iBqn"
 # ningún sitio -> ReferenceError: RAILWAY_URL is not defined en cuanto
 # se intentaba el failover. Mismo valor que API_URL_SECUNDARIA_POR_DEFECTO
 # en public/js/config.js.
-RAILWAY_URL = "https://elotro-futbol-api-production.up.railway.app"
+#
+# API SECUNDARIA DESACTIVADA (oct-2026): ya no se usa. Con
+# SECONDARY_ENABLED = "false" (o sin la línea) el Worker NO reenvía nada a
+# Railway: un 5xx o una excepción del principal se devuelve tal cual (el
+# aviso por email de enviarAlerta se mantiene), y FAILOVER_TEST se ignora.
+# Para REACTIVARLA: SECONDARY_ENABLED = "true" y descomentar RAILWAY_URL
+# (más public/js/config.js -> SECUNDARIA_ACTIVA, ver NOTAS-CAMBIOS.md).
+SECONDARY_ENABLED = "false"
+# RAILWAY_URL = "https://elotro-futbol-api-production.up.railway.app"
 # Modo mantenimiento temporal (ver "MODO MANTENIMIENTO TEMPORAL" en
 # src/index.js). Pon "true" para activar la pantalla de mantenimiento en
 # TODA la web y la API (menos /api/internal/*), o "false"/borra la línea
 # para desactivarla. Se puede cambiar también desde el dashboard de
 # Cloudflare (Settings > Variables) sin necesidad de "wrangler deploy".
 #
+
+SYNC_INGEST_TOKEN = "VP,B;KYC=%XYL+ZqtoWGSvnN-W5vk8d3"
+
+
 # IMPORTANTE: se activó el 1-sep-2026 "hasta medianoche" por la cuota
 # diaria de lecturas de D1 agotada, y se quedó puesta a "true" sin que
 # nadie la desactivara -- así ha seguido bloqueando la API entera (con

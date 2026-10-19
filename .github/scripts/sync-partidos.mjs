@@ -16,7 +16,7 @@ async function tsdb(ruta) {
     const r = await fetch(`https://www.thesportsdb.com/api/v1/json/${CLAVE}/${ruta}`, { headers: UA });
     if (r.status === 429) { console.log("429: espero 65 s"); await dormir(65000); continue; }
     if (!r.ok) throw new Error(`TheSportsDB ${r.status} en ${ruta.split("?")[0]}`);
-    await dormir(2200); // ~27 peticiones/min (limite gratuito: 30)
+    await dormir(3500); // ~17 peticiones/min: la clave gratuita compartida da 429 con facilidad
     return r.json();
   }
   throw new Error("TheSportsDB: 429 repetido");
@@ -46,14 +46,23 @@ for (const liga of ligas) {
       for (const [ronda, eventos] of porRonda) await worker("POST", "", { clave: liga.clave, ronda, eventos });
     } else {
       let vacias = 0;
+      let totalEventos = 0;
       for (let ronda = 1; ronda <= liga.rondas; ronda++) {
         const d = await tsdb(`eventsround.php?id=${liga.leagueId}&r=${ronda}&s=${encodeURIComponent(temporada)}`);
         const eventos = d?.events || [];
-        if (!eventos.length) { if (++vacias >= 3) break; continue; }
+        if (!eventos.length) {
+          console.log(`  ronda ${ronda}: sin eventos`);
+          if (++vacias >= 3) { console.log("  3 rondas seguidas vacias: se corta esta liga"); break; }
+          continue;
+        }
         vacias = 0;
+        totalEventos += eventos.length;
         const res = await worker("POST", "", { clave: liga.clave, ronda, eventos });
-        console.log(`  ronda ${ronda}: ${eventos.length} eventos`, JSON.stringify(res.resumen || {}).slice(0, 120));
+        const { ejemplos = [], ...resto } = res.resumen || {};
+        console.log(`  ronda ${ronda}: ${eventos.length} eventos`, JSON.stringify(resto));
+        for (const e of ejemplos) console.log(`     · ${e}`);
       }
+      if (!totalEventos) { fallos++; console.error(`  AVISO ${liga.clave}: TheSportsDB no devolvio ningun partido. Revisa el ID de liga (${liga.leagueId}) y la temporada (${temporada}).`); }
     }
   } catch (err) { fallos++; console.error(`  ERROR ${liga.clave}: ${err.message}`); }
 }

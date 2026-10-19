@@ -19150,6 +19150,10 @@ async function handlePrimary(request, env, ctx) {
             body.publicado = false;
           }
         }
+        // Una noticia programada no puede ser de "última hora": el banner dura 2 h
+        // desde que se guarda y habría caducado mucho antes de publicarse. Se
+        // fuerza a false (en la edicion, tambien apaga uno que ya tuviera).
+        if (programadoPara) body.banner_urgente = false;
 
         // Estado del borrador (solo aplica si no se publica): "terminado"
         // o "en_proceso", según lo que haya contestado el redactor en la
@@ -19908,6 +19912,10 @@ async function handlePrimary(request, env, ctx) {
             body.publicado = false;
           }
         }
+        // Una noticia programada no puede ser de "última hora": el banner dura 2 h
+        // desde que se guarda y habría caducado mucho antes de publicarse. Se
+        // fuerza a false (en la edicion, tambien apaga uno que ya tuviera).
+        if (programadoPara) body.banner_urgente = false;
 
         // Igual que al crear: si se guarda como borrador, se registra si
         // el redactor lo ha marcado como "terminado" o "en_proceso" en la

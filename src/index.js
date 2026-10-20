@@ -22756,6 +22756,52 @@ async function handlePrimary(request, env, ctx) {
         return minutos > 0 ? minutos : 0;
       }
 
+      // GET /api/results/filtros?competicion=..&desde_fecha=..[&grupo=..]
+      // Devuelve los grupos y equipos DISTINTOS de una competición (y si hay
+      // algún partido en juego) con SELECT DISTINCT, sin pasar por el LIMIT 500
+      // de GET /api/results. Antes los desplegables de grupo/equipo del
+      // calendario, la clasificación y las porras se rellenaban mirando los
+      // partidos devueltos por /api/results?limit=500 (orden fecha DESC): con la
+      // temporada entera cargada, esos 500 se llenaban con unos pocos grupos y
+      // el resto (p.ej. Segunda RFEF grupos 2 y 5) desaparecía del desplegable.
+      if (path === "/api/results/filtros" && method === "GET") {
+        const esStaff = !!(await requireAuth(request, env, url));
+        const claveFiltros = esStaff ? null : `filtros:${url.search}`;
+        if (claveFiltros) {
+          const enCache = CACHE_CORTA.get(claveFiltros);
+          if (enCache && enCache.exp > Date.now()) return json(enCache.valor);
+        }
+        const competicion = url.searchParams.get("competicion");
+        const grupo = url.searchParams.get("grupo");
+        const desdeFecha = url.searchParams.get("desde_fecha");
+        const verNoCubiertos = esStaff || url.searchParams.get("con_no_cubiertos") === "1";
+        let donde = " WHERE 1=1";
+        const binds = [];
+        if (!verNoCubiertos) donde += " AND finalizado_no_cubierto = 0";
+        if (competicion) { donde += " AND competicion = ?"; binds.push(competicion); }
+        if (desdeFecha) { donde += " AND (fecha_partido >= ? OR fecha_partido IS NULL)"; binds.push(desdeFecha); }
+        const { results: filasGrupos } = await env.DB.prepare(
+          `SELECT DISTINCT grupo FROM results${donde} AND grupo IS NOT NULL AND grupo <> ''`
+        ).bind(...binds).all();
+        let dondeEq = donde;
+        const bindsEq = [...binds];
+        if (grupo) { dondeEq += " AND grupo = ?"; bindsEq.push(grupo); }
+        const { results: filasEquipos } = await env.DB.prepare(
+          `SELECT equipo_local AS equipo FROM results${dondeEq} UNION SELECT equipo_visitante AS equipo FROM results${dondeEq}`
+        ).bind(...bindsEq, ...bindsEq).all();
+        const { results: filasVivo } = await env.DB.prepare(
+          `SELECT id FROM results${donde} AND estado = 'en_juego' LIMIT 1`
+        ).bind(...binds).all();
+        const cmp = (a, b) => a.localeCompare(b, "es");
+        const valor = {
+          grupos: filasGrupos.map(r => r.grupo).filter(Boolean).sort(cmp),
+          equipos: filasEquipos.map(r => r.equipo).filter(Boolean).sort(cmp),
+          hay_en_juego: filasVivo.length > 0,
+        };
+        if (claveFiltros) CACHE_CORTA.set(claveFiltros, { exp: Date.now() + 30000, valor });
+        return json(valor);
+      }
+
       if (path === "/api/results" && method === "GET") {
         // Un partido "finalizado" automáticamente por el cron sin que
         // ningún redactor lo haya cubierto (finalizado_no_cubierto = 1,

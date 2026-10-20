@@ -11821,8 +11821,13 @@ async function syncCargarAlias(env, ctr, cache) {
 
 // Aplica los eventos de UNA liga: resuelve nombres, deduplica contra los
 // partidos existentes y escribe solo lo que cambia. Devuelve contadores.
-async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cache) {
-  const resumen = { version: "prioridad-v3", eventos: eventos.length, insertados: 0, actualizados: 0, modificados: 0, cubiertos_redaccion: 0, sin_hora_api: 0, ejemplos: [], nuevos: [], cambios: [], sin_alias: [], omitidos: 0, error: null };
+async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cache, opciones = {}) {
+  // opciones.reemplazo = SUSTITUCIÓN TOTAL: los datos de la API pisan los de la
+  // base de datos en TODOS los partidos que casan (también los editados o
+  // cubiertos por redacción y los que están en juego/aplazados). Solo la pide la
+  // GitHub Action lanzada desde el panel («Sincronizar todo»).
+  const reemplazo = opciones.reemplazo === true;
+  const resumen = { version: "prioridad-v3", reemplazo, eventos: eventos.length, insertados: 0, actualizados: 0, modificados: 0, cubiertos_redaccion: 0, sin_hora_api: 0, ejemplos: [], nuevos: [], cambios: [], sin_alias: [], omitidos: 0, error: null };
   if (!eventos.length) return resumen;
 
   const alias = await syncCargarAlias(env, ctr, cache);
@@ -11953,7 +11958,32 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
     const bloqueaHorario = ["en_juego", "retrasado", "cancelado", "anulado", "colgado"].includes(fila.estado);
     if (!origenAuto) resumen.cubiertos_redaccion++;
     const cambios = {};
-    if (!bloqueaHorario) {
+    if (reemplazo) {
+      // SUSTITUCIÓN TOTAL: la API manda en todo lo que ella da, sin importar quién
+      // tocó el partido ni su estado. Se conserva autor, eventos, MVP, galería...
+      if (!origenAuto) resumen.reemplazados_redaccion = (resumen.reemplazados_redaccion || 0) + 1;
+      if (fila.external_id !== externalId) cambios.external_id = externalId;
+      // Pasa a ser del relleno salvo que alguien lo esté cubriendo/lo haya cubierto en directo.
+      if (!esAutomatico && !fila.autor_id && !iniciado) cambios.fuente = SYNC_FUENTE;
+      if (jornada !== null && jornada !== fila.jornada) cambios.jornada = jornada;
+      if (local.ok && local.nombre !== fila.equipo_local) cambios.equipo_local = local.nombre;
+      if (visitante.ok && visitante.nombre !== fila.equipo_visitante) cambios.equipo_visitante = visitante.nombre;
+      if (fechaLocal) {
+        // Única salvaguarda: si la API solo da el día, no se pierde una hora ya conocida.
+        const sustituyeHoraPorDia = fechaLocal.length === 10 && String(fila.fecha_partido || "").slice(0, 10) === fechaLocal && String(fila.fecha_partido || "").length === 16;
+        if (!sustituyeHoraPorDia && fechaLocal !== fila.fecha_partido) cambios.fecha_partido = fechaLocal;
+      }
+      const sedeApiR = String(ev.strVenue || "").trim();
+      if (sedeApiR && sedeApiR !== fila.ubicacion) cambios.ubicacion = sedeApiR;
+      else if (ubicacion && !fila.ubicacion) cambios.ubicacion = ubicacion;
+      // Resultado: si la API ya lo da (finalizado), sustituye estado y marcador.
+      // Si la API aún no lo tiene, NO se borra un resultado ya guardado.
+      if (estado === "finalizado") {
+        if (fila.estado !== "finalizado") cambios.estado = "finalizado";
+        if (golesL !== fila.goles_local) cambios.goles_local = golesL;
+        if (golesV !== fila.goles_visitante) cambios.goles_visitante = golesV;
+      }
+    } else if (!bloqueaHorario) {
       if (origenAuto && fila.external_id !== externalId) cambios.external_id = externalId;
       if (jornada !== null && jornada !== fila.jornada) cambios.jornada = jornada;
       if (origenAuto && local.ok && local.nombre !== fila.equipo_local) cambios.equipo_local = local.nombre;
@@ -11967,7 +11997,7 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
       if (sedeApi && sedeApi !== fila.ubicacion) cambios.ubicacion = sedeApi;
       else if (ubicacion && !fila.ubicacion) cambios.ubicacion = ubicacion;
     }
-    if (origenAuto && !enDirecto && estado === "finalizado") {
+    if (!reemplazo && origenAuto && !enDirecto && estado === "finalizado") {
       if (fila.estado !== "finalizado") cambios.estado = "finalizado";
       if (golesL !== fila.goles_local) cambios.goles_local = golesL;
       if (golesV !== fila.goles_visitante) cambios.goles_visitante = golesV;
@@ -12020,7 +12050,7 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
 // ---- Texto legible para el historial del panel (Funcionalidades > Historial) ----
 function syncFechaLegible(v) { return v ? String(v).replace("T", " ") : ""; }
 
-const SYNC_ETIQUETAS_CAMPO = { fecha_partido: "fecha", jornada: "jornada", ubicacion: "sede", equipo_local: "local", equipo_visitante: "visitante", estado: "estado" };
+const SYNC_ETIQUETAS_CAMPO = { fuente: "origen", fecha_partido: "fecha", jornada: "jornada", ubicacion: "sede", equipo_local: "local", equipo_visitante: "visitante", estado: "estado" };
 
 // "fecha: 2026-10-18 16:15 → 2026-10-18 18:30; resultado: -- → 2-1"
 function syncTextoCambio(fila, cambios, visibles) {
@@ -12336,7 +12366,7 @@ async function syncRutasAdmin(request, env, path, method, url) {
       if (!liga || !Number.isFinite(ronda) || !Array.isArray(body?.eventos)) return json({ error: "Cuerpo no valido" }, 400);
       const ctr = { sub: 1, max: parseInt(env.SYNC_MAX_SUBREQUESTS, 10) || 40 };
       const eventos = body.eventos.slice(0, 100).map((e) => ({ ...e, _ronda: ronda }));
-      const resumen = await syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, {});
+      const resumen = await syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, {}, { reemplazo: body.reemplazo === true });
       // «Última pasada» de la liga: la Action manda una peticion por jornada, asi que
       // las peticiones seguidas (menos de 10 min entre ellas) se suman como una sola pasada.
       try {
@@ -12438,8 +12468,12 @@ async function syncRutasAdmin(request, env, path, method, url) {
     const cfg = ghCfg();
     if (!cfg) return json({ error: "Falta configurar GITHUB_DISPATCH_TOKEN y GITHUB_REPO (owner/repo) en el Worker" }, 400);
     const desde = new Date(Date.now() - 15000).toISOString();
+    const bodyLanzar = await request.json().catch(() => ({}));
+    // «Sincronizar todo» pide sustitución total; el workflow lo recibe como input.
+    const dispatch = { ref: cfg.ref };
+    if (bodyLanzar && bodyLanzar.reemplazo_total === true) dispatch.inputs = { reemplazo_total: "true" };
     const r = await ghFetch(cfg, `actions/workflows/${encodeURIComponent(cfg.wf)}/dispatches`, {
-      method: "POST", body: JSON.stringify({ ref: cfg.ref }),
+      method: "POST", body: JSON.stringify(dispatch),
     });
     if (r.status !== 204) {
       const t = await r.text().catch(() => "");

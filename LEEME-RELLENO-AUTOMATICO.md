@@ -39,3 +39,15 @@ Sin ligas configuradas no se hace nada.
 - Secreto `THESPORTSDB_API_KEY` (clave premium): usa `eventsseason.php`, 1 petición por liga.
 - Rutas admin: `GET/PUT /api/admin/sync-partidos[/config]`, `POST /api/admin/sync-partidos/ejecutar`,
   `GET /api/admin/sync-partidos/ligas`, `GET/POST/DELETE /api/admin/alias-equipos`.
+
+## Sustitución total (botón «Sincronizar todo (GitHub Action)»)
+Ese botón lanza el workflow con `reemplazo_total=true`; el script lo envía como `reemplazo: true` a
+`/api/admin/sync-partidos/ingestar` y `syncAplicarEventos` entra en modo sustitución:
+- Pisa jornada, equipos, fecha/hora, sede y, si la API ya lo da, estado y marcador en TODOS los partidos
+  que casan (redacción incluida, también aplazados/en juego). La salvaguarda de «un redactor siempre gana»
+  NO se aplica en este modo.
+- No borra partidos, ni toca autor, eventos, MVP ni galerías. No borra un resultado si la API aún no lo tiene.
+- Si la API solo da el día, conserva la hora que ya hubiera.
+- La ejecución diaria programada y «Rellenar desde el servidor» siguen en modo normal (con las reglas de arriba).
+- Orden de despliegue: primero el workflow (`sync-partidos.yml`) en `main`, luego los Workers; si no, GitHub
+  rechaza el lanzamiento (422) por el input desconocido.

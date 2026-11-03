@@ -1,0 +1,11 @@
+-- Interruptor «Notificaciones push» del panel de Minuto a Minuto.
+--
+--   avisos_push: NULL o 1 = se avisa a los suscriptores (goles, descanso, final,
+--                VAR, correcciones y añadido), que es lo habitual;
+--                0 = este partido no manda ninguna notificación push.
+--
+-- Sin esta columna todo sigue funcionando como hasta ahora (se avisa siempre),
+-- pero el interruptor del panel no podrá guardarse.
+--
+--   wrangler d1 execute elotrofutbol --remote --file=migracion_avisos_push.sql
+ALTER TABLE results ADD COLUMN avisos_push INTEGER;

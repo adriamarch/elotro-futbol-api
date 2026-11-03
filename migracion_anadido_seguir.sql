@@ -1,0 +1,14 @@
+-- "Seguir jugando" en el aviso de fin de añadido del Minuto a Minuto.
+--
+-- Antes, "Seguir jugando" subía +1' el añadido anunciado (+6 -> +7). Ahora el
+-- añadido anunciado NO cambia: solo se marca este indicador y el reloj sigue
+-- corriendo (90+7, 90+8...) sin tope ni cierre automático hasta que el
+-- redactor pite el descanso / el final a mano.
+--
+--   anadido_seguir: 1 = el redactor ha pulsado "Seguir jugando" (NULL = no).
+--   Se borra solo al anunciar otro añadido, al borrar el evento "Tiempo
+--   añadido" y al empezar la 2ª parte.
+--
+-- Aplicar ANTES de desplegar el código nuevo:
+--   wrangler d1 execute elotrofutbol --remote --file=migracion_anadido_seguir.sql
+ALTER TABLE results ADD COLUMN anadido_seguir INTEGER;

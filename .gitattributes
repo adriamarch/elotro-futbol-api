@@ -1,0 +1,2 @@
+# Finales de línea LF en el repositorio (evita que los tests que buscan "\n}\n" fallen)
+* text=auto eol=lf

@@ -195,3 +195,18 @@ test("el formulario público no expone alias de usuarios y borrar el formulario 
   assert.equal((await api(`/api/formularios/${r.json.id}`, { method: "DELETE", token: tokenAdmin })).status, 200);
   assert.equal(sqlite.prepare("SELECT COUNT(*) n FROM formularios_invitados WHERE formulario_id = ?").get(r.json.id).n, 0);
 });
+
+test("en campos con alta de usuario el guion se normaliza a «Nombre — Equipo 1 & Equipo 2»", async () => {
+  const r = await api("/api/formularios", { method: "POST", token: tokenAdmin, body: {
+    titulo: "Guion auto",
+    campos: [{ id: "nombre", tipo: "desplegable", etiqueta: "Tu nombre", opciones: [], unica: true, alta_usuario: "redactor" }],
+  } });
+  assert.equal(r.status, 200);
+  const p = await api(`/api/formularios/${r.json.id}/invitados`, { method: "POST", token: tokenAdmin, body: {
+    campo_id: "nombre",
+    personas: ["Luis - Real Madrid", "Marta – Celta&Sevilla", "Ana-María — Cádiz  &  Xerez", "Pepe"],
+  } });
+  assert.equal(p.json.anadidas, 4, JSON.stringify(p.json));
+  const lista = (await api(`/api/formularios/${r.json.id}/invitados`, { token: tokenAdmin })).json.invitados.map((i) => i.opcion).sort();
+  assert.deepEqual(lista, ["Ana-María — Cádiz & Xerez", "Luis — Real Madrid", "Marta — Celta & Sevilla", "Pepe"]);
+});

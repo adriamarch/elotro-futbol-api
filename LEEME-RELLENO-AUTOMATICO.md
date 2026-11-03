@@ -51,3 +51,12 @@ Ese botón lanza el workflow con `reemplazo_total=true`; el script lo envía com
 - La ejecución diaria programada y «Rellenar desde el servidor» siguen en modo normal (con las reglas de arriba).
 - Orden de despliegue: primero el workflow (`sync-partidos.yml`) en `main`, luego los Workers; si no, GitHub
   rechaza el lanzamiento (422) por el input desconocido.
+
+## Aplazados reprogramados (protegidos del relleno)
+- Columna `results.horario_manual` (migración `migracion_horario_manual.sql` / `070_horario_manual.sql`).
+- Se pone a 1 sola al guardar desde el panel un partido en estado `retrasado`, o uno que estaba
+  `retrasado`/`cancelado`/`anulado` y se acaba de reprogramar.
+- Con `horario_manual = 1` el relleno **no toca nada** del partido (horario, jornada, sede, equipos,
+  estado ni marcador), tampoco en «Sincronizar todo» (sustitución total). Se gestiona solo a mano.
+- Los ya reprogramados antes de la migración hay que marcarlos con el `UPDATE` comentado en el SQL.
+- Si la migración aún no está aplicada, todo funciona como antes (sin protección).

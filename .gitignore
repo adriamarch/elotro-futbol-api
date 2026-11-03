@@ -1,0 +1,11 @@
+node_modules/
+.wrangler/
+.env
+.env.*
+!.env.example
+credenciales.txt
+# Claves de cuenta de servicio de Google (nunca al repositorio)
+elotrofutbol-*.json
+*-service-account*.json
+# Copias de seguridad locales (no deben subirse ni desplegarse)
+*.bak

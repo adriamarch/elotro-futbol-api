@@ -18,6 +18,11 @@ CREATE TABLE users (
   -- que inicia sesión (queda NULL hasta entonces) y sirve para poder
   -- recuperar la contraseña desde "He olvidado mi contraseña".
   email TEXT,
+  -- Fecha/hora (ISO) del primer inicio de sesión real. NULL = todavía no ha
+  -- entrado nunca ("Sin primer acceso" en Usuarios). Antes se deducía de que
+  -- faltara el correo, pero ahora el correo se guarda al crear la cuenta.
+  -- Ver migracion_primer_acceso.sql.
+  primer_acceso_at TEXT,
   -- Perfil público del redactor/admin (se muestra en su página de autor,
   -- enlazada desde el nombre en sus noticias): biografía corta, experiencia
   -- previa, foto y redes sociales propias (JSON con las mismas claves que
@@ -318,6 +323,8 @@ CREATE TABLE match_events (
   bajar_gol INTEGER NOT NULL DEFAULT 0, -- solo para tipo "gol_var": si 1, este gol anulado ya se había sumado al marcador y hay que restarlo; si 0, se registra sin tocar el marcador
   var_motivo TEXT, -- solo para tipo "var": jugada que se revisa (gol, penalti, roja, amarilla, falta, fuera_juego, mano, otra)
   var_decision TEXT, -- solo para tipo "var": estado de la revisión (revisando, mantiene, cambia)
+  es_penalti INTEGER NOT NULL DEFAULT 0, -- solo para tipo "gol": 1 si el gol fue de penalti durante el partido (no confundir con la tanda: "penalti_marcado")
+  motivo_tarjeta TEXT, -- solo para tarjetas (amarilla, doble_amarilla, roja): motivo en texto libre ("Falta", "Protestas"...)
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX idx_match_events_resultado ON match_events(resultado_id);
@@ -408,6 +415,10 @@ CREATE TABLE match_gallery (
   -- pestañas por equipo de la galería pública (ver
   -- migracion_galeria_partido_equipo_slug.sql).
   equipo TEXT,
+  -- 1 = esta foto es la PORTADA de la galería de ESTE partido (obligatoria al
+  -- crear la galería; como mucho una por partido). Ver
+  -- migracion_galeria_portada.sql.
+  es_portada INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (result_id) REFERENCES results(id) ON DELETE CASCADE,
   FOREIGN KEY (media_id) REFERENCES media(id) ON DELETE CASCADE,
@@ -779,3 +790,489 @@ CREATE INDEX idx_article_reading_created ON article_reading(created_at);
 CREATE INDEX idx_article_reading_view ON article_reading(view_id);
 CREATE INDEX idx_article_reading_created_article ON article_reading(created_at, article_id);
 
+
+-- Tablas añadidas por migraciones posteriores (mantener schema.sql completo para montar una D1 desde cero y para los tests).
+-- Origen: migracion_jugadores.sql
+CREATE TABLE IF NOT EXISTS jugadores (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slug TEXT NOT NULL UNIQUE,
+  club TEXT NOT NULL,
+  nombre TEXT NOT NULL,
+  dorsal INTEGER,
+  oculto INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS jugador_alias (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  jugador_id INTEGER NOT NULL REFERENCES jugadores(id) ON DELETE CASCADE,
+  club TEXT NOT NULL,
+  clave TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (club, clave)
+);
+
+CREATE INDEX IF NOT EXISTS idx_jugador_alias_jugador ON jugador_alias(jugador_id);
+CREATE INDEX IF NOT EXISTS idx_jugadores_club ON jugadores(club);
+
+-- Origen: migracion_lecturas_cuenta.sql
+CREATE TABLE IF NOT EXISTS reader_saved_articles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reader_id INTEGER NOT NULL REFERENCES readers(id) ON DELETE CASCADE,
+  article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (reader_id, article_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reader_saved_reader_fecha ON reader_saved_articles(reader_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reader_saved_article ON reader_saved_articles(article_id);
+
+CREATE TABLE IF NOT EXISTS reader_reading_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reader_id INTEGER NOT NULL REFERENCES readers(id) ON DELETE CASCADE,
+  article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (reader_id, article_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reader_history_reader_fecha ON reader_reading_history(reader_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reader_history_article ON reader_reading_history(article_id);
+
+-- Columnas añadidas por migraciones posteriores (solo para montar una D1 desde cero; en producción ya están aplicadas).
+-- migracion_2fa_admins.sql
+ALTER TABLE users ADD COLUMN totp_secret TEXT;
+-- migracion_2fa_admins.sql
+ALTER TABLE users ADD COLUMN totp_activo INTEGER NOT NULL DEFAULT 0;
+-- migracion_2fa_admins.sql
+ALTER TABLE users ADD COLUMN totp_ultimo_paso INTEGER;
+-- migracion_2fa_admins.sql
+ALTER TABLE users ADD COLUMN totp_recovery TEXT;
+-- migracion_anadido_anunciado.sql
+ALTER TABLE results ADD COLUMN anadido_minutos INTEGER;
+-- migracion_anadido_anunciado.sql
+ALTER TABLE results ADD COLUMN anadido_parte INTEGER;
+-- migracion_anadido_avisado.sql
+ALTER TABLE results ADD COLUMN anadido_avisado INTEGER;
+-- migracion_anadido_seguir.sql
+ALTER TABLE results ADD COLUMN anadido_seguir INTEGER;
+-- migracion_aviso_desatendido.sql
+ALTER TABLE results ADD COLUMN aviso_desatendido_enviado INTEGER NOT NULL DEFAULT 0;
+-- migracion_banner_urgente.sql
+ALTER TABLE articles ADD COLUMN banner_urgente INTEGER NOT NULL DEFAULT 0;
+-- migracion_banner_urgente.sql
+ALTER TABLE articles ADD COLUMN banner_urgente_hasta TEXT;
+-- migracion_comentarios_respuestas.sql
+ALTER TABLE comments ADD COLUMN parent_id INTEGER REFERENCES comments(id) ON DELETE CASCADE;
+-- migracion_comentarios_respuestas.sql
+ALTER TABLE comments ADD COLUMN responde_a_id INTEGER REFERENCES comments(id) ON DELETE SET NULL;
+-- migracion_comentarios_respuestas.sql
+ALTER TABLE comments ADD COLUMN aviso_aprobado INTEGER NOT NULL DEFAULT 0;
+-- migracion_comentarios_respuestas.sql
+ALTER TABLE comments ADD COLUMN respuesta_avisada INTEGER NOT NULL DEFAULT 0;
+-- migracion_comentarios_respuestas.sql
+ALTER TABLE readers ADD COLUMN avisos_comentarios INTEGER NOT NULL DEFAULT 1;
+-- migracion_fase4_sync_tracking.sql
+ALTER TABLE users ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'));
+-- migracion_fase4_sync_tracking.sql
+ALTER TABLE results ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'));
+-- migracion_fase4_sync_tracking.sql
+ALTER TABLE sessions ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'));
+-- migracion_fase4_sync_tracking.sql
+ALTER TABLE edit_requests ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'));
+-- migracion_fase4_sync_tracking.sql
+ALTER TABLE comments ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'));
+-- migracion_fase4_sync_tracking.sql
+ALTER TABLE club_info_solicitudes ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'));
+-- migracion_formato_enlace.sql
+ALTER TABLE articles ADD COLUMN usa_url_bonita INTEGER NOT NULL DEFAULT 1;
+-- migracion_horario_manual.sql
+ALTER TABLE results ADD COLUMN horario_manual INTEGER NOT NULL DEFAULT 0;
+-- migracion_horario_publicacion.sql
+ALTER TABLE articles ADD COLUMN fuera_calendario INTEGER NOT NULL DEFAULT 0;
+-- migracion_media_carpetas.sql
+ALTER TABLE media ADD COLUMN carpeta_id INTEGER REFERENCES media_carpetas(id) ON DELETE SET NULL;
+-- migracion_media_portada.sql
+ALTER TABLE media ADD COLUMN portada_segundo REAL;
+-- migracion_media_portada_foco.sql
+ALTER TABLE media ADD COLUMN portada_foco TEXT;
+-- migracion_media_visibilidad.sql
+ALTER TABLE media ADD COLUMN visibilidad TEXT NOT NULL DEFAULT 'publico';
+-- migracion_niveles.sql
+ALTER TABLE users ADD COLUMN nivel INTEGER NOT NULL DEFAULT 1;
+-- migracion_niveles.sql
+ALTER TABLE users ADD COLUMN nivel_nota TEXT;
+-- migracion_origin_write_id.sql
+ALTER TABLE articles ADD COLUMN origin_write_id TEXT;
+-- migracion_origin_write_id.sql
+ALTER TABLE results ADD COLUMN origin_write_id TEXT;
+-- migracion_partidazo.sql
+ALTER TABLE results ADD COLUMN partidazo INTEGER NOT NULL DEFAULT 0;
+-- migracion_partidazo.sql
+ALTER TABLE results ADD COLUMN partidazo_puntuacion INTEGER;
+-- migracion_partidazo.sql
+ALTER TABLE results ADD COLUMN partidazo_motivos TEXT;
+-- migracion_perfil_lectores.sql
+ALTER TABLE readers ADD COLUMN avatar_url TEXT;
+-- migracion_permisos_redactores.sql
+ALTER TABLE users ADD COLUMN ultima_hora_hash TEXT;
+-- migracion_permisos_redactores.sql
+ALTER TABLE users ADD COLUMN ultima_hora_salt TEXT;
+-- migracion_readers_discord.sql
+ALTER TABLE readers ADD COLUMN discord_id TEXT;
+-- migracion_readers_google.sql
+ALTER TABLE readers ADD COLUMN google_id TEXT;
+-- migracion_readers_microsoft.sql
+ALTER TABLE readers ADD COLUMN microsoft_id TEXT;
+-- migracion_readers_x.sql
+ALTER TABLE readers ADD COLUMN x_id TEXT;
+-- migracion_recordatorios_inactividad_historial.sql
+ALTER TABLE recordatorios_inactividad ADD COLUMN historial_avisos TEXT;
+-- migracion_redes_destino.sql
+ALTER TABLE articles ADD COLUMN redes_destino TEXT;
+-- migracion_tienda.sql
+ALTER TABLE users ADD COLUMN puede_gestionar_tienda INTEGER NOT NULL DEFAULT 0;
+-- migracion_users_avatar_foco.sql
+ALTER TABLE users ADD COLUMN avatar_foco TEXT;
+
+-- Tablas creadas solo en migraciones (para montar una D1 desde cero y para los tests).
+-- Origen: migracion_acreditaciones.sql
+CREATE TABLE IF NOT EXISTS acreditaciones (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  nombre TEXT NOT NULL,
+  email TEXT NOT NULL,
+  dni TEXT NOT NULL,
+  equipo TEXT NOT NULL,
+  tipo_evento TEXT NOT NULL,
+  tipo_acreditacion TEXT NOT NULL,
+  funciones TEXT NOT NULL,
+  jornada_partido TEXT NOT NULL,
+  confirmado INTEGER NOT NULL DEFAULT 1,
+  estado TEXT NOT NULL DEFAULT 'pendiente',
+  nota_admin TEXT,
+  revisado_por TEXT,
+  revisado_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_acreditaciones_created ON acreditaciones(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_acreditaciones_estado ON acreditaciones(estado);
+
+-- Origen: migracion_activity_log.sql
+CREATE TABLE IF NOT EXISTS activity_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  usuario_id INTEGER,
+  usuario_nombre TEXT NOT NULL,
+  usuario_rol TEXT NOT NULL,
+  accion TEXT NOT NULL,       
+  entidad TEXT,               
+  entidad_id TEXT,            
+  descripcion TEXT NOT NULL,  
+  detalle TEXT,               
+  ip TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (usuario_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_activity_created ON activity_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_activity_usuario ON activity_log(usuario_id);
+CREATE INDEX IF NOT EXISTS idx_activity_accion ON activity_log(accion);
+CREATE INDEX IF NOT EXISTS idx_activity_entidad ON activity_log(entidad, entidad_id);
+
+-- Origen: migracion_anuncios_destinatarios.sql
+CREATE TABLE IF NOT EXISTS anuncios_email_destinatarios (
+  anuncio_id INTEGER NOT NULL,
+  email TEXT NOT NULL,
+  estado TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (anuncio_id, email)
+);
+
+-- Origen: migracion_anuncios_email.sql
+CREATE TABLE IF NOT EXISTS anuncios_email (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  asunto TEXT NOT NULL,
+  mensaje TEXT NOT NULL,
+  
+  
+  audiencias TEXT NOT NULL,
+  boton_texto TEXT,
+  boton_url TEXT,
+  creado_por_id INTEGER,
+  creado_por_nombre TEXT,
+  total_destinatarios INTEGER NOT NULL DEFAULT 0,
+  enviados INTEGER NOT NULL DEFAULT 0,
+  fallidos INTEGER NOT NULL DEFAULT 0,
+  estado TEXT NOT NULL DEFAULT 'enviando', 
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  completado_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_anuncios_email_created ON anuncios_email(created_at);
+
+-- Origen: migracion_formularios.sql
+CREATE TABLE IF NOT EXISTS formularios (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slug TEXT NOT NULL UNIQUE,
+  titulo TEXT NOT NULL,
+  descripcion TEXT NOT NULL DEFAULT '',
+  aviso TEXT NOT NULL DEFAULT '',
+  texto_boton TEXT NOT NULL DEFAULT 'Enviar',
+  mensaje_final TEXT NOT NULL DEFAULT '',
+  campos TEXT NOT NULL DEFAULT '[]',
+  acceso TEXT NOT NULL DEFAULT 'libre',
+  pin TEXT,
+  activo INTEGER NOT NULL DEFAULT 1,
+  notificar_email INTEGER NOT NULL DEFAULT 1,
+  creado_por TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_formularios_created ON formularios(created_at DESC);
+
+-- Origen: migracion_formularios.sql
+CREATE TABLE IF NOT EXISTS formularios_respuestas (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  formulario_id INTEGER NOT NULL,
+  datos TEXT NOT NULL DEFAULT '{}',
+  estado TEXT NOT NULL DEFAULT 'nueva',
+  nota_admin TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_formularios_respuestas_form ON formularios_respuestas(formulario_id, created_at DESC);
+
+-- Origen: migracion_formularios_invitados.sql
+CREATE TABLE IF NOT EXISTS formularios_invitados (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  formulario_id INTEGER NOT NULL,
+  campo_id TEXT NOT NULL,
+  opcion TEXT NOT NULL,
+  opcion_norm TEXT NOT NULL,
+  expira_at TEXT,
+  creado_por TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_formularios_invitados_unica ON formularios_invitados(formulario_id, campo_id, opcion_norm);
+CREATE INDEX IF NOT EXISTS idx_formularios_invitados_form ON formularios_invitados(formulario_id, expira_at);
+
+-- Origen: migracion_jornadas_calendario.sql
+CREATE TABLE IF NOT EXISTS jornadas_calendario (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  competicion TEXT NOT NULL,
+  grupo TEXT,
+  jornada INTEGER NOT NULL,
+  fecha_inicio TEXT NOT NULL, 
+  fecha_fin TEXT NOT NULL,    
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_jornadas_calendario_busqueda
+  ON jornadas_calendario(competicion, grupo, fecha_inicio, fecha_fin);
+
+-- Origen: migracion_media_carpetas.sql
+CREATE TABLE IF NOT EXISTS media_carpetas (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  nombre TEXT NOT NULL,
+  creada_por_id INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (creada_por_id) REFERENCES users(id) ON DELETE SET NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_media_carpetas_nombre ON media_carpetas(LOWER(nombre));
+
+-- Origen: migracion_niveles.sql
+CREATE TABLE IF NOT EXISTS nivel_historial (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  usuario_id INTEGER NOT NULL,
+  usuario_nombre TEXT NOT NULL,
+  nivel_anterior INTEGER NOT NULL,
+  nivel_nuevo INTEGER NOT NULL,
+  motivo TEXT,                        
+  cambiado_por_id INTEGER,
+  cambiado_por_nombre TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (usuario_id) REFERENCES users(id),
+  FOREIGN KEY (cambiado_por_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_nivel_historial_usuario ON nivel_historial(usuario_id);
+
+-- Origen: migracion_noticias_rapidas.sql
+CREATE TABLE IF NOT EXISTS noticias_rapidas (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  titulo TEXT NOT NULL,
+  subtitulo TEXT NOT NULL,
+  imagen_url TEXT NOT NULL,
+  autor_id INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_noticias_rapidas_created ON noticias_rapidas(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_noticias_rapidas_autor ON noticias_rapidas(autor_id);
+
+-- Origen: migracion_push.sql
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  endpoint TEXT NOT NULL UNIQUE,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  noticias INTEGER NOT NULL DEFAULT 1,
+  partidos INTEGER NOT NULL DEFAULT 1,
+  user_agent TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_push_noticias ON push_subscriptions(noticias);
+CREATE INDEX IF NOT EXISTS idx_push_partidos ON push_subscriptions(partidos);
+
+-- Origen: migracion_push_clubes.sql
+CREATE TABLE IF NOT EXISTS push_subscription_clubs (
+  subscription_id INTEGER NOT NULL,
+  club TEXT NOT NULL,
+  PRIMARY KEY (subscription_id, club)
+);
+CREATE INDEX IF NOT EXISTS idx_push_clubs_club ON push_subscription_clubs(club);
+
+-- Origen: migracion_recordatorios_galeria.sql
+CREATE TABLE IF NOT EXISTS recordatorios_galeria (
+  acreditacion_id INTEGER NOT NULL,
+  result_id INTEGER NOT NULL,
+  email TEXT,
+  enviado_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (acreditacion_id, result_id)
+);
+
+-- Origen: migracion_staff_push.sql
+CREATE TABLE IF NOT EXISTS staff_push_subscriptions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  endpoint TEXT NOT NULL UNIQUE,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  user_agent TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_staff_push_user ON staff_push_subscriptions(user_id);
+
+-- Origen: migracion_staff_push.sql
+CREATE TABLE IF NOT EXISTS staff_push_prefs (
+  user_id INTEGER NOT NULL,
+  categoria TEXT NOT NULL,
+  PRIMARY KEY (user_id, categoria)
+);
+CREATE INDEX IF NOT EXISTS idx_staff_push_prefs_cat ON staff_push_prefs(categoria);
+
+-- Origen: migracion_tienda.sql
+CREATE TABLE IF NOT EXISTS tienda_productos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  nombre TEXT NOT NULL,
+  descripcion TEXT,
+  
+  
+  precio_centimos INTEGER NOT NULL,
+  imagen_url TEXT,
+  
+  
+  
+  variantes TEXT,
+  
+  
+  
+  
+  requiere_para_acreditacion INTEGER NOT NULL DEFAULT 0,
+  activo INTEGER NOT NULL DEFAULT 1,
+  orden INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Origen: migracion_tienda.sql
+CREATE TABLE IF NOT EXISTS tienda_pedidos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  usuario_id INTEGER NOT NULL,
+  producto_id INTEGER NOT NULL,
+  
+  
+  
+  producto_nombre TEXT NOT NULL,
+  variante TEXT,
+  precio_centimos INTEGER NOT NULL,
+  
+  
+  
+  
+  
+  
+  estado TEXT NOT NULL DEFAULT 'pendiente_pago',
+  
+  
+  
+  referencia_pago TEXT,
+  
+  
+  nota_gestion TEXT,
+  gestionado_por INTEGER,
+  gestionado_en TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (usuario_id) REFERENCES users(id),
+  FOREIGN KEY (producto_id) REFERENCES tienda_productos(id),
+  FOREIGN KEY (gestionado_por) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_tienda_pedidos_usuario ON tienda_pedidos(usuario_id);
+CREATE INDEX IF NOT EXISTS idx_tienda_pedidos_estado ON tienda_pedidos(estado);
+
+-- Origen: migracion_votaciones_internas.sql
+CREATE TABLE IF NOT EXISTS votaciones_internas (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  titulo TEXT NOT NULL,
+  descripcion TEXT,
+  multiple INTEGER NOT NULL DEFAULT 0,
+  anonima INTEGER NOT NULL DEFAULT 0,
+  resultados_visibles TEXT NOT NULL DEFAULT 'tras_votar',
+  cierra_en TEXT,
+  estado TEXT NOT NULL DEFAULT 'abierta',
+  creado_por INTEGER REFERENCES users(id),
+  creado_por_nombre TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  cerrada_en TEXT
+);
+
+-- Origen: migracion_votaciones_internas.sql
+CREATE TABLE IF NOT EXISTS votaciones_internas_opciones (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  votacion_id INTEGER NOT NULL REFERENCES votaciones_internas(id) ON DELETE CASCADE,
+  texto TEXT NOT NULL,
+  orden INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_votint_opciones_votacion ON votaciones_internas_opciones(votacion_id);
+
+-- Origen: migracion_votaciones_internas.sql
+CREATE TABLE IF NOT EXISTS votaciones_internas_votos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  votacion_id INTEGER NOT NULL REFERENCES votaciones_internas(id) ON DELETE CASCADE,
+  opcion_id INTEGER NOT NULL REFERENCES votaciones_internas_opciones(id) ON DELETE CASCADE,
+  usuario_id INTEGER NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(opcion_id, usuario_id)
+);
+CREATE INDEX IF NOT EXISTS idx_votint_votos_votacion ON votaciones_internas_votos(votacion_id);
+CREATE INDEX IF NOT EXISTS idx_votint_votos_usuario ON votaciones_internas_votos(usuario_id, votacion_id);
+
+
+-- Feedback de revisores a redactores: aviso al autor cuando se aprueba,
+-- programa o devuelve su pieza (con nota breve del revisor) y observaciones
+-- sueltas. article_id puede quedar a NULL si la noticia se borra: por eso
+-- se guarda también el título (article_titulo).
+--   tipo: aprobada | programada | cambios | observacion
+CREATE TABLE IF NOT EXISTS article_feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  article_id INTEGER,
+  article_titulo TEXT NOT NULL DEFAULT '',
+  article_slug TEXT,
+  destinatario_id INTEGER NOT NULL,
+  autor_feedback_id INTEGER,
+  autor_feedback_nombre TEXT NOT NULL DEFAULT '',
+  tipo TEXT NOT NULL DEFAULT 'observacion',
+  nota TEXT,
+  leido INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_article_feedback_dest ON article_feedback(destinatario_id, leido, created_at);
+CREATE INDEX IF NOT EXISTS idx_article_feedback_updated ON article_feedback(updated_at);

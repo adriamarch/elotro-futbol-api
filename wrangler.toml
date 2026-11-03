@@ -174,7 +174,11 @@ SECONDARY_ENABLED = "false"
 # Cloudflare (Settings > Variables) sin necesidad de "wrangler deploy".
 #
 
-SYNC_INGEST_TOKEN = "VP,B;KYC=%XYL+ZqtoWGSvnN-W5vk8d3"
+# SYNC_INGEST_TOKEN NO va aquí (este archivo está versionado): se define como
+# secret real con "wrangler secret put SYNC_INGEST_TOKEN" y el MISMO valor en
+# el secreto SYNC_INGEST_TOKEN de GitHub Actions (sync-partidos.yml). El valor
+# que estuvo escrito en este archivo quedó en el historial de git: hay que
+# REGENERARLO (cadena aleatoria larga nueva) y no reutilizarlo.
 
 
 # IMPORTANTE: se activó el 1-sep-2026 "hasta medianoche" por la cuota

@@ -1,0 +1,29 @@
+name: Desactivar mantenimiento (manual)
+
+# Botón manual para reabrir la web YA, sin esperar a las 2:00. Pone
+# MAINTENANCE_MODE = "false" a la vez en el Worker de la API y en Pages con el
+# mismo script que usan "Activar mantenimiento" y el cierre automático de las 2:00
+# (.github/scripts/set-mantenimiento.sh).
+#
+# Antes este workflow editaba "const MANTENIMIENTO = true;" en public/index.html,
+# una constante que ya no existe: el paso fallaba siempre. El apagado automático
+# diario lo hace desactivar-mantenimiento-2am.yml.
+on:
+  workflow_dispatch:
+
+# Solo lectura: no escribe en el repositorio.
+permissions:
+  contents: read
+
+jobs:
+  desactivar-mantenimiento:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Desactivar MAINTENANCE_MODE en API + frontend
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bash .github/scripts/set-mantenimiento.sh false

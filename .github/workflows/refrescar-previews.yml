@@ -1,0 +1,29 @@
+# Limpia las tarjetas de enlace cacheadas por Facebook/WhatsApp/Instagram.
+# Se lanza a mano (Actions → "Refrescar tarjetas de redes" → Run workflow).
+# Requiere los secrets FB_APP_ID y FB_APP_SECRET.
+name: Refrescar tarjetas de redes
+on:
+  workflow_dispatch:
+    inputs:
+      cuantas:
+        description: "Cuántas noticias recientes refrescar"
+        default: "50"
+# Solo lectura: este workflow no escribe en el repositorio (principio de mínimo privilegio).
+permissions:
+  contents: read
+
+jobs:
+  refrescar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Pedir a Facebook que relea las tarjetas
+        env:
+          FB_APP_ID: ${{ secrets.FB_APP_ID }}
+          FB_APP_SECRET: ${{ secrets.FB_APP_SECRET }}
+          # Por variable de entorno y no dentro del comando: evita inyección de comandos.
+          CUANTAS: ${{ inputs.cuantas }}
+        run: node .github/scripts/refrescar-previews.mjs "$CUANTAS"

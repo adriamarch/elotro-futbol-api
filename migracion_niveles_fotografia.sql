@@ -1,0 +1,23 @@
+-- Migración: niveles de FOTOGRAFÍA (F1–F2)
+--
+-- Contexto: los colaboradores de fotografía (users.rol = 'fotografo') tienen su propia
+-- escala de progresión, distinta de la N1–N4 de redacción:
+--   F1 · Fotógrafo colaborador   (nivel general de participación)
+--   F2 · Fotógrafo de referencia (calidad, autonomía y responsabilidad demostradas)
+--
+-- NO hay columnas nuevas: se reutiliza users.nivel (1 = F1, 2 = F2), users.nivel_nota y la
+-- tabla nivel_historial de migracion_niveles.sql. Todo fotógrafo existente ya es F1 (el
+-- DEFAULT de la columna es 1). La escala (nombres, funciones, criterios) vive en el Worker
+-- (NIVELES_FOTO_INFO / NIVELES_FOTO_CRITERIOS), igual que NIVELES_INFO para redacción.
+--
+-- A diferencia de la redacción NO hay cifras mínimas (ni de partidos ni de fotografías): el
+-- ascenso es una valoración global que decide un admin (PUT /api/users/:id/nivel).
+--
+-- Única limpieza de datos: un fotógrafo que antes fue redactor podría arrastrar un nivel
+-- 3 o 4. Se recorta a F2 (el máximo de fotografía). El Worker ya lo recorta al leer, así que
+-- este UPDATE solo deja la base coherente; es idempotente y seguro de repetir.
+--
+-- Ejemplo de ejecución con wrangler:
+--   wrangler d1 execute elotrofutbol --remote --file=./migracion_niveles_fotografia.sql
+
+UPDATE users SET nivel = 2 WHERE rol = 'fotografo' AND nivel > 2;

@@ -577,6 +577,93 @@ async function consultaConAlternativas(env, variantes, binds) {
   throw ultimoError;
 }
 
+// ---------- LIMPIEZA DE CARPETAS PRIVADAS VACÍAS (Subir contenido) ----------
+// Una carpeta de contenido privado (media_carpetas) que se queda SIN NINGÚN
+// archivo dentro se borra sola a los 5 días. Los 5 días cuentan desde que la
+// limpieza la ve vacía por primera vez (se pasa cada hora, así que equivale a
+// "desde que se creó o se vació"). Si mientras tanto se sube o se mueve algo a
+// la carpeta, el contador se anula y vuelve a empezar si algún día se vacía.
+// La fecha de primera vez vacía se guarda en settings ("carpetas_vacias_desde",
+// JSON { idCarpeta: ISO }), sin migración ni columnas nuevas. Las carpetas que
+// ya estaban vacías al desplegar tienen también 5 días de margen.
+const CARPETAS_VACIAS_DIAS = 5;
+const CARPETAS_VACIAS_KEY = "carpetas_vacias_desde";
+const CARPETAS_LIMPIEZA_INTERVALO_MS = 60 * 60 * 1000;
+const CARPETAS_LIMPIEZA_KV = "carpetas-limpieza:ultima";
+let CARPETAS_LIMPIEZA_ULTIMO_MS = 0;
+
+// Lógica pura (testeable): dado el mapa guardado, las carpetas vacías de ahora
+// y la hora actual, devuelve el mapa nuevo y las carpetas a borrar.
+function planificarLimpiezaCarpetasVacias(guardado, vacias, ahoraMs, dias = CARPETAS_VACIAS_DIAS) {
+  const limiteMs = dias * 24 * 3600 * 1000;
+  const mapa = {};
+  const borrar = [];
+  for (const c of vacias || []) {
+    const previo = Date.parse(guardado && guardado[c.id]);
+    const desde = Number.isFinite(previo) && previo <= ahoraMs ? previo : ahoraMs;
+    mapa[c.id] = new Date(desde).toISOString();
+    if (ahoraMs - desde >= limiteMs) borrar.push(c);
+  }
+  return { mapa, borrar };
+}
+
+async function limpiarCarpetasVaciasSiToca(env) {
+  if (env.LIMPIEZA_CARPETAS_DESACTIVADA === "1" || env.LIMPIEZA_CARPETAS_DESACTIVADA === 1) return 0;
+  const ahora = Date.now();
+  if (ahora - CARPETAS_LIMPIEZA_ULTIMO_MS < CARPETAS_LIMPIEZA_INTERVALO_MS) return 0;
+  CARPETAS_LIMPIEZA_ULTIMO_MS = ahora;
+  try {
+    if (env.ELOTROFUTBOL_KV) {
+      const previo = Number(await env.ELOTROFUTBOL_KV.get(CARPETAS_LIMPIEZA_KV)) || 0;
+      if (ahora - previo < CARPETAS_LIMPIEZA_INTERVALO_MS) return 0;
+      await env.ELOTROFUTBOL_KV.put(CARPETAS_LIMPIEZA_KV, String(ahora), { expirationTtl: 3600 });
+    }
+    let vacias;
+    try {
+      ({ results: vacias } = await env.DB.prepare(
+        `SELECT c.id, c.nombre FROM media_carpetas c
+          WHERE NOT EXISTS (SELECT 1 FROM media m WHERE m.carpeta_id = c.id)`
+      ).all());
+    } catch (err) {
+      // Sin la tabla (migración de carpetas sin ejecutar) o sin la columna: nada que limpiar.
+      if (/no such (table|column)|does not exist|undefined (table|column)/i.test(String((err && err.message) || err))) return 0;
+      throw err;
+    }
+    const fila = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(CARPETAS_VACIAS_KEY).first();
+    let guardado = {};
+    try { guardado = fila && fila.value ? JSON.parse(fila.value) : {}; } catch { guardado = {}; }
+    if (!guardado || typeof guardado !== "object" || Array.isArray(guardado)) guardado = {};
+
+    const { mapa, borrar } = planificarLimpiezaCarpetasVacias(guardado, vacias || [], ahora);
+    let borradas = 0;
+    for (const c of borrar) {
+      // El NOT EXISTS vuelve a comprobarlo en el momento de borrar: si justo
+      // ahora alguien subió algo a la carpeta, no se toca.
+      const r = await env.DB.prepare(
+        "DELETE FROM media_carpetas WHERE id = ? AND NOT EXISTS (SELECT 1 FROM media m WHERE m.carpeta_id = media_carpetas.id)"
+      ).bind(c.id).run();
+      if (r && r.meta && r.meta.changes === 0) continue; // se llenó justo antes: se queda
+      delete mapa[c.id];
+      borradas++;
+      await registrarActividad(env, null, { uid: null, nombre: "Limpieza automática", rol: "sistema" }, {
+        accion: "borrar_carpeta_media_vacia", entidad: "media_carpeta", entidad_id: String(c.id),
+        descripcion: `Carpeta de contenido «${c.nombre}» borrada automáticamente: llevaba ${CARPETAS_VACIAS_DIAS} días vacía`,
+      });
+    }
+    const nuevo = JSON.stringify(mapa);
+    if (nuevo !== JSON.stringify(guardado)) {
+      await env.DB.prepare(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+      ).bind(CARPETAS_VACIAS_KEY, nuevo).run();
+    }
+    return borradas;
+  } catch (err) {
+    console.error("Limpieza de carpetas vacías: error (se reintenta en la próxima pasada):", err && err.message ? err.message : err);
+    CARPETAS_LIMPIEZA_ULTIMO_MS = 0;
+    return 0;
+  }
+}
+
 // ---------- Notificaciones por correo ----------
 // Avisa a la redacción por email cada vez que se sube contenido (fotos/vídeos)
 // o se publica una crónica. Usa Resend (mismo servicio que TGN Fan Shop).
@@ -1616,6 +1703,7 @@ function categoriaLabelEmail(cat) {
     hypermotion: "LaLiga Hypermotion",
     primera_federacion: "Primera Federación",
     segunda_federacion: "Segunda Federación",
+    tercera_federacion: "Tercera Federación",
     copa_del_rey: "Copa del Rey",
     copa_federacion: "Copa Federación",
     general: "General",
@@ -2118,6 +2206,97 @@ function construirEmailAnuncio({ asunto, mensaje, boton_texto, boton_url }, dest
 
 function dormirMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// ---------- Envío reanudable de anuncios ----------
+// Cada destinatario queda apuntado en anuncios_email_destinatarios (pendiente -> enviando -> enviado |
+// fallido). Así un envío cortado (pestaña cerrada, error de red) se reanuda sin repetir a quien ya lo
+// recibió, los fallidos se reintentan solo al reanudar y dos llamadas a la vez no mandan el mismo correo
+// (cada correo se "reclama" en la BD antes de enviarse).
+// ============================================================
+// PODCAST (mini-YouTube público + gestión desde el panel)
+// Tabla creada en caliente con DDL portable (id TEXT, sin AUTOINCREMENT)
+// para que sea idéntica en D1 (SQLite) y en PostgreSQL.
+// ============================================================
+let PODCAST_TABLA_LISTA = false;
+async function asegurarTablaPodcast(env) {
+  if (PODCAST_TABLA_LISTA) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS podcast_items (
+       id TEXT PRIMARY KEY, tipo TEXT NOT NULL, titulo TEXT NOT NULL, descripcion TEXT,
+       fecha TEXT, duracion TEXT, invitado TEXT, temporada INTEGER, numero INTEGER,
+       plataforma TEXT, embed_id TEXT, portada TEXT,
+       destacado INTEGER NOT NULL DEFAULT 0, publicado INTEGER NOT NULL DEFAULT 1,
+       created_at TEXT NOT NULL)`
+  ).run();
+  PODCAST_TABLA_LISTA = true;
+}
+
+async function asegurarTablaDestinatariosAnuncio(env) {
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS anuncios_email_destinatarios (
+       anuncio_id INTEGER NOT NULL, email TEXT NOT NULL, estado TEXT NOT NULL, created_at TEXT NOT NULL,
+       PRIMARY KEY (anuncio_id, email))`
+  ).run();
+}
+
+async function registrarDestinatariosAnuncio(env, anuncioId, correos) {
+  const CHUNK = 40; // 2 parámetros por fila: por debajo del límite de 100 de D1
+  for (let i = 0; i < correos.length; i += CHUNK) {
+    const trozo = correos.slice(i, i + CHUNK);
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO anuncios_email_destinatarios (anuncio_id, email, estado, created_at) VALUES ${trozo.map(() => "(?, ?, 'pendiente', datetime('now'))").join(",")}`
+    ).bind(...trozo.flatMap((e) => [anuncioId, e])).run();
+  }
+}
+
+async function contarDestinatariosAnuncio(env, anuncioId) {
+  const { results } = await env.DB.prepare(
+    "SELECT estado, COUNT(*) AS n FROM anuncios_email_destinatarios WHERE anuncio_id = ? GROUP BY estado"
+  ).bind(anuncioId).all();
+  const c = { pendiente: 0, enviando: 0, enviado: 0, fallido: 0, omitido: 0 };
+  for (const r of results || []) c[r.estado] = Number(r.n) || 0;
+  return c;
+}
+
+function correosDeTextoAnuncio(texto) {
+  return [...new Set(String(texto || "").split(/[\s,;]+/).map((e) => e.trim().toLowerCase()).filter(emailAnuncioValido))];
+}
+
+// Anuncio anterior al registro: se averigua quién lo recibió ya mirando los envíos de Resend (mismo
+// asunto, posteriores al anuncio y no rebotados) y/o la lista que pegue el admin. Devuelve null si no
+// hay forma de saberlo: NUNCA se envía a ciegas, porque se repetiría el correo a quien ya lo tiene.
+async function recuperarYaRecibieronAnuncio(env, anuncio, textoManual) {
+  const manuales = correosDeTextoAnuncio(textoManual);
+  const encontrados = new Set();
+  let consultaOk = false;
+  const desde = Date.parse(String(anuncio.created_at || "").replace(" ", "T") + "Z");
+  const MALOS = new Set(["bounced", "complained", "failed", "canceled", "suppressed"]);
+  for (const cuenta of cuentasResend(env)) {
+    let despues = null;
+    try {
+      for (let pagina = 0; pagina < 20; pagina++) {
+        const resp = await fetch("https://api.resend.com/emails?limit=100" + (despues ? "&after=" + encodeURIComponent(despues) : ""), {
+          headers: { Authorization: "Bearer " + cuenta.clave },
+        });
+        if (!resp.ok) break;
+        const data = await resp.json().catch(() => null);
+        const lista = data && Array.isArray(data.data) ? data.data : [];
+        if (pagina === 0) consultaOk = true;
+        let antiguo = false;
+        for (const m of lista) {
+          const t = Date.parse(m.created_at);
+          if (Number.isFinite(desde) && Number.isFinite(t) && t < desde) { antiguo = true; continue; }
+          if (m.subject !== anuncio.asunto || MALOS.has(String(m.last_event || "").toLowerCase())) continue;
+          for (const para of Array.isArray(m.to) ? m.to : [m.to]) if (para) encontrados.add(String(para).trim().toLowerCase());
+        }
+        if (!data || !data.has_more || antiguo || !lista.length) break;
+        despues = lista[lista.length - 1].id;
+      }
+    } catch (e) { console.log("Anuncios: no se pudo consultar Resend:", e && e.message); }
+  }
+  if (!consultaOk && !manuales.length) return null;
+  return { desdeResend: [...encontrados], manuales };
+}
+
 // Valida el cuerpo recibido del panel. Devuelve { error } o { datos }.
 function validarAnuncio(body) {
   const asunto = String(body.asunto || "").trim();
@@ -2231,22 +2410,44 @@ function clubArticuloDesdeResultado(equipoLocal, equipoVisitante) {
 // incompatible), o { club, categoria } con los valores finales listos
 // para el INSERT/UPDATE (categoria es undefined para el resto de tipos,
 // ya que ahí la decide validarCategoriaSegunAutor).
-async function resolverClubArticulo(env, tipo, resultadoId, clubBody) {
+// Categorías en las que una previa o crónica puede guardarse SIN resultado
+// vinculado. Son competiciones de las que no llevamos los resultados en la
+// tabla "results" (Tercera Federación y las copas), así que obligar a
+// vincular un partido allí bloqueaba el guardado. En ellas el vínculo es
+// opcional: si se vincula un resultado se comporta igual que siempre (club y
+// categoría automáticos); si no, se usan la categoría y el club que elija el
+// redactor a mano. Para añadir más categorías basta con ponerlas aquí (y en
+// CATEGORIAS_PREVIA_CRONICA_SIN_RESULTADO de public/admin/js/admin.js).
+const CATEGORIAS_PREVIA_CRONICA_SIN_RESULTADO = ["tercera_federacion", "copa_del_rey", "copa_federacion"];
+
+// esAdminUsuario: un admin puede guardar previa o crónica con el partido en
+// cualquier estado (sin la comprobación de estado de abajo), para poder
+// cambiar libremente de previa a crónica y viceversa.
+async function resolverClubArticulo(env, tipo, resultadoId, clubBody, categoriaBody, esAdminUsuario = false) {
   if (tipo !== "previa" && tipo !== "cronica") {
     return { club: clubBody || null };
   }
   if (!resultadoId) {
-    return { error: "Una previa o crónica debe tener un resultado vinculado para poder guardarse (el club y la categoría se toman automáticamente del partido)." };
+    // Sin resultado vinculado solo se admite en las categorías de la lista
+    // de arriba: el club y la categoría vienen entonces del propio redactor
+    // (categoria = undefined hace que se use la del body).
+    if (CATEGORIAS_PREVIA_CRONICA_SIN_RESULTADO.includes(categoriaBody)) {
+      let club = null;
+      if (Array.isArray(clubBody)) club = clubArticuloDesdeResultado(clubBody[0], clubBody[1]);
+      else if (typeof clubBody === "string" && clubBody.trim()) club = clubBody.trim();
+      return { club };
+    }
+    return { error: "Una previa o crónica debe tener un resultado vinculado para poder guardarse (el club y la categoría se toman automáticamente del partido). Solo es opcional en Tercera Federación, Copa del Rey y Copa Federación." };
   }
   const resultado = await env.DB.prepare("SELECT equipo_local, equipo_visitante, competicion, estado FROM results WHERE id = ?")
     .bind(resultadoId).first();
   if (!resultado) {
     return { error: "El resultado vinculado ya no existe. Elige de nuevo el partido." };
   }
-  if (tipo === "cronica" && resultado.estado !== "finalizado") {
+  if (!esAdminUsuario && tipo === "cronica" && resultado.estado !== "finalizado") {
     return { error: "No puedes guardar una crónica de un partido que todavía no ha terminado." };
   }
-  if (tipo === "previa" && resultado.estado !== "programado" && resultado.estado !== "retrasado") {
+  if (!esAdminUsuario && tipo === "previa" && resultado.estado !== "programado" && resultado.estado !== "retrasado") {
     return { error: "No puedes guardar una previa de un partido que ya ha terminado o está en juego." };
   }
   const club = clubArticuloDesdeResultado(resultado.equipo_local, resultado.equipo_visitante);
@@ -2314,7 +2515,7 @@ function validarCategoriaSegunAutor(_categoriasComplementariasAutor, categoriaRe
 // (solo llegan a través de las categorías fijas de un redactor de ese
 // tipo). "copa_del_rey" y "copa_federacion" solo valen como categoría
 // principal, NO como adicionales (por eso no están en esta lista).
-const CATEGORIAS_ARTICULO_VALIDAS = ["hypermotion", "primera_federacion", "segunda_federacion", "general", "amistoso", "arbitraje", "jurisdiccion"];
+const CATEGORIAS_ARTICULO_VALIDAS = ["hypermotion", "primera_federacion", "segunda_federacion", "tercera_federacion", "general", "amistoso", "arbitraje", "jurisdiccion"];
 const MAX_CATEGORIAS_ADICIONALES = 4;
 
 // Igual que parsearEquipos()/parsearCategoriasFijas(): convierte el JSON
@@ -2430,6 +2631,9 @@ function calcularBannerUrgenteHasta(activar) {
 async function obtenerNivelUsuario(env, uid) {
   const user = await env.DB.prepare("SELECT nivel, rol FROM users WHERE id = ?").bind(uid).first();
   if (user && user.rol === "admin") return NIVEL_MAXIMO;
+  // El nivel de un fotógrafo (F1/F2) comparte columna pero NO es un nivel editorial:
+  // para cualquier comprobación de permisos de redacción cuenta siempre como 1.
+  if (user && user.rol === "fotografo") return 1;
   return (user && user.nivel) || 1;
 }
 
@@ -2792,6 +2996,40 @@ async function limiteExcedido(request, env, accion, max, ventanaSeg, extra = "")
   }
 }
 
+// Bloqueo por CUENTA (independiente de la IP). limiteExcedido() cuenta por IP
+// (+ clave), así que un ataque repartido entre muchas IPs (botnet, proxies
+// rotativos) contra UNA misma cuenta nunca llegaba al tope. Estos dos helpers
+// cuentan solo los intentos FALLIDOS contra la cuenta, vengan de donde vengan:
+//   - cuentaBloqueada(): se consulta ANTES de comprobar la contraseña/código
+//     (así, mientras está bloqueada, ni siquiera la contraseña correcta abre
+//     sesión y el atacante no puede seguir adivinando).
+//   - registrarFalloCuenta(): se llama justo tras cada fallo.
+// Ventana fija en KV, como limiteExcedido. Falla abierto si KV no responde.
+// Contrapartida asumida: quien conozca el usuario puede bloquearlo hasta que
+// acabe la ventana (15 min); con el tope de 30 fallos y el límite por IP de
+// 20, hacen falta al menos 2 IPs distintas para conseguirlo.
+function claveFalloCuenta(accion, id, ventanaSeg) {
+  const ventana = Math.floor(Date.now() / (ventanaSeg * 1000));
+  return `rlf:${accion}:${String(id).toLowerCase().slice(0, 80)}:${ventana}`;
+}
+async function cuentaBloqueada(env, accion, id, max, ventanaSeg) {
+  try {
+    if (!env.ELOTROFUTBOL_KV || !id) return false;
+    const actual = parseInt((await env.ELOTROFUTBOL_KV.get(claveFalloCuenta(accion, id, ventanaSeg))) || "0", 10);
+    return actual >= max;
+  } catch {
+    return false;
+  }
+}
+async function registrarFalloCuenta(env, accion, id, ventanaSeg) {
+  try {
+    if (!env.ELOTROFUTBOL_KV || !id) return;
+    const clave = claveFalloCuenta(accion, id, ventanaSeg);
+    const actual = parseInt((await env.ELOTROFUTBOL_KV.get(clave)) || "0", 10);
+    await env.ELOTROFUTBOL_KV.put(clave, String(actual + 1), { expirationTtl: Math.max(60, ventanaSeg * 2) });
+  } catch {}
+}
+
 // ---------- Alertas de incidencias (Discord) ----------
 // Si la variable/secreto ALERT_WEBHOOK_URL contiene la URL de un webhook de
 // Discord, aquí se avisa de: el principal respondiendo 5xx o lanzando una
@@ -2800,6 +3038,17 @@ async function limiteExcedido(request, env, accion, max, ventanaSeg, extra = "")
 // una vez cada 15 min (memoria del isolate + KV si existe), para no inundar
 // el canal durante una caída que genera miles de errores.
 const ALERTAS_ULTIMO_AVISO = new Map();
+// ¿La excepción es solo un cuerpo JSON mal formado enviado por el CLIENTE?
+// (await request.json() lanza SyntaxError). Eso es un error 400 del cliente, no una
+// caída del principal: no debe disparar la alerta (que solo salta 1 vez cada 15 min,
+// así que un bot mandando basura silenciaría la alerta de una caída real) ni reenviar
+// la petición a Railway.
+function esErrorJsonDelCliente(err, request) {
+  if (!err || err.name !== "SyntaxError" || !/JSON/i.test(String(err.message || ""))) return false;
+  const metodo = String((request && request.method) || "").toUpperCase();
+  return metodo === "POST" || metodo === "PUT" || metodo === "PATCH" || metodo === "DELETE";
+}
+
 async function enviarAlerta(env, clave, titulo, detalle) {
   try {
     const url = env && env.ALERT_WEBHOOK_URL;
@@ -3130,6 +3379,18 @@ function campoAdmiteInvitaciones(c) {
   return !!c && (c.tipo === "desplegable" || c.tipo === "opcion")
     && (c.invitaciones === true || FORMULARIO_ALTA_ROLES.includes(String(c.alta_usuario || "")));
 }
+// Deja la persona en el formato de siempre. En los campos que crean usuario: "Nombre - Equipo", "Nombre – Equipo"
+// o "Nombre—Equipo" pasan a "Nombre — Equipo", y los equipos se separan con " & " (no toca guiones de nombres como "Ana-María").
+function normalizarPersonaInvitacionFormulario(texto, campo) {
+  let t = String(texto || "").replace(/\s+/g, " ").trim();
+  if (!campo || !campo.alta_usuario) return t;
+  t = t.replace(/\s*[—–―]\s*|\s+-{1,2}\s+/, " — ");
+  const i = t.indexOf(" — ");
+  if (i < 0) return t;
+  const nombre = t.slice(0, i).trim();
+  const equipos = t.slice(i + 3).replace(/\s*&\s*/g, " & ").trim();
+  return equipos ? `${nombre} — ${equipos}` : nombre;
+}
 async function invitadosActivosFormulario(env, formularioId) {
   const { results } = await env.DB.prepare(
     "SELECT campo_id, opcion FROM formularios_invitados WHERE formulario_id = ? AND (expira_at IS NULL OR expira_at > ?) ORDER BY id"
@@ -3241,6 +3502,55 @@ function opcionCoincideConUsuarioFormulario(opcion, u, alias) {
   const cats = parsearCategoriasFijas(u.categorias_fijas);
   return d.equipos.some((e) => equipos.includes(normalizarOpcionUnica(e))) || d.categorias_fijas.some((c) => cats.includes(c));
 }
+// Nombres y apellidos de colaboradores: la primera letra de cada palabra siempre va en mayúscula
+// ("juan garcía-lópez" -> "Juan García-López"). Solo se sube la inicial: el resto se respeta tal cual
+// (McDonald, O'Brien...), y las partículas de en medio ("de", "del", "la", "van"...) se dejan como estén
+// escritas ("Juan de la Cruz"). Se aplica al crear/editar usuarios, al editar el perfil propio y en el alta
+// desde el formulario de incorporación, así que el nombre queda igual en firmas, créditos y perfil público.
+const PARTICULAS_NOMBRE_PROPIO = new Set(["de", "del", "dels", "la", "las", "los", "el", "y", "e", "i", "da", "das", "do", "dos", "di", "van", "von", "der", "den"]);
+function capitalizarNombrePropio(texto) {
+  const limpio = String(texto == null ? "" : texto).replace(/\s+/g, " ").trim();
+  if (!limpio) return "";
+  return limpio.split(" ").map((palabra, i) => {
+    if (i > 0 && PARTICULAS_NOMBRE_PROPIO.has(palabra.toLowerCase())) return palabra;
+    return palabra.replace(/(^|-)(\p{L})/gu, (_, sep, letra) => sep + letra.toLocaleUpperCase("es"));
+  }).join(" ");
+}
+// ---------- Excepción: firmar solo con el nombre (sin apellidos) ----------
+// Redactores y fotógrafos deben tener nombre y apellidos, pero hay quien prefiere no
+// publicar su apellido (privacidad). Un administrador puede marcar esa excepción desde
+// Usuarios (users.sin_apellidos = 1): a esa persona ya no se le exigen apellidos ni en
+// el panel ni en el servidor. La columna se crea sola la primera vez que se usa.
+let _columnaSinApellidosLista = null;
+async function asegurarColumnaSinApellidos(env) {
+  if (_columnaSinApellidosLista) return _columnaSinApellidosLista;
+  _columnaSinApellidosLista = (async () => {
+    try {
+      await env.DB.prepare("SELECT sin_apellidos FROM users LIMIT 1").first();
+      return true;
+    } catch (err) {
+      if (!/no such column|does not exist|undefined column/i.test(String((err && err.message) || err))) throw err;
+    }
+    console.warn("[SIN APELLIDOS] Falta users.sin_apellidos: se crea ahora (migración automática).");
+    try {
+      await env.DB.prepare("ALTER TABLE users ADD COLUMN sin_apellidos INTEGER NOT NULL DEFAULT 0").run();
+    } catch (err) {
+      if (!/duplicate column|already exists/i.test(String((err && err.message) || err))) throw err;
+    }
+    return true;
+  })();
+  _columnaSinApellidosLista.catch(() => { _columnaSinApellidosLista = null; });
+  return _columnaSinApellidosLista;
+}
+async function usuarioSinApellidos(env, uid) {
+  try {
+    await asegurarColumnaSinApellidos(env);
+    const fila = await env.DB.prepare("SELECT sin_apellidos FROM users WHERE id = ?").bind(uid).first();
+    return !!(fila && Number(fila.sin_apellidos) === 1);
+  } catch (err) {
+    return false;
+  }
+}
 // Crea el usuario de la opción elegida. Devuelve { cuenta } (cuenta=null si esa persona ya tenía usuario).
 async function crearUsuarioDesdeFormulario(env, { opcion, rol, email, alias }) {
   const d = datosUsuarioDesdeOpcionFormulario(opcion);
@@ -3252,6 +3562,7 @@ async function crearUsuarioDesdeFormulario(env, { opcion, rol, email, alias }) {
   const enAlias = Object.entries(alias || {}).find(([k]) => formularioClaveNombreUsuario(k) === clave);
   if (enAlias && todos.some((u) => String(u.username).toLowerCase() === String(enAlias[1]).toLowerCase())) return { cuenta: null, yaExistia: true };
   if (!enAlias && todos.some((u) => u.rol === rol && opcionCoincideConUsuarioFormulario(opcion, u, alias))) return { cuenta: null, yaExistia: true };
+  d.nombre = capitalizarNombrePropio(d.nombre);
   const { error, equipos } = validarEquipos(d.equipos);
   if (error) throw new Error(error);
   const username = await usernameLibreFormulario(env, d.nombre, equipos);
@@ -3317,14 +3628,62 @@ async function recorrerRespuestasAltaUsuarios(env, rol, fn) {
     }
   }
 }
-// Al eliminar un usuario: fuera su respuesta del formulario (se reconoce por el nombre y equipo elegidos).
+// Palabras de un nombre de formulario, sin tildes, mayúsculas ni teléfono entre paréntesis.
+function palabrasNombreFormulario(t) {
+  return normalizarOpcionUnica(String(t || "").replace(/\s*\([^)]*\)\s*$/, "")).split(" ").filter(Boolean);
+}
+// Al eliminar un usuario: fuera su respuesta del formulario. Devuelve cuántas respuestas ha borrado.
+// Se busca por niveles y se para en el primero que encuentra algo:
+//  1) vínculo guardado al enviar el formulario (datos._usuario = username): exacto, aunque luego se
+//     hayan cambiado el nombre, el equipo o el rol de la persona;
+//  2) nombre y equipo elegidos = los datos actuales del usuario (respuestas anteriores al vínculo);
+//  3) mismo nombre sin mirar el equipo, solo si hay UNA respuesta candidata (le cambiaron el equipo);
+//  4) un nombre contenido en el otro (le añadieron apellidos) y un equipo en común, solo si hay UNA.
+// Se miran los campos de alta de TODOS los roles: si la persona cambió de rol (o ahora es admin) su
+// respuesta sigue en el campo del rol con el que se dio de alta. Una respuesta vinculada a OTRO
+// usuario nunca se borra por los niveles 2-4.
 async function borrarRespuestasDeUsuarioFormulario(env, u) {
-  if (!u || !FORMULARIO_ALTA_ROLES.includes(u.rol)) return;
-  await recorrerRespuestasAltaUsuarios(env, u.rol, async (rid, datos, ids) => {
-    if (ids.some((c) => typeof datos[c.id] === "string" && opcionCoincideConUsuarioFormulario(datos[c.id], u, c.alias_usuarios))) {
-      await env.DB.prepare("DELETE FROM formularios_respuestas WHERE id = ?").bind(rid).run();
-    }
-  });
+  if (!u) return 0;
+  const porId = new Map();
+  for (const rol of FORMULARIO_ALTA_ROLES) {
+    await recorrerRespuestasAltaUsuarios(env, rol, async (rid, datos, ids) => {
+      const previa = porId.get(rid);
+      if (previa) previa.campos.push(...ids); else porId.set(rid, { rid, datos, campos: [...ids] });
+    });
+  }
+  const todas = [...porId.values()];
+  const username = String(u.username || "").toLowerCase();
+  const vinculo = (c) => (typeof c.datos._usuario === "string" ? c.datos._usuario.toLowerCase() : "");
+  const opciones = (c) => c.campos
+    .map((campo) => ({ campo, valor: c.datos[campo.id] }))
+    .filter((x) => typeof x.valor === "string" && x.valor);
+  let elegidas = username ? todas.filter((c) => vinculo(c) === username) : [];
+  const libres = todas.filter((c) => !vinculo(c) || vinculo(c) === username);
+  if (!elegidas.length) {
+    elegidas = libres.filter((c) => opciones(c).some((x) => opcionCoincideConUsuarioFormulario(x.valor, u, x.campo.alias_usuarios)));
+  }
+  const miNombre = palabrasNombreFormulario(u.nombre);
+  if (!elegidas.length && miNombre.length) {
+    const iguales = libres.filter((c) => opciones(c).some((x) => palabrasNombreFormulario(datosUsuarioDesdeOpcionFormulario(x.valor).nombre).join(" ") === miNombre.join(" ")));
+    if (iguales.length === 1) elegidas = iguales;
+  }
+  if (!elegidas.length && miNombre.length) {
+    const misEquipos = parsearEquipos(u.equipo).map(normalizarOpcionUnica);
+    const misCategorias = parsearCategoriasFijas(u.categorias_fijas);
+    const contenidos = libres.filter((c) => opciones(c).some((x) => {
+      const d = datosUsuarioDesdeOpcionFormulario(x.valor);
+      const suyo = palabrasNombreFormulario(d.nombre);
+      if (!suyo.length) return false;
+      const unoEnOtro = suyo.every((p) => miNombre.includes(p)) || miNombre.every((p) => suyo.includes(p));
+      const equipoComun = d.equipos.some((e) => misEquipos.includes(normalizarOpcionUnica(e))) || d.categorias_fijas.some((k) => misCategorias.includes(k));
+      return unoEnOtro && equipoComun;
+    }));
+    if (contenidos.length === 1) elegidas = contenidos;
+  }
+  for (const c of elegidas) {
+    await env.DB.prepare("DELETE FROM formularios_respuestas WHERE id = ?").bind(c.rid).run();
+  }
+  return elegidas.length;
 }
 async function obtenerFormularioPublico(env, slug) {
   const s = String(slug || "").toLowerCase();
@@ -3488,6 +3847,71 @@ const ACREDITACION_TIPOS_ACREDITACION = [
 // Correo al solicitante cuando un admin aprueba o rechaza su acreditación:
 // resultado, datos de la solicitud y, si se aprueba, dónde y cuándo recogerla.
 // Es un extra: si falla, la resolución ya está guardada.
+// Máximo de caracteres de «dónde/cuándo recogerla» y de las indicaciones/mensaje de una acreditación.
+const ACRED_MAX_INDICACION = 3000;
+// ===== Feedback de revisores (article_feedback) =====
+// Aviso al autor (y coautor) cuando alguien revisa su pieza: la aprueba
+// (publica), la programa o la devuelve a borrador pidiendo cambios, con una
+// nota breve opcional. Tambien admite observaciones sueltas. Ver
+// migracion_article_feedback.sql. NUNCA debe romper el guardado de la noticia.
+const FEEDBACK_TIPOS = ["aprobada", "programada", "cambios", "observacion"];
+const FEEDBACK_NOTA_MAX = 500;
+
+function limpiarNotaFeedback(v) {
+  if (typeof v !== "string") return "";
+  return v.replace(/<[^>]*>/g, "").replace(/\r/g, "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim().slice(0, FEEDBACK_NOTA_MAX);
+}
+
+async function enviarCorreoFeedbackArticulo(env, { destinatario, tipo, titulo, nota, revisorNombre }) {
+  if (!destinatario || !destinatario.email) return false;
+  const etiquetas = { aprobada: "Pieza aprobada", programada: "Pieza programada", cambios: "Cambios solicitados", observacion: "Nueva observación" };
+  const intros = {
+    aprobada: `${revisorNombre} ha aprobado y publicado tu pieza "${titulo}". ¡Enhorabuena!`,
+    programada: `${revisorNombre} ha aprobado tu pieza "${titulo}" y la ha programado para publicarse.`,
+    cambios: `${revisorNombre} ha devuelto tu pieza "${titulo}" a borrador con comentarios para que la revises.`,
+    observacion: `${revisorNombre} te ha dejado una observación sobre "${titulo}".`,
+  };
+  const intro = intros[tipo] || intros.observacion;
+  const colores = { aprobada: "#1b7f3b", programada: "#1f6feb", cambios: "#b7791f", observacion: "#7c3aed" };
+  const bloque = nota
+    ? `<div style="margin:0 0 14px;padding:14px 16px;background:#f5f7fa;border-left:4px solid ${colores[tipo] || "#8a93a3"};border-radius:8px;color:#2b3445;"><strong style="display:block;margin-bottom:4px;">Nota de ${escapeHtmlEmail(revisorNombre)}</strong>${escapeHtmlEmail(nota).replace(/\n/g, "<br>")}</div>`
+    : "";
+  const texto = [`Hola ${destinatario.nombre || ""},`, "", intro, ...(nota ? ["", `Nota de ${revisorNombre}:`, nota] : []), "", `Verlo en el panel: ${SITIO_URL}/admin/panel.html?ir=feedback`, "", "Equipo de ElOtroFútbol"].join("\n");
+  const html = plantillaEmail({
+    etiqueta: etiquetas[tipo] || "Feedback",
+    titulo,
+    tono: tipo === "cambios" ? "error" : "exito",
+    preheader: intro,
+    parrafo: intro,
+    bloqueHtml: bloque,
+    boton: { texto: "Ver mi feedback", url: escapeHtmlEmail(`${SITIO_URL}/admin/panel.html?ir=feedback`) },
+  });
+  return enviarEmailNotificacion(env, { asunto: `${etiquetas[tipo] || "Feedback"}: ${titulo}`, texto, html }, { destinatario: destinatario.email, replyTo: EMAIL_NOTIFICACIONES });
+}
+
+// Crea una fila por destinatario (autor y coautor, sin repetir ni avisar al
+// propio revisor) y manda el correo. Devuelve cuántas filas ha creado.
+async function crearFeedbackArticulo(env, { articulo, destinatariosIds, tipo, nota, revisor }) {
+  try {
+    if (!FEEDBACK_TIPOS.includes(tipo)) return 0;
+    const ids = [...new Set((destinatariosIds || []).filter((x) => Number.isInteger(x) && x > 0 && x !== revisor.uid))];
+    const notaLimpia = limpiarNotaFeedback(nota);
+    let creadas = 0;
+    for (const uid of ids) {
+      await env.DB.prepare(
+        "INSERT INTO article_feedback (article_id, article_titulo, article_slug, destinatario_id, autor_feedback_id, autor_feedback_nombre, tipo, nota) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(articulo.id || null, String(articulo.titulo || "").slice(0, 300), articulo.slug || null, uid, revisor.uid || null, String(revisor.nombre || "Revisión").slice(0, 120), tipo, notaLimpia || null).run();
+      creadas++;
+      const dest = await env.DB.prepare("SELECT nombre, email FROM users WHERE id = ?").bind(uid).first();
+      await enviarCorreoFeedbackArticulo(env, { destinatario: dest, tipo, titulo: articulo.titulo || "Tu pieza", nota: notaLimpia, revisorNombre: revisor.nombre || "Un revisor" });
+    }
+    return creadas;
+  } catch (err) {
+    console.error("feedback (crear):", err && err.message);
+    return 0;
+  }
+}
+
 async function enviarCorreoResolucionAcreditacion(env, a, estado, { recogida, mensaje } = {}) {
   if (!a || !a.email) return false;
   const aprobada = estado === "aprobada";
@@ -3572,6 +3996,91 @@ async function enviarCorreoIndicacionesAcreditacion(env, a, { recogida, mensaje 
   return enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario: a.email, replyTo: EMAIL_NOTIFICACIONES });
 }
 
+// Correo OPCIONAL a la persona cuando su solicitud pasa a "Solicitada": ya se ha pedido al club.
+// Solo informa; no cambia el estado ni promete nada. Es un extra: si falla, el cambio ya está guardado.
+// Correo de despedida y agradecimiento que se envía solo cuando se elimina una
+// cuenta del panel (DELETE /api/users/:id). Se manda DESPUÉS de borrar la cuenta
+// con los datos leídos ANTES (el email ya no existe en la BD). Nunca rompe el
+// borrado: si no hay email entregable o falla el envío, solo se registra en logs.
+function mensajeDespedidaPorRol(rol) {
+  if (rol === "fotografo") {
+    return "Gracias por cada foto, por madrugar, por esperar el gol con la cámara lista y por mirar el fútbol con ojos de verdad. "
+      + "Tus imágenes han dado vida a ElOtroFútbol y han hecho que el fútbol que no sale en las portadas grandes también se vea.";
+  }
+  if (rol === "admin") {
+    return "Gracias por todo lo que has hecho por ElOtroFútbol desde la administración: las decisiones, las horas y las ganas de sacar el medio adelante. "
+      + "Un proyecto como este solo existe gracias a personas como tú.";
+  }
+  if (rol === "redactor") {
+    return "Gracias por cada crónica, cada previa y cada hora dedicada a contar el fútbol que no sale en las portadas grandes. "
+      + "Tus palabras han sido parte de la voz de ElOtroFútbol.";
+  }
+  return "Gracias por el tiempo, las ganas y el cariño que has puesto en ElOtroFútbol. "
+    + "Un medio como este se construye con personas como tú.";
+}
+
+async function enviarCorreoDespedidaCuenta(env, u) {
+  try {
+    if (!u || !emailLectorEntregable(u.email)) return false;
+    const email = String(u.email).trim();
+    const nombre = String(u.nombre || "").trim().split(/\s+/)[0] || "";
+    const asunto = "Gracias por todo, " + (nombre || "de corazón") + " · ElOtroFútbol";
+    const parrafo = (nombre ? "Hola " + nombre + ", t" : "T") + "u cuenta de ElOtroFútbol ha sido eliminada y ya no tienes acceso al panel. "
+      + "Antes de que te vayas queremos decirte algo importante: gracias.";
+    const mensaje = mensajeDespedidaPorRol(u.rol);
+    const texto = [
+      parrafo, "", mensaje, "",
+      "Si crees que ha sido un error o algún día quieres volver, responde a este correo y lo hablamos. Las puertas siempre estarán abiertas.",
+      "", "Un abrazo enorme,", "El equipo de ElOtroFútbol", SITIO_URL,
+    ].join("\n");
+    const bloqueHtml = `<div class="eof-ficha eof-texto" style="margin:18px 0 6px;padding:16px 18px;background:#fdecef;border-left:4px solid #d1132e;border-radius:8px;font-family:Georgia,'Times New Roman',serif;font-size:16px;line-height:1.6;color:#0c1b2e;">`
+      + escapeHtmlEmail(mensaje) + `</div>`
+      + `<p class="eof-texto-suave" style="margin:16px 0 0;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.6;color:#5a6270;">`
+      + `Si crees que ha sido un error o algún día quieres volver, responde a este correo y lo hablamos. Las puertas siempre estarán abiertas.</p>`
+      + `<p class="eof-texto" style="margin:18px 0 0;font-family:Georgia,'Times New Roman',serif;font-size:16px;line-height:1.5;color:#0c1b2e;">Un abrazo enorme,<br><strong>El equipo de ElOtroFútbol</strong></p>`;
+    const html = plantillaEmail({
+      etiqueta: "Hasta pronto",
+      titulo: nombre ? "Gracias por todo, " + nombre : "Gracias por todo",
+      tono: "marca",
+      preheader: "Tu cuenta se ha eliminado. Gracias por formar parte de ElOtroFútbol.",
+      parrafo,
+      bloqueHtml,
+      boton: { texto: "Visitar ElOtroFútbol", url: SITIO_URL },
+      pieHtml: "Este correo se ha enviado porque tu cuenta de ElOtroFútbol ha sido eliminada. Puedes responder a este mensaje si tienes cualquier duda.",
+    });
+    return await enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario: email, replyTo: EMAIL_NOTIFICACIONES });
+  } catch (e) {
+    console.log("Correo de despedida: no se pudo enviar:", e && e.message);
+    return false;
+  }
+}
+
+async function enviarCorreoSolicitadaAcreditacion(env, a) {
+  if (!a || !a.email) return false;
+  const filas = [
+    ["Nombre", a.nombre], ["Equipo", a.equipo], ["Evento", a.tipo_evento],
+    ["Acreditación", a.tipo_acreditacion], ["Jornada y partido", a.jornada_partido],
+  ].filter(([, v]) => v);
+  const asunto = `Hemos pedido tu acreditación al club: ${a.equipo || "ElOtroFútbol"}${a.jornada_partido ? " · " + a.jornada_partido : ""}`;
+  const intro = `Hola ${a.nombre || ""}, ya hemos pedido tu acreditación al club.`;
+  const cierre = "Ahora estamos a la espera de su respuesta y te avisaremos en cuanto la tengamos. Recuerda que la concesión final de la acreditación corresponde siempre al club organizador.";
+  const texto = [
+    intro, "",
+    ...filas.map(([k, v]) => `${k}: ${v}`),
+    "", cierre, "", "Equipo de ElOtroFútbol",
+  ].join("\n");
+  const html = plantillaEmail({
+    etiqueta: "Acreditaciones",
+    titulo: "Hemos pedido tu acreditación al club",
+    preheader: intro,
+    parrafo: intro,
+    filas: filas.map(([k, v]) => ({ etiqueta: k, valor: v })),
+    bloqueHtml: `<p style="margin:4px 0 0;font-size:14px;line-height:1.6;color:#5a6270;">${escapeHtmlEmail(cierre)}</p>`,
+    pieHtml: "Equipo de ElOtroFútbol. Puedes responder a este correo si tienes cualquier duda.",
+  });
+  return enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario: a.email, replyTo: EMAIL_NOTIFICACIONES });
+}
+
 // ---------- Configuración editable del formulario de acreditaciones ----------
 // Un admin puede cambiar textos y listas desde Solicitudes > Formularios > Acreditaciones.
 // Se guarda como JSON en settings (clave "acreditacion_config"); sin nada
@@ -3596,7 +4105,7 @@ const ACREDITACION_CONFIG_DEFECTO = {
     confirmacion: "Confirmación",
   },
   preguntas: {
-    nombre: { etiqueta: "Nombre y apellidos", ayuda: "Tu respuesta", error: "Indica tu nombre y apellidos.", activa: true, obligatoria: true },
+    nombre: { etiqueta: "Nombre completo", ayuda: "Nombre y apellidos", error: "Indica tu nombre completo (nombre y apellidos).", activa: true, obligatoria: true },
     email: { etiqueta: "Correo electrónico", ayuda: "Tu respuesta", error: "Introduce un correo electrónico válido.", activa: true, obligatoria: true },
     dni: { etiqueta: "DNI / NIE", ayuda: "Tu respuesta", error: "Introduce un DNI / NIE válido.", activa: true, obligatoria: true },
     equipo: { etiqueta: "Equipo que deseas cubrir", ayuda: "Elige un equipo…", error: "Elige o escribe el equipo que deseas cubrir.", activa: true, obligatoria: true },
@@ -3658,8 +4167,8 @@ function normalizarConfigAcreditacion(raw) {
     aviso: texto(r.aviso, d.aviso, 800),
     confirmacion: texto(r.confirmacion, d.confirmacion, 600),
     gracias: texto(r.gracias, d.gracias, 600),
-    recogida: typeof r.recogida === "string" ? r.recogida.replace(/\r/g, "").trim().slice(0, 600) : d.recogida,
-    instrucciones_aprobada: typeof r.instrucciones_aprobada === "string" ? r.instrucciones_aprobada.replace(/\r/g, "").trim().slice(0, 800) : d.instrucciones_aprobada,
+    recogida: typeof r.recogida === "string" ? r.recogida.replace(/\r/g, "").trim().slice(0, ACRED_MAX_INDICACION) : d.recogida,
+    instrucciones_aprobada: typeof r.instrucciones_aprobada === "string" ? r.instrucciones_aprobada.replace(/\r/g, "").trim().slice(0, ACRED_MAX_INDICACION) : d.instrucciones_aprobada,
     eventos,
     evento_otro: eventoOtro,
     acreditaciones,
@@ -3674,6 +4183,13 @@ async function obtenerConfigAcreditacion(env) {
   } catch {}
   return normalizarConfigAcreditacion(null);
 }
+// Estados de una solicitud: pendiente (llegó) -> solicitada (pedida al club) -> aprobada / rechazada;
+// cancelada = partido suspendido o la persona ya no va. Control interno: la concesión real la decide el club.
+const ACRED_ESTADOS_VALIDOS = ["pendiente", "solicitada", "aprobada", "rechazada", "cancelada"];
+function acredFechaPartidoValida(v) {
+  const t = String(v || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(t) && !isNaN(Date.parse(t)) ? t : "";
+}
 // Limpieza y validación compartida por la edición y la importación del panel
 // (el formulario público tiene su propia validación, más estricta).
 function limpiarDatosAcreditacionAdmin(d, { estricto } = {}) {
@@ -3687,6 +4203,7 @@ function limpiarDatosAcreditacionAdmin(d, { estricto } = {}) {
     tipo_acreditacion: limpiar(d.tipo_acreditacion, 200),
     funciones: (d.funciones ? String(d.funciones) : "").trim().slice(0, 2000),
     jornada_partido: limpiar(d.jornada_partido, 500),
+    fecha_partido: acredFechaPartidoValida(d.fecha_partido),
   };
   if (!out.nombre) return { error: "Falta el nombre" };
   if (!emailValido(out.email)) return { error: "Correo no válido" };
@@ -3833,12 +4350,21 @@ function sanearHtmlArticulo(html) {
 // abierta indefinidamente para una sesión revocada de verdad.
 const TOLERANCIA_SESION_NO_REPLICADA_SEGUNDOS = 5 * 60;
 
-// ¿Sigue existiendo la cuenta? Se usa en requireAuth cuando la fila de la
-// sesión no está (cuenta eliminada desde "Usuarios", réplica con retraso...)
-// para no dar por buena una sesión de alguien que ya no existe.
-async function usuarioSigueExistiendo(env, uid) {
-  const fila = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(uid).first();
-  return !!fila;
+// Estado ACTUAL de la cuenta (rol y activo), leído de la base. Se usa en
+// requireAuth cuando no hay fila de sesión que traiga ya esos datos (cuenta
+// eliminada desde "Usuarios", réplica con retraso, JWT antiguo sin "sid").
+async function cargarEstadoUsuario(env, uid) {
+  return (await env.DB.prepare("SELECT id, rol, activo FROM users WHERE id = ?").bind(uid).first()) || null;
+}
+
+// El JWT lleva el rol con el que se emitió, pero un admin puede cambiar el
+// rol o desactivar la cuenta después. Esta función es la que manda: devuelve
+// null si la cuenta no existe o está desactivada, y si no, deja en
+// payload.rol el rol ACTUAL de la base (no el del token).
+function aplicarEstadoUsuario(payload, estado) {
+  if (!estado || Number(estado.activo) !== 1) return null;
+  if (estado.rol) payload.rol = estado.rol;
+  return payload;
 }
 
 async function requireAuth(request, env, url) {
@@ -3869,12 +4395,24 @@ async function requireAuth(request, env, url) {
     const sesion = (sesionEnCache && sesionEnCache.exp > Date.now())
       ? await sesionEnCache.valor
       : await memoCorta(claveSesion, 20000, async () => {
+          // Se une con users para traer rol y activo en la MISMA consulta (y
+          // en la misma caché de 20 s): así un cambio de rol o una cuenta
+          // desactivada se nota en segundos, no cuando caduca el JWT (12 h).
           const fila = await env.DB.prepare(
-            "SELECT id, last_seen_at FROM sessions WHERE id = ? AND user_id = ? AND revoked_at IS NULL"
+            `SELECT s.id, s.last_seen_at, s.revoked_at, u.rol AS usuario_rol, u.activo AS usuario_activo
+             FROM sessions s JOIN users u ON u.id = s.user_id
+             WHERE s.id = ? AND s.user_id = ?`
           ).bind(payload.sid, payload.uid).first();
-          if (!fila) CACHE_CORTA.delete(claveSesion); // no se cachea lo no encontrado
+          // No se cachea lo no encontrado ni lo revocado.
+          if (!fila || fila.revoked_at) CACHE_CORTA.delete(claveSesion);
           return fila;
         });
+    // Sesión que SÍ existe pero está revocada (cerrada desde "Mis sesiones",
+    // cambio de rol, cuenta desactivada, contraseña restablecida...): fuera ya.
+    // La tolerancia de más abajo es solo para la fila que NO existe todavía
+    // en esta réplica; antes, una sesión revocada con un JWT de menos de 5
+    // minutos se aceptaba igualmente porque ambos casos se trataban igual.
+    if (sesion && sesion.revoked_at) return null;
     if (!sesion) {
       // TOLERANCIA_SESION_NO_REPLICADA_SEGUNDOS: en el Worker secundario
       // (Railway/Postgres), "sessions" no es la tabla original sino una
@@ -3902,8 +4440,10 @@ async function requireAuth(request, env, url) {
       if (emitidoHaceSegundos > TOLERANCIA_SESION_NO_REPLICADA_SEGUNDOS) return null;
       // La tolerancia es solo para el hueco de replicación de una sesión que
       // SÍ existe. Si la cuenta ha sido eliminada, la sesión se cierra ya.
-      if (!(await usuarioSigueExistiendo(env, payload.uid))) return null;
+      if (!aplicarEstadoUsuario(payload, await cargarEstadoUsuario(env, payload.uid))) return null;
     } else {
+      // Rol y activo actuales de la cuenta (vienen en la fila de sesión).
+      if (!aplicarEstadoUsuario(payload, { rol: sesion.usuario_rol, activo: sesion.usuario_activo })) return null;
       // No bloqueamos la respuesta por esto: es solo para que la lista de
       // "Mis sesiones" muestre cuándo se ha usado cada una por última vez.
       // Throttle a 5 minutos: sin esto, cada request autenticado (que puede
@@ -3918,9 +4458,10 @@ async function requireAuth(request, env, url) {
         sesion.last_seen_at = new Date().toISOString().slice(0, 19).replace("T", " "); // evita repetir el UPDATE mientras la fila está en caché
       }
     }
-  } else if (!(await usuarioSigueExistiendo(env, payload.uid))) {
+  } else if (!aplicarEstadoUsuario(payload, await cargarEstadoUsuario(env, payload.uid))) {
     // JWT antiguo sin "sid": no hay fila de sesión que borrar, así que la
-    // única forma de cerrarlo al eliminar la cuenta es comprobar que existe.
+    // única forma de cerrarlo al eliminar o desactivar la cuenta es leer su
+    // estado (y de paso su rol actual).
     return null;
   }
   return payload;
@@ -3958,9 +4499,10 @@ async function requireAuthTienda(request, env) {
       if (sesion && sesion.revoked_at) return null;
     }
     const usuario = await env.DB.prepare(
-      "SELECT id FROM users WHERE id = ? AND activo = 1"
+      "SELECT id, rol FROM users WHERE id = ? AND activo = 1"
     ).bind(payload.uid).first();
     if (!usuario) return null;
+    if (usuario.rol) payload.rol = usuario.rol; // rol actual, no el del token
   } catch (err) {
     console.error("requireAuthTienda: no se pudo comprobar la sesión/usuario:", err.message);
     return null;
@@ -4353,8 +4895,68 @@ async function dispositivoConfianzaValido(env, user, token) {
   if (!p || p.td !== user.id || p.uid || p.rid || p.fa2 || !p.f) return false;
   return comparacionConstante(p.f, await huellaDispositivoConfianza(user));
 }
+// ---------- PRIMER ACCESO (primer inicio de sesión real) ----------
+// Antes se deducía de "el usuario no tiene correo guardado" (el correo se
+// pedía en el primer inicio de sesión). Ahora el correo ya se guarda al crear
+// la cuenta, así que esa señal ya no vale: el primer acceso tiene su propia
+// columna, users.primer_acceso_at (NULL = todavía no ha iniciado sesión nunca).
+// Se rellena SOLO al abrir una sesión de login (contraseña correcta y, si
+// procede, 2FA superado), nunca al crear la cuenta ni al guardar el correo.
+let _columnaPrimerAccesoLista = null;
+async function asegurarColumnaPrimerAcceso(env) {
+  if (_columnaPrimerAccesoLista) return _columnaPrimerAccesoLista;
+  _columnaPrimerAccesoLista = (async () => {
+    try {
+      await env.DB.prepare("SELECT primer_acceso_at FROM users LIMIT 1").first();
+      return true;
+    } catch (err) {
+      if (!/no such column|does not exist|undefined column/i.test(String((err && err.message) || err))) throw err;
+    }
+    console.warn("[PRIMER ACCESO] Falta users.primer_acceso_at: se crea ahora (migración automática).");
+    try {
+      await env.DB.prepare("ALTER TABLE users ADD COLUMN primer_acceso_at TEXT").run();
+    } catch (err) {
+      // Otra petición (u otro backend) pudo crearla justo antes: no es un fallo.
+      if (!/duplicate column|already exists/i.test(String((err && err.message) || err))) throw err;
+    }
+    // Quien ya tiene alguna sesión registrada ya había entrado antes: se le
+    // pone como primer acceso la fecha de su sesión más antigua.
+    await env.DB.prepare(
+      "UPDATE users SET primer_acceso_at = (SELECT CAST(MIN(s.created_at) AS TEXT) FROM sessions s WHERE s.user_id = users.id) WHERE primer_acceso_at IS NULL"
+    ).run();
+    return true;
+  })();
+  try {
+    return await _columnaPrimerAccesoLista;
+  } catch (err) {
+    _columnaPrimerAccesoLista = null; // reintentar en la próxima petición
+    throw err;
+  }
+}
+
+// Marca el primer acceso del usuario. Devuelve true solo si ESTE inicio de
+// sesión es el primero. Hay que llamarla ANTES de crearSesion() (la migración
+// automática se apoya en la tabla sessions para saber quién ya había entrado).
+// Nunca rompe el login: si algo falla, se deja pasar y se registra en consola.
+async function marcarPrimerAcceso(env, user) {
+  try {
+    await asegurarColumnaPrimerAcceso(env);
+    if (user.primer_acceso_at) return false; // camino normal: sin consultas extra
+    // El SELECT * del login pudo ser anterior a crear la columna: se relee.
+    const fila = await env.DB.prepare("SELECT primer_acceso_at FROM users WHERE id = ?").bind(user.id).first();
+    if (fila && fila.primer_acceso_at) { user.primer_acceso_at = fila.primer_acceso_at; return false; }
+    const ahora = new Date().toISOString();
+    await env.DB.prepare("UPDATE users SET primer_acceso_at = ? WHERE id = ? AND primer_acceso_at IS NULL").bind(ahora, user.id).run();
+    user.primer_acceso_at = ahora;
+    return true;
+  } catch (err) {
+    console.error("[PRIMER ACCESO] No se pudo marcar el primer acceso:", err && err.message);
+    return false;
+  }
+}
+
 function usuarioParaRespuestaLogin(user) {
-  return { id: user.id, username: user.username, nombre: user.nombre, rol: user.rol, nivel: user.rol === "admin" ? NIVEL_MAXIMO : (user.nivel || 1), email: user.email || null, avatar_url: user.avatar_url || null, avatar_foco: user.avatar_foco || null, categorias_fijas: parsearCategoriasFijas(user.categorias_fijas) };
+  return { id: user.id, username: user.username, nombre: user.nombre, rol: user.rol, nivel: nivelEfectivoUsuario(user), email: user.email || null, avatar_url: user.avatar_url || null, avatar_foco: user.avatar_foco || null, categorias_fijas: parsearCategoriasFijas(user.categorias_fijas) };
 }
 
 // Crea la fila de sesión en la BD y el JWT correspondiente (con el "sid"
@@ -4439,9 +5041,10 @@ async function requireAuthSubida(request, env) {
       if (sesion && sesion.revoked_at) return null;
     }
     const usuario = await env.DB.prepare(
-      "SELECT id FROM users WHERE id = ? AND activo = 1"
+      "SELECT id, rol FROM users WHERE id = ? AND activo = 1"
     ).bind(payload.uid).first();
     if (!usuario) return null;
+    if (usuario.rol) payload.rol = usuario.rol; // rol actual, no el del token
   } catch (err) {
     console.error("requireAuthSubida: no se pudo comprobar la sesión/usuario:", err.message);
     return null;
@@ -4872,6 +5475,20 @@ function esFalloDeCuentaCloudinary(status, mensaje) {
   return /exceed|limit/.test(m);
 }
 
+// ¿El fallo es de CUOTA/CUENTA (sin espacio ni créditos, desactivada, credenciales
+// rechazadas) y no del archivo ni un corte pasajero? Solo estos casos hacen que
+// una cuenta se deje de probar un rato (ver CUENTAS_CLOUDINARY_SIN_CUPO).
+function esCuotaCloudinaria(status, mensaje) {
+  if (status === 401 || status === 403 || status === 420) return true;
+  return /quota|credit|storage|disabled|blocked|suspended|usage|plan limit/i.test(mensaje || "");
+}
+// Cuenta -> momento en que se detectó que no tenía cupo. Mientras no pasen 10 min,
+// las subidas van directas a la siguiente cuenta en vez de gastar una petición
+// fallida por foto en la que está llena. La última cuenta nunca se salta. (Memoria
+// del proceso: si se reinicia, simplemente se vuelve a descubrir.)
+const CUENTAS_CLOUDINARY_SIN_CUPO = new Map();
+const PAUSA_CUENTA_SIN_CUPO_MS = 10 * 60 * 1000;
+
 // Sube un archivo a UNA cuenta concreta de Cloudinary sin ninguna
 // transformación (se conserva la calidad original).
 async function subirACloudinaryEnCuenta(cuenta, fileBytes, mimeType, nombreArchivo) {
@@ -4884,10 +5501,25 @@ async function subirACloudinaryEnCuenta(cuenta, fileBytes, mimeType, nombreArchi
   form.append("timestamp", timestamp.toString());
   form.append("signature", signature);
 
-  const resp = await fetch(`https://api.cloudinary.com/v1_1/${cuenta.cloudName}/auto/upload`, {
-    method: "POST",
-    body: form,
-  });
+  // Sin tiempo límite, una conexión colgada con Cloudinary dejaba la subida
+  // esperando hasta que algo más arriba la cortaba sin dar ningún motivo.
+  const controlador = new AbortController();
+  const temporizador = setTimeout(() => controlador.abort(), 55000);
+  let resp;
+  try {
+    resp = await fetch(`https://api.cloudinary.com/v1_1/${cuenta.cloudName}/auto/upload`, {
+      method: "POST",
+      body: form,
+      signal: controlador.signal,
+    });
+  } catch (e) {
+    const esTiempo = !!(e && e.name === "AbortError");
+    const errRed = new Error(`Cloudinary (${cuenta.cloudName}) no responde: ${esTiempo ? "tiempo de espera agotado" : (e && e.message) || "error de red"}`);
+    errRed.esTiempoAgotado = esTiempo;
+    throw errRed;
+  } finally {
+    clearTimeout(temporizador);
+  }
   if (!resp.ok) {
     const cuerpoError = await resp.text();
     console.error(`Cloudinary (${cuenta.cloudName}) respondió ${resp.status} al subir "${nombreArchivo || "(sin nombre)"}" (${mimeType || "tipo desconocido"}): ${cuerpoError}`);
@@ -4908,7 +5540,7 @@ async function subirACloudinaryEnCuenta(cuenta, fileBytes, mimeType, nombreArchi
   // momento, sin perder la posibilidad de pedir luego otras
   // transformaciones sobre esa misma URL en el resto del sitio.
   let url = data.secure_url;
-  const esHeic = mimeType === "image/heic" || mimeType === "image/heif" || /\.(heic|heif)$/i.test(nombreArchivo || "");
+  const esHeic = mimeType === "image/heic" || mimeType === "image/heif" || mimeType === "image/tiff" || mimeType === "image/bmp" || /\.(heic|heif|tiff?|bmp)$/i.test(nombreArchivo || "");
   if (esHeic) {
     const marca = "/upload/";
     const i = url.indexOf(marca);
@@ -4926,14 +5558,32 @@ async function subirACloudinary(env, fileBytes, mimeType, nombreArchivo) {
   if (!cuentas.length) throw new Error("Cloudinary no está configurado (faltan CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET)");
   let ultimoError;
   for (let i = 0; i < cuentas.length; i++) {
-    try {
-      return await subirACloudinaryEnCuenta(cuentas[i], fileBytes, mimeType, nombreArchivo);
-    } catch (err) {
-      ultimoError = err;
-      const hayOtraCuenta = i < cuentas.length - 1;
-      if (!hayOtraCuenta || !esFalloDeCuentaCloudinary(err.cloudinaryStatus, err.cloudinaryMensaje)) throw err;
-      console.warn(`Cloudinary: la cuenta "${cuentas[i].cloudName}" no puede aceptar la subida (${err.cloudinaryStatus ?? "sin respuesta"}); se prueba con la cuenta "${cuentas[i + 1].cloudName}"`);
+    const desde = CUENTAS_CLOUDINARY_SIN_CUPO.get(cuentas[i].cloudName);
+    if (i < cuentas.length - 1 && desde && Date.now() - desde < PAUSA_CUENTA_SIN_CUPO_MS) continue;
+    // Fallos PASAJEROS (corte de red, 429, 5xx de Cloudinary): se reintenta una
+    // vez en la misma cuenta antes de darla por mala. Un tiempo agotado no se
+    // reintenta aquí (ya ha tardado un minuto): se pasa a la otra cuenta.
+    for (let intento = 1; intento <= 2; intento++) {
+      try {
+        const subidaOk = await subirACloudinaryEnCuenta(cuentas[i], fileBytes, mimeType, nombreArchivo);
+        CUENTAS_CLOUDINARY_SIN_CUPO.delete(cuentas[i].cloudName);
+        return subidaOk;
+      } catch (err) {
+        ultimoError = err;
+        const st = err.cloudinaryStatus;
+        const pasajero = !err.esTiempoAgotado && (st === undefined || st === 429 || st >= 500);
+        if (pasajero && intento < 2) {
+          await new Promise((r) => setTimeout(r, 500));
+          continue;
+        }
+        break;
+      }
     }
+    const hayOtraCuenta = i < cuentas.length - 1;
+    const err = ultimoError;
+    if (esCuotaCloudinaria(err.cloudinaryStatus, err.cloudinaryMensaje)) CUENTAS_CLOUDINARY_SIN_CUPO.set(cuentas[i].cloudName, Date.now());
+    if (!hayOtraCuenta || !esFalloDeCuentaCloudinary(err.cloudinaryStatus, err.cloudinaryMensaje)) throw err;
+    console.warn(`Cloudinary: la cuenta "${cuentas[i].cloudName}" no puede aceptar la subida (${err.cloudinaryStatus ?? "sin respuesta"}); se prueba con la cuenta "${cuentas[i + 1].cloudName}"`);
   }
   throw ultimoError;
 }
@@ -4946,7 +5596,7 @@ async function subirACloudinary(env, fileBytes, mimeType, nombreArchivo) {
 // los formatos admitidos, los límites de tamaño y los mensajes de error
 // son siempre los mismos en toda la web en vez de estar duplicados (y
 // potencialmente desincronizados) en cada sitio donde se sube algo.
-const TIPOS_IMAGEN_PERMITIDOS = ["image/jpeg", "image/png", "image/webp", "image/gif", "image/avif", "image/heic", "image/heif"];
+const TIPOS_IMAGEN_PERMITIDOS = ["image/jpeg", "image/png", "image/webp", "image/gif", "image/avif", "image/heic", "image/heif", "image/bmp", "image/tiff"];
 const TIPOS_VIDEO_PERMITIDOS = ["video/mp4", "video/quicktime", "video/webm", "video/x-matroska", "video/mpeg"];
 // Las imágenes no tienen límite de tamaño propio: Cloudinary y el límite
 // de payload de Workers son los únicos topes reales.
@@ -4960,11 +5610,33 @@ const LIMITE_VIDEO_BYTES = 90 * 1024 * 1024; // 90 MB (el plan gratis de Workers
 // se podría subir.
 function extensionImagenPermitida(nombreArchivo) {
   const ext = (nombreArchivo || "").split(".").pop().toLowerCase();
-  return ["jpg", "jpeg", "png", "webp", "gif", "avif", "heic", "heif"].includes(ext);
+  return ["jpg", "jpeg", "jpe", "jfif", "png", "webp", "gif", "avif", "heic", "heif", "bmp", "tif", "tiff"].includes(ext);
+}
+
+// Algunos navegadores/móviles mandan variantes no estándar del tipo MIME
+// ("image/jpg", "image/pjpeg"...). Se normalizan antes de validar para no
+// rechazar una foto perfectamente válida por el nombre de su tipo.
+function normalizarMimeImagen(mimeType) {
+  const m = (mimeType || "").toLowerCase().trim();
+  if (m === "image/jpg" || m === "image/pjpeg" || m === "image/jfif" || m === "image/pjpeg") return "image/jpeg";
+  if (m === "image/x-ms-bmp" || m === "image/x-bmp" || m === "image/x-windows-bmp") return "image/bmp";
+  if (m === "image/x-tiff" || m === "image/tif") return "image/tiff";
+  if (m === "image/x-png") return "image/png";
+  if (m === "image/heic-sequence") return "image/heic";
+  if (m === "image/heif-sequence") return "image/heif";
+  return m;
 }
 
 function esImagenPermitida(mimeType) {
-  return TIPOS_IMAGEN_PERMITIDOS.includes(mimeType);
+  return TIPOS_IMAGEN_PERMITIDOS.includes(normalizarMimeImagen(mimeType));
+}
+
+// Igual que con las fotos: un vídeo (típico: .mov de iPhone) puede llegar con
+// el tipo MIME vacío. El panel ya lo admitía por extensión, pero el servidor
+// lo rechazaba con "Solo se admiten fotos o vídeos"; ahora también.
+function extensionVideoPermitida(nombreArchivo) {
+  const ext = (nombreArchivo || "").split(".").pop().toLowerCase();
+  return ["mp4", "mov", "webm", "mkv", "mpeg", "mpg"].includes(ext);
 }
 
 // Devuelve un mensaje de error si el archivo no es válido, o null si se
@@ -4981,13 +5653,14 @@ function validarArchivoSubida(file, { permitirVideo = false } = {}) {
   if ((!file.type || file.type === "application/octet-stream") && extensionImagenPermitida(file.name)) {
     return null;
   }
-  if (permitirVideo && TIPOS_VIDEO_PERMITIDOS.includes(file.type)) {
+  const tipoNoFiable = !file.type || file.type === "application/octet-stream";
+  if (permitirVideo && (TIPOS_VIDEO_PERMITIDOS.includes(file.type) || (tipoNoFiable && extensionVideoPermitida(file.name)))) {
     if (file.size > LIMITE_VIDEO_BYTES) return "El vídeo no puede superar los 90 MB";
     return null;
   }
   return permitirVideo
-    ? "Solo se admiten fotos (JPG, PNG, WEBP, GIF, AVIF, HEIC/HEIF) o vídeos (MP4, MOV, WEBM, MKV, MPEG)"
-    : "Solo se admiten imágenes en un formato compatible (JPG, PNG, WEBP, GIF, AVIF o HEIC/HEIF)";
+    ? "Solo se admiten fotos (JPG, JFIF, PNG, WEBP, GIF, AVIF, HEIC/HEIF, BMP, TIFF) o vídeos (MP4, MOV, WEBM, MKV, MPEG)"
+    : "Solo se admiten imágenes en un formato compatible (JPG, JFIF, PNG, WEBP, GIF, AVIF, HEIC/HEIF, BMP o TIFF)";
 }
 
 // Valida el archivo y, si es correcto, lo sube a Cloudinary tal cual
@@ -5007,7 +5680,7 @@ function validarArchivoSubida(file, { permitirVideo = false } = {}) {
 // en memoria a la vez podía agotar la memoria del Worker (límite de
 // 128 MB) y tirar la petición entera con un 502 sin ningún mensaje de
 // error legible.
-async function procesarSubidaArchivo(env, file, opciones, fileBytes) {
+async function procesarSubidaArchivo(env, file, opciones, fileBytes, hashPrecalculado) {
   const errorValidacion = validarArchivoSubida(file, opciones);
   if (errorValidacion) {
     const error = new Error(errorValidacion);
@@ -5018,7 +5691,10 @@ async function procesarSubidaArchivo(env, file, opciones, fileBytes) {
   const subida = await subirACloudinary(env, bytes, file.type, file.name);
   // El hash se calcula sobre los bytes ya leídos, así no hace falta
   // volver a leer el archivo entero una segunda vez.
-  subida.hash = await sha256Hex(bytes);
+  // Si quien llama ya calculó el hash (POST /api/media lo hace para detectar
+  // duplicados), se reutiliza: recalcular el SHA-256 de todo el archivo era
+  // CPU repetida en cada foto de la tanda.
+  subida.hash = hashPrecalculado || await sha256Hex(bytes);
   return subida;
 }
 
@@ -5046,6 +5722,112 @@ async function selectPorLotesDeIds(env, ids, construirSql) {
 async function sha256Hex(arrayBuffer) {
   const digest = await crypto.subtle.digest("SHA-256", arrayBuffer);
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ---------- Galería de partido: vínculo robusto de una foto subida ----------
+// Antes, si el INSERT en match_gallery fallaba (la columna "equipo" aún sin
+// migrar en una de las dos bases de datos, un corte pasajero...), el error se
+// tragaba en silencio: la foto quedaba subida pero FUERA de la galería del
+// partido y nadie se enteraba. Ahora:
+//   - se reintenta ante fallos pasajeros,
+//   - si falta la columna "equipo" se vincula igualmente sin ella,
+//   - "ya estaba vinculada" cuenta como éxito (es idempotente),
+//   - y el resultado (true/false) se devuelve al panel, que lo comprueba.
+async function vincularMediaAGaleriaPartidoBase(env, resultId, mediaId, uid, equipo) {
+  const esUnico = (m) => /unique|duplicate key/i.test(m || "");
+  const faltaEquipo = (m) => /no such column|no column named|column .* does not exist/i.test(m || "") && /equipo/i.test(m || "");
+  for (let intento = 1; intento <= 3; intento++) {
+    try {
+      const maxFila = await env.DB.prepare(
+        "SELECT COALESCE(MAX(orden), -1) AS max_orden FROM match_gallery WHERE result_id = ?"
+      ).bind(resultId).first();
+      const siguiente = (maxFila?.max_orden ?? -1) + 1;
+      try {
+        await env.DB.prepare(
+          `INSERT INTO match_gallery (result_id, media_id, orden, vinculado_por_id, equipo) VALUES (?, ?, ?, ?, ?)`
+        ).bind(resultId, mediaId, siguiente, uid, equipo || null).run();
+      } catch (err) {
+        if (esUnico(err.message)) return true;
+        if (!faltaEquipo(err.message)) throw err;
+        await env.DB.prepare(
+          `INSERT INTO match_gallery (result_id, media_id, orden, vinculado_por_id) VALUES (?, ?, ?, ?)`
+        ).bind(resultId, mediaId, siguiente, uid).run();
+      }
+      return true;
+    } catch (err) {
+      if (esUnico(err.message)) return true;
+      console.error(`No se pudo vincular la foto ${mediaId} a la galería del partido ${resultId} (intento ${intento}/3):`, err.message);
+      if (intento < 3) await new Promise((r) => setTimeout(r, 250 * intento));
+    }
+  }
+  return false;
+}
+
+// ---------- Galería de partido: PORTADA ----------
+// Cada galería de partido tiene una foto de portada elegida por quien la hace
+// (match_gallery.es_portada = 1; como mucho una por partido). Es obligatoria al
+// crear la galería desde el panel (ver "Subir contenido" y "Galería de partido"
+// en admin.js); aquí abajo vive lo que garantiza la coherencia en el servidor.
+//
+// Vincula la foto a la galería y, si se pide, la deja como portada.
+async function vincularMediaAGaleriaPartido(env, resultId, mediaId, uid, equipo, esPortada = false) {
+  const ok = await vincularMediaAGaleriaPartidoBase(env, resultId, mediaId, uid, equipo);
+  if (ok && esPortada) await fijarPortadaGaleria(env, resultId, mediaId);
+  return ok;
+}
+
+// Deja `mediaId` como portada de la galería del partido y desmarca el resto, en
+// UNA sola sentencia: nunca quedan dos portadas ni una a medias. Devuelve false
+// (sin tirar nada abajo) si la columna aún no está migrada o falla la BD: las
+// lecturas públicas caen entonces en la primera foto de la galería.
+async function fijarPortadaGaleria(env, resultId, mediaId) {
+  try {
+    await env.DB.prepare(
+      "UPDATE match_gallery SET es_portada = CASE WHEN media_id = ? THEN 1 ELSE 0 END WHERE result_id = ?"
+    ).bind(mediaId, resultId).run();
+    return true;
+  } catch (err) {
+    console.error(`No se pudo fijar la portada de la galería del partido ${resultId} (¿falta migracion_galeria_portada.sql?):`, err.message);
+    return false;
+  }
+}
+
+// ¿Puede esta foto ser la portada de la galería de este partido? Tiene que estar
+// en ella, ser una FOTO (no un vídeo) y ser pública (una privada no se ve en la
+// web). Devuelve { ok: true } o { error, status }.
+async function validarPortadaGaleria(env, resultId, mediaId) {
+  let filas;
+  try {
+    ({ results: filas } = await consultaConAlternativas(env, [
+      `SELECT m.tipo, m.visibilidad FROM match_gallery mg JOIN media m ON m.id = mg.media_id WHERE mg.result_id = ? AND mg.media_id = ?`,
+      `SELECT m.tipo, NULL AS visibilidad FROM match_gallery mg JOIN media m ON m.id = mg.media_id WHERE mg.result_id = ? AND mg.media_id = ?`,
+    ], [resultId, mediaId]));
+  } catch (err) {
+    return { error: "No se pudo comprobar la foto elegida: " + err.message, status: 500 };
+  }
+  const fila = (filas || [])[0];
+  if (!fila) return { error: "Esa foto no está en la galería de este partido", status: 404 };
+  if (fila.tipo && fila.tipo !== "foto") return { error: "La portada tiene que ser una foto, no un vídeo", status: 400 };
+  if (fila.visibilidad === "privado") return { error: "La portada tiene que ser una foto pública: esta está marcada como privada", status: 400 };
+  return { ok: true };
+}
+
+// slugPartidoUnico puede fallar por un corte pasajero: no debe tumbar la
+// respuesta de una subida que ya se guardó bien. Devuelve null si no hay forma.
+async function slugPartidoSeguro(env, resultado) {
+  for (let intento = 1; intento <= 2; intento++) {
+    try { return await slugPartidoUnico(env, resultado); }
+    catch (err) {
+      console.error("slugPartidoUnico falló (se sigue sin enlace público):", err.message);
+      if (intento < 2) await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+  return null;
+}
+
+// ¿Un error de base de datos parece pasajero (corte, bloqueo, saturación)?
+function esErrorTransitorioBD(err) {
+  return /network|timeout|timed out|temporar|overload|busy|locked|reset|unavailable|too many|connection|ECONN|EPIPE/i.test((err && err.message) || "");
 }
 
 // ---------- Contenido MUY pesado: enlace externo manual (MediaFire, Drive, Mega...) ----------
@@ -5187,6 +5969,61 @@ const POSICIONES_TWEET_VALIDAS = ["inicio", "personalizada", "galeria"];
 // disposición visual concreta de cada plantilla la decide el CSS
 // (public/css/style.css, .collage-<plantilla>), no el backend.
 const PLANTILLAS_COLLAGE_VALIDAS = ["2-horizontal", "2-vertical", "3-una-grande", "3-fila", "4-cuadricula"];
+
+// ---------- Regla: nunca dos fotos seguidas ----------
+// En el cuerpo de una noticia no puede haber dos fotos (ni una foto y un
+// collage) pegadas una a otra sin texto entre ellas. Pasa cuando dos
+// fotos comparten hueco: las dos al "inicio", las dos tras el mismo
+// párrafo, o una foto de "inicio" justo debajo de la portada que ya se
+// muestra arriba como foto de cabecera. La primera se queda donde está y
+// las demás pasan a la galería final (posicion "galeria"), sin perderse.
+// Un collage cuenta como UN solo bloque (todas sus filas comparten
+// "grupo"). Los tweets/posts no cuentan como foto.
+// Si la noticia lleva marcador de partido (hayMarcador), la foto de
+// cabecera pasa a la galería final al pintarla (ver public/noticia.html)
+// y entonces no queda pegada al inicio del texto: no cuenta.
+// Se aplica sobre el array CRUDO que manda el panel, ANTES de
+// normalizarImagenes (que descarta "grupo" en cuanto la posición no es
+// "collage"). Devuelve un array nuevo; no modifica el original.
+function separarFotosSeguidas(imagenes, portadaUrl, hayMarcador) {
+  if (!Array.isArray(imagenes)) return imagenes;
+  const esFoto = (f) => f && typeof f === "object" && f.tipo !== "tweet" && typeof f.url === "string" && f.url.trim() !== "";
+  const enTexto = (f) => ["inicio", "personalizada", "medio", "final"].includes(f.posicion);
+  const hueco = (f) => {
+    if (f.posicion === "inicio") return "inicio";
+    if (["personalizada", "medio", "final", "collage"].includes(f.posicion)) {
+      return "p" + Math.max(1, parseInt(f.trasParrafo, 10) || 1);
+    }
+    return null;
+  };
+  const portada = typeof portadaUrl === "string" ? portadaUrl.trim() : "";
+  const ocupados = new Set();
+  // La portada que NO va dentro del texto se pinta arriba del todo (cabecera)
+  // y el cuerpo empieza justo debajo: ocupa el hueco "inicio".
+  const filaCabecera = portada
+    ? imagenes.find((f) => esFoto(f) && f.url.trim() === portada && !enTexto(f) && !f.grupo)
+    : null;
+  if (!hayMarcador && portada && (filaCabecera || !imagenes.some((f) => esFoto(f) && f.url.trim() === portada))) {
+    ocupados.add("inicio");
+  }
+  const decididoGrupo = new Map();
+  return imagenes.map((f) => {
+    if (!esFoto(f) || f === filaCabecera) return f;
+    const h = hueco(f);
+    if (h === null) return f;
+    let mover;
+    if (f.grupo && decididoGrupo.has(f.grupo)) {
+      mover = decididoGrupo.get(f.grupo);
+    } else {
+      mover = ocupados.has(h);
+      if (!mover) ocupados.add(h);
+      if (f.grupo) decididoGrupo.set(f.grupo, mover);
+    }
+    if (!mover) return f;
+    const { trasParrafo, ...resto } = f;
+    return { ...resto, posicion: "galeria" };
+  });
+}
 
 // Normaliza el array de fotos de una noticia/crónica. Admite tanto el
 // formato antiguo (array de URLs en texto plano) como el nuevo, con un
@@ -5639,6 +6476,32 @@ async function remapearSlugsFusion(env, articulos) {
   return salida;
 }
 
+// Ficha técnica de una crónica: solo se aceptan las claves conocidas, con texto
+// recortado y límites de tamaño (el panel ya la manda normalizada, pero la API
+// es pública para cualquier redactor: no se guarda nada que no sea texto).
+// Devuelve el objeto limpio o null si queda vacío.
+const FICHA_CAMPOS_TEXTO = ["competicion", "jornada", "fecha_hora", "estadio", "ciudad", "asistencia", "arbitro", "mvp"];
+function normalizarFichaTecnica(f) {
+  if (!f || typeof f !== "object" || Array.isArray(f)) return null;
+  const limpio = {};
+  for (const clave of FICHA_CAMPOS_TEXTO) {
+    const v = typeof f[clave] === "string" || typeof f[clave] === "number" ? String(f[clave]).trim().slice(0, 120) : "";
+    if (v) limpio[clave] = v;
+  }
+  const notas = typeof f.notas === "string" ? f.notas.trim().slice(0, 1000) : "";
+  if (notas) limpio.notas = notas;
+  for (const clave of ["goleadores", "tarjetas"]) {
+    if (!Array.isArray(f[clave])) continue;
+    const lista = f[clave]
+      .filter((x) => typeof x === "string")
+      .map((x) => x.trim().slice(0, 160))
+      .filter(Boolean)
+      .slice(0, 40);
+    if (lista.length) limpio[clave] = lista;
+  }
+  return Object.keys(limpio).length ? limpio : null;
+}
+
 // Ficha técnica de una página fusionada: la de la ÚLTIMA crónica que tenga ficha
 // SUSTITUYE por completo a las anteriores (no se mezclan). Encaja con el panel, que al
 // escribir una crónica nueva del mismo partido precarga la ficha de la anterior para que
@@ -5691,7 +6554,9 @@ function fusionarGrupoDePartido(base, otros, nombres) {
   // Las "al inicio" de las secciones que no abren la página pasan a ir justo
   // tras su <h2>. Los collages de cada sección cambian de grupo para no
   // mezclarse con los de otra.
-  const vistas = new Set([claveImagenFusion(base.imagen_url)].filter(Boolean));
+  // La portada NO se siembra aquí: si también está dentro de una sección se conserva
+  // la de la sección y el navegador quita la de la cabecera (noticia.html, esFusion).
+  const vistas = new Set();
   const todas = [];
   let portada = base.imagen_url || null;
   const ultima = secciones.length - 1;
@@ -5888,7 +6753,7 @@ function normalizarJugadoresAlineacion(raw) {
 // ---------- ORGANIGRAMA (Funcionalidades > Información) ----------
 // Se guarda entero como JSON en settings bajo la clave 'organigrama'.
 // Forma: { orientacion: "vertical"|"horizontal", nodos: [{ id, nombre, cargo,
-// nota, color, padre, padres, colapsado }] }. `padres` es la lista de jefes de la
+// nota, telefono, twitter, instagram, color, padre, padres, colapsado }] }. `padres` es la lista de jefes de la
 // casilla (puede tener varios; el primero es el principal, bajo el que se dibuja
 // su equipo) y `padre` = padres[0] (se mantiene por compatibilidad: un dato
 // antiguo con solo `padre` sigue siendo válido). El orden del array es el orden
@@ -5896,6 +6761,19 @@ function normalizarJugadoresAlineacion(raw) {
 const ORGANIGRAMA_MAX_NODOS = 300;
 const ORGANIGRAMA_MAX_JEFES = 10;
 const ORGANIGRAMA_COLORES = ["azul", "rojo", "verde", "amarillo", "morado", "rosa", "gris", "naranja"];
+// Contacto opcional de cada casilla: teléfono y usuario de Twitter/X e Instagram.
+// El usuario se guarda sin @ ni URL (si pegan un enlace se extrae el usuario).
+function limpiarTelefonoOrg(v) {
+  if (typeof v !== "string") return "";
+  const t = v.replace(/[^0-9+()\-.\s]/g, "").replace(/\s+/g, " ").trim().slice(0, 25);
+  return (t.match(/\d/g) || []).length >= 6 ? t : "";
+}
+function limpiarUsuarioRedOrg(v) {
+  if (typeof v !== "string") return "";
+  let t = v.trim().replace(/^https?:\/\/(www\.|mobile\.)?(twitter\.com|x\.com|instagram\.com)\//i, "");
+  t = t.replace(/^@+/, "").split(/[/?#\s]/)[0];
+  return /^[A-Za-z0-9_.]{1,30}$/.test(t) ? t : "";
+}
 function limpiarOrganigrama(entrada) {
   if (!entrada || typeof entrada !== "object" || Array.isArray(entrada)) return { error: "Organigrama no válido" };
   const lista = Array.isArray(entrada.nodos) ? entrada.nodos : null;
@@ -5925,6 +6803,9 @@ function limpiarOrganigrama(entrada) {
       id, nombre,
       cargo: texto(n.cargo, 80),
       nota,
+      telefono: limpiarTelefonoOrg(n.telefono),
+      twitter: limpiarUsuarioRedOrg(n.twitter),
+      instagram: limpiarUsuarioRedOrg(n.instagram),
       color: ORGANIGRAMA_COLORES.includes(n.color) ? n.color : "azul",
       padre: padres[0] || null,
       padres,
@@ -5953,6 +6834,224 @@ function limpiarOrganigrama(entrada) {
     if (!visitar(n)) return { error: "El organigrama tiene un bucle: una casilla depende de una de sus subordinadas" };
   }
   return { datos: { orientacion: entrada.orientacion === "horizontal" ? "horizontal" : "vertical", nodos } };
+}
+
+// ---------- RESPONSABILIDADES ESPECÍFICAS (Funcionalidades > Responsabilidades) ----------
+// Solo administradores. Se guarda entero como JSON en settings bajo la clave
+// 'responsabilidades'. Forma:
+//   { relaciones: { clubes: [slug, ...],
+//                   contactos: [{ id, tipo, entidad, area, nombre, cargo,
+//                   email, telefono, web, notas }] },
+//     rrhh: { redactores: [slug, ...], fotografos: [slug, ...],
+//             fichajes: [{ id, nombre, puesto, contacto, club, prioridad,
+//             estado, notas }] } }
+// `clubes`, `redactores` y `fotografos` son los clubes marcados en cada checklist
+// (slug del escudo, p. ej. "cd-castellon"). En RRHH hay dos checklists: clubes
+// con redactor asignado y clubes con fotógrafo asignado. Antes había una sola
+// lista `rrhh.clubes`: si aún no existe `redactores`, se toma esa como redactores.
+// `fichajes` es la lista de personas que al medio le gustaría fichar.
+// `contactos` es la base de datos de contactos institucionales: clubes,
+// federaciones y otros organismos, con su departamento de prensa o su
+// responsable de comunicación. Las plantillas de comunicación institucional no
+// se guardan aquí (viven en el navegador). Devuelve { datos } o { error }.
+const RESP_MAX_CLUBES = 2000;
+const RESP_MAX_FICHAJES = 500;
+const RESP_PUESTOS = ["redactor", "fotografo", "community", "diseno", "video", "narracion", "web", "otro"];
+const RESP_PRIORIDADES = ["alta", "media", "baja"];
+const RESP_ESTADOS = ["pendiente", "contactado", "conversando", "fichado", "descartado"];
+const RESP_MAX_CONTACTOS = 1500;
+const RESP_CONTACTO_TIPOS = ["club", "federacion", "otro"];
+const RESP_CONTACTO_AREAS = ["prensa", "comunicacion", "general", "otro"];
+const RESP_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+function limpiarSlugsResp(lista) {
+  if (!Array.isArray(lista)) return [];
+  const vistos = new Set();
+  for (const s of lista) {
+    if (typeof s !== "string" || !/^[a-z0-9-]{1,80}$/.test(s)) continue;
+    vistos.add(s);
+    if (vistos.size >= RESP_MAX_CLUBES) break;
+  }
+  return [...vistos];
+}
+function limpiarTextoResp(v, max) {
+  return typeof v === "string" ? v.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").trim().slice(0, max) : "";
+}
+// Base de datos de contactos institucionales. Cada contacto necesita al menos la
+// entidad (club, federación u organismo); el resto es opcional. Devuelve
+// { contactos } o { error }.
+function limpiarContactosResp(entrada) {
+  const brutos = Array.isArray(entrada) ? entrada : [];
+  if (brutos.length > RESP_MAX_CONTACTOS) return { error: `La base de contactos admite como máximo ${RESP_MAX_CONTACTOS} contactos` };
+  const ids = new Set();
+  const contactos = [];
+  for (const c of brutos) {
+    if (!c || typeof c !== "object") continue;
+    const entidad = limpiarTextoResp(c.entidad, 100);
+    if (!entidad) return { error: "Cada contacto necesita el nombre del club, la federación o el organismo" };
+    const email = limpiarTextoResp(c.email, 120).toLowerCase();
+    if (email && !RESP_EMAIL_RE.test(email)) return { error: `El correo de «${entidad}» no es válido` };
+    let id = typeof c.id === "string" && /^[A-Za-z0-9_-]{1,40}$/.test(c.id) ? c.id : "";
+    if (!id || ids.has(id)) id = "c" + Math.random().toString(36).slice(2, 10) + ids.size;
+    ids.add(id);
+    contactos.push({
+      id,
+      tipo: RESP_CONTACTO_TIPOS.includes(c.tipo) ? c.tipo : "club",
+      entidad,
+      area: RESP_CONTACTO_AREAS.includes(c.area) ? c.area : "general",
+      nombre: limpiarTextoResp(c.nombre, 80),
+      cargo: limpiarTextoResp(c.cargo, 80),
+      email,
+      telefono: limpiarTextoResp(c.telefono, 40),
+      web: limpiarTextoResp(c.web, 200),
+      notas: limpiarTextoResp(c.notas, 600),
+    });
+  }
+  return { contactos };
+}
+// Recordatorio de contacto (habitualmente cada dos meses) con los colaboradores activos (RRHH):
+// { dia: 1-28 (desde qué día del mes se recuerda), historial: [{ mes: "2026-10",
+// fecha: "2026-10-26", nota }] } con un máximo de un registro por mes, y
+// marcados: { mes: "2026-10", ids: [12, 15] } = colaboradores ya contactados en
+// ese ciclo (la lista con checkbox; a los dos meses deja de contar).
+const RESP_MAX_HIST_CONTACTO = 60;
+function limpiarContactoMensualResp(entrada) {
+  const e = entrada && typeof entrada === "object" && !Array.isArray(entrada) ? entrada : {};
+  let dia = parseInt(e.dia, 10);
+  if (!(dia >= 1 && dia <= 28)) dia = 1;
+  const vistos = new Set();
+  const historial = [];
+  for (const h of (Array.isArray(e.historial) ? e.historial : [])) {
+    if (!h || typeof h !== "object") continue;
+    const mes = typeof h.mes === "string" && /^\d{4}-(0[1-9]|1[0-2])$/.test(h.mes) ? h.mes : "";
+    if (!mes || vistos.has(mes)) continue;
+    vistos.add(mes);
+    historial.push({
+      mes,
+      fecha: typeof h.fecha === "string" && /^\d{4}-\d{2}-\d{2}$/.test(h.fecha) ? h.fecha : mes + "-01",
+      nota: limpiarTextoResp(h.nota, 300),
+    });
+  }
+  historial.sort((a, b) => (a.mes < b.mes ? 1 : -1));
+  const m = e.marcados && typeof e.marcados === "object" && !Array.isArray(e.marcados) ? e.marcados : {};
+  const mesMarcados = typeof m.mes === "string" && /^\d{4}-(0[1-9]|1[0-2])$/.test(m.mes) ? m.mes : "";
+  const ids = [];
+  if (mesMarcados) {
+    for (const x of (Array.isArray(m.ids) ? m.ids : [])) {
+      const n = Number(x);
+      if (Number.isInteger(n) && n > 0 && !ids.includes(n)) ids.push(n);
+      if (ids.length >= 500) break;
+    }
+  }
+  return { dia, historial: historial.slice(0, RESP_MAX_HIST_CONTACTO), marcados: { mes: mesMarcados, ids } };
+}
+function limpiarResponsabilidades(entrada) {
+  if (!entrada || typeof entrada !== "object" || Array.isArray(entrada)) return { error: "Datos no válidos" };
+  const rel = entrada.relaciones && typeof entrada.relaciones === "object" ? entrada.relaciones : {};
+  const rrhh = entrada.rrhh && typeof entrada.rrhh === "object" ? entrada.rrhh : {};
+  const brutos = Array.isArray(rrhh.fichajes) ? rrhh.fichajes : [];
+  if (brutos.length > RESP_MAX_FICHAJES) return { error: `La lista admite como máximo ${RESP_MAX_FICHAJES} personas` };
+  const heredados = Array.isArray(rrhh.clubes) ? rrhh.clubes : [];
+  const redactores = Array.isArray(rrhh.redactores) ? rrhh.redactores : heredados;
+  const fotografos = Array.isArray(rrhh.fotografos) ? rrhh.fotografos : [];
+  const ids = new Set();
+  const fichajes = [];
+  for (const f of brutos) {
+    if (!f || typeof f !== "object") continue;
+    const nombre = limpiarTextoResp(f.nombre, 80);
+    if (!nombre) return { error: "Cada persona de la lista necesita un nombre" };
+    let id = typeof f.id === "string" && /^[A-Za-z0-9_-]{1,40}$/.test(f.id) ? f.id : "";
+    if (!id || ids.has(id)) id = "f" + Math.random().toString(36).slice(2, 10) + ids.size;
+    ids.add(id);
+    fichajes.push({
+      id,
+      nombre,
+      puesto: RESP_PUESTOS.includes(f.puesto) ? f.puesto : "otro",
+      contacto: limpiarTextoResp(f.contacto, 120),
+      club: limpiarTextoResp(f.club, 80),
+      prioridad: RESP_PRIORIDADES.includes(f.prioridad) ? f.prioridad : "media",
+      estado: RESP_ESTADOS.includes(f.estado) ? f.estado : "pendiente",
+      notas: limpiarTextoResp(f.notas, 600),
+    });
+  }
+  const rc = limpiarContactosResp(rel.contactos);
+  if (rc.error) return { error: rc.error };
+  return {
+    datos: {
+      relaciones: { clubes: limpiarSlugsResp(rel.clubes), contactos: rc.contactos },
+      rrhh: { redactores: limpiarSlugsResp(redactores), fotografos: limpiarSlugsResp(fotografos), fichajes, contacto_mensual: limpiarContactoMensualResp(rrhh.contacto_mensual) },
+    },
+  };
+}
+function responsabilidadesVacias() {
+  return { relaciones: { clubes: [], contactos: [] }, rrhh: { redactores: [], fotografos: [], fichajes: [], contacto_mensual: { dia: 1, historial: [], marcados: { mes: "", ids: [] } } } };
+}
+// Colaboradores con la cuenta activa (redactores y fotógrafos) para el contacto
+// de RRHH (cada dos meses). Solo la lee un administrador. Además de nombre, rol y
+// correo devuelve datos para conocer mejor a cada persona: foto, equipos, nivel,
+// fecha de alta, último acceso, noticias publicadas (total y en los últimos dos
+// meses), última noticia y una biografía corta. Si la consulta ampliada falla
+// (p. ej. falta alguna columna en esa base de datos) se usa la básica; si también
+// falla, vacío.
+async function colaboradoresActivosResp(env) {
+  const base = (u) => ({
+    id: Number(u.id),
+    nombre: String(u.nombre || "").trim() || "Sin nombre",
+    rol: u.rol === "fotografo" ? "fotografo" : "redactor",
+    email: String(u.email || "").trim(),
+  });
+  const texto = (v, max) => { const t = String(v == null ? "" : v).replace(/\s+/g, " ").trim(); return t.length > max ? t.slice(0, max - 1) + "…" : t; };
+  const ordenar = (lista) => lista.sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
+  try {
+    const filas = (await env.DB.prepare(
+      `SELECT u.id, u.nombre, u.rol, u.email, u.avatar_url, u.avatar_foco, u.equipo, u.nivel, u.bio,
+              u.created_at, u.primer_acceso_at,
+              (SELECT MAX(l.created_at) FROM activity_log l WHERE l.usuario_id = u.id AND l.accion = 'login') AS ultimo_acceso,
+              (SELECT COUNT(*) FROM articles a WHERE a.autor_id = u.id AND a.publicado = 1) AS noticias,
+              (SELECT COUNT(*) FROM articles a WHERE a.autor_id = u.id AND a.publicado = 1 AND a.fecha_publicacion >= datetime('now', '-2 months')) AS noticias_2m,
+              (SELECT MAX(a.fecha_publicacion) FROM articles a WHERE a.autor_id = u.id AND a.publicado = 1) AS ultima_noticia
+         FROM users u WHERE u.activo = 1 AND u.rol IN ('redactor','fotografo')`
+    ).all()).results || [];
+    return ordenar(filas.map((u) => ({
+      ...base(u),
+      avatar_url: texto(u.avatar_url, 400),
+      avatar_foco: texto(u.avatar_foco, 40),
+      equipos: parsearEquipos(u.equipo).slice(0, 3),
+      nivel: Number.isInteger(Number(u.nivel)) && Number(u.nivel) > 0 ? Number(u.nivel) : null,
+      bio: texto(u.bio, 220),
+      alta: texto(u.created_at, 30),
+      primer_acceso: texto(u.primer_acceso_at, 30),
+      ultimo_acceso: texto(u.ultimo_acceso, 30),
+      noticias: Number(u.noticias) || 0,
+      noticias_2m: Number(u.noticias_2m) || 0,
+      ultima_noticia: texto(u.ultima_noticia, 30),
+    })));
+  } catch { /* se prueba con la consulta básica */ }
+  try {
+    const filas = (await env.DB.prepare(
+      "SELECT id, nombre, rol, email FROM users WHERE activo = 1 AND rol IN ('redactor','fotografo')"
+    ).all()).results || [];
+    return ordenar(filas.map(base));
+  } catch { return []; }
+}
+// Clubes que ya tienen a alguien asignado según las cuentas de la web: el equipo
+// (hasta 3) de cada redactor o fotógrafo activo (users.equipo). El panel los marca
+// solo en las checklists de RRHH. Devuelve { redactores: { "Club": ["Nombre"] },
+// fotografos: { … } }; no se guarda nada, se calcula en cada lectura. Los
+// administradores no cuentan. Si la consulta falla, devuelve vacío.
+async function asignacionesAutoResp(env) {
+  const out = { redactores: Object.create(null), fotografos: Object.create(null) };
+  try {
+    const filas = (await env.DB.prepare(
+      "SELECT nombre, rol, equipo FROM users WHERE activo = 1 AND rol IN ('redactor','fotografo') AND equipo IS NOT NULL AND TRIM(equipo) <> ''"
+    ).all()).results || [];
+    for (const u of filas) {
+      const destino = u.rol === "fotografo" ? out.fotografos : out.redactores;
+      for (const club of parsearEquipos(u.equipo)) {
+        (destino[club] = destino[club] || []).push(String(u.nombre || "").trim() || "Sin nombre");
+      }
+    }
+  } catch { /* sin asignaciones automáticas */ }
+  return out;
 }
 
 async function registrarActividad(env, request, payload, { accion, entidad = null, entidad_id = null, descripcion, detalle = null }) {
@@ -6189,6 +7288,11 @@ function longitudTextoPlano(html) {
 
 const CONTENIDO_MIN = 1500;
 const CONTENIDO_MAX = 8000;
+// Los artículos de opinión admiten más texto que el resto.
+const CONTENIDO_MAX_OPINION = 8500;
+function contenidoMaxPorTipo(tipo) {
+  return tipo === "opinion" ? CONTENIDO_MAX_OPINION : CONTENIDO_MAX;
+}
 
 // ---------- Sistema de niveles y recompensas ----------
 // Umbrales de publicaciones (contenido PUBLICADO, no borradores) que
@@ -6254,7 +7358,7 @@ async function contarPublicacionesPorTipo(env, autorId) {
      WHERE coautor_id = ? AND publicado = 1
      GROUP BY tipo`
   ).bind(autorId, autorId).all();
-  const conteo = { noticia: 0, previa: 0, cronica: 0, analisis: 0, opinion: 0, entrevista: 0, uno_por_uno: 0 };
+  const conteo = { noticia: 0, previa: 0, cronica: 0, analisis: 0, opinion: 0, entrevista: 0, uno_por_uno: 0, rdp_previa: 0, rdp_post: 0 };
   for (const fila of results) {
     if (conteo[fila.tipo] !== undefined) conteo[fila.tipo] += fila.total;
   }
@@ -6274,7 +7378,7 @@ async function contarPublicacionesPorTipo(env, autorId) {
 // por culpa del OR.
 async function contarPublicacionesPorTipoDeVarios(env, autorIds) {
   const idsUnicos = [...new Set(autorIds.filter((id) => id != null))];
-  const conteos = new Map(idsUnicos.map((id) => [id, { noticia: 0, previa: 0, cronica: 0, analisis: 0, opinion: 0, entrevista: 0, uno_por_uno: 0 }]));
+  const conteos = new Map(idsUnicos.map((id) => [id, { noticia: 0, previa: 0, cronica: 0, analisis: 0, opinion: 0, entrevista: 0, uno_por_uno: 0, rdp_previa: 0, rdp_post: 0 }]));
   if (idsUnicos.length === 0) return conteos;
   // Se trocea en lotes de 90 ids: D1/SQLite tiene un límite de 100
   // parámetros bind por consulta, y esta plantilla ya reutiliza la
@@ -6327,6 +7431,938 @@ function calcularProgresoNivel(conteo, requisitos) {
   return { cumple: detalle.every((d) => d.cumple), detalle };
 }
 
+// ---------- Resumen mensual de colaboradores ----------
+// Cada persona con cuenta en el panel (admin, redactor o fotógrafo) puede consultar, SOLO a
+// final de mes, un resumen de lo que ha hecho ese mes: noticias publicadas, visitas, contenido
+// subido, galerías de partido, partidos creados y actividad en el panel. "A final de mes" =
+// desde el ÚLTIMO DÍA del mes (hora de Madrid) en adelante; el servidor lo comprueba siempre, así
+// que no se puede pedir antes cambiando la URL. Los meses ya cerrados siguen consultables.
+// El aviso "ya puedes consultarlo" lo pinta el panel; cada persona puede desactivarlo. Las
+// preferencias (aviso sí/no y último mes visto) van en la tabla settings, clave
+// "resumen_mensual_prefs:<id de usuario>", para no necesitar migración en D1 ni en PostgreSQL.
+const RESUMEN_MES_MAX_ATRAS = 12;
+const RESUMEN_MES_TIPOS = ["noticia", "previa", "cronica", "analisis", "opinion", "entrevista", "uno_por_uno", "rdp_previa", "rdp_post"];
+
+function resumenMesFechaMadrid(ahora = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" }).format(ahora);
+}
+function resumenMesValido(mes) {
+  return typeof mes === "string" && /^\d{4}-(0[1-9]|1[0-2])$/.test(mes);
+}
+function resumenMesUltimoDia(mes) {
+  const [a, m] = mes.split("-").map(Number);
+  return `${mes}-${String(new Date(Date.UTC(a, m, 0)).getUTCDate()).padStart(2, "0")}`;
+}
+function resumenMesSiguiente(mes) {
+  const [a, m] = mes.split("-").map(Number);
+  return m === 12 ? `${a + 1}-01` : `${a}-${String(m + 1).padStart(2, "0")}`;
+}
+function resumenMesAnterior(mes) {
+  const [a, m] = mes.split("-").map(Number);
+  return m === 1 ? `${a - 1}-12` : `${a}-${String(m - 1).padStart(2, "0")}`;
+}
+// Medianoche de Madrid del día "YYYY-MM-DD", expresada en UTC como "YYYY-MM-DD HH:MM:SS" (el formato
+// de datetime('now') con el que se guardan created_at y fecha_publicacion).
+function resumenMesInicioUtc(fecha) {
+  const [a, m, d] = fecha.split("-").map(Number);
+  const base = Date.UTC(a, m - 1, d, 0, 0, 0);
+  let horas = 1;
+  try {
+    const parte = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Madrid", timeZoneName: "shortOffset" })
+      .formatToParts(new Date(base)).find((p) => p.type === "timeZoneName");
+    const mm = /GMT([+-]\d+)/.exec(parte && parte.value ? parte.value : "");
+    if (mm) horas = Number(mm[1]);
+  } catch { /* se queda en CET */ }
+  return new Date(base - horas * 3600000).toISOString().slice(0, 19).replace("T", " ");
+}
+function resumenMesEstado(hoy) {
+  const mesActual = hoy.slice(0, 7);
+  const disponibleDesde = resumenMesUltimoDia(mesActual);
+  const actualDisponible = hoy >= disponibleDesde;
+  return {
+    hoy,
+    mes_actual: mesActual,
+    mes_actual_disponible: actualDisponible,
+    mes_actual_disponible_desde: disponibleDesde,
+    ultimo_mes_disponible: actualDisponible ? mesActual : resumenMesAnterior(mesActual),
+  };
+}
+function resumenMesClavePrefs(uid) { return `resumen_mensual_prefs:${uid}`; }
+async function resumenMesLeerPrefs(env, uid) {
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(resumenMesClavePrefs(uid)).first();
+    const p = row && row.value ? JSON.parse(row.value) : {};
+    return { aviso: p.aviso !== false, visto: resumenMesValido(p.visto) ? p.visto : "" };
+  } catch {
+    return { aviso: true, visto: "" };
+  }
+}
+async function resumenMesGuardarPrefs(env, uid, prefs) {
+  await env.DB.prepare(
+    "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+  ).bind(resumenMesClavePrefs(uid), JSON.stringify({ aviso: !!prefs.aviso, visto: prefs.visto || "" })).run();
+}
+// Primer mes en el que la persona ya tenía cuenta ("YYYY-MM"), o "" si no se sabe.
+async function resumenMesPrimerMes(env, uid) {
+  try {
+    const u = await env.DB.prepare("SELECT created_at FROM users WHERE id = ?").bind(uid).first();
+    const c = u && u.created_at ? String(u.created_at).slice(0, 7) : "";
+    return resumenMesValido(c) ? c : "";
+  } catch { return ""; }
+}
+// Meses consultables (el más reciente primero): hasta RESUMEN_MES_MAX_ATRAS, sin pasar del mes de alta.
+function resumenMesLista(ultimo, primerMes) {
+  const lista = [];
+  let m = ultimo;
+  for (let i = 0; i < RESUMEN_MES_MAX_ATRAS; i++) {
+    if (primerMes && m < primerMes) break;
+    lista.push(m);
+    m = resumenMesAnterior(m);
+  }
+  return lista;
+}
+
+async function construirResumenMensual(env, usuario, mes) {
+  const desde = resumenMesInicioUtc(`${mes}-01`);
+  const hasta = resumenMesInicioUtc(`${resumenMesSiguiente(mes)}-01`);
+  const uid = usuario.id;
+  // Cada bloque es independiente: si uno falla (p. ej. una tabla que aún no existe en la réplica) el
+  // resto del resumen sigue saliendo.
+  const seguro = async (fn, vacio) => { try { return await fn(); } catch { return vacio; } };
+
+  // Rendimiento: todo lo que NO depende de los artículos se lanza a la vez (antes eran 6 viajes a la
+  // base de datos uno detrás de otro) y se espera al final, mientras se calculan las visitas.
+  const pMedia = seguro(async () => {
+    const { results } = await env.DB.prepare(
+      `SELECT tipo, COUNT(*) AS n, COALESCE(SUM(tamano_bytes), 0) AS bytes FROM media
+        WHERE autor_id = ?1 AND created_at >= ?2 AND created_at < ?3 GROUP BY tipo`
+    ).bind(uid, desde, hasta).all();
+    return results || [];
+  }, []);
+  const pGalerias = seguro(async () => {
+    const f = await env.DB.prepare(
+      `SELECT COUNT(*) AS n, COUNT(DISTINCT result_id) AS partidos FROM match_gallery
+        WHERE vinculado_por_id = ?1 AND created_at >= ?2 AND created_at < ?3`
+    ).bind(uid, desde, hasta).first();
+    return { fotos_vinculadas: Number(f && f.n) || 0, partidos: Number(f && f.partidos) || 0 };
+  }, { fotos_vinculadas: 0, partidos: 0 });
+  const pResultadosCreados = seguro(async () => {
+    const f = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM results WHERE autor_id = ?1 AND created_at >= ?2 AND created_at < ?3"
+    ).bind(uid, desde, hasta).first();
+    return Number(f && f.n) || 0;
+  }, 0);
+  const pActividad = seguro(async () => {
+    const f = await env.DB.prepare(
+      `SELECT COUNT(*) AS acciones, COUNT(DISTINCT substr(created_at, 1, 10)) AS dias FROM activity_log
+        WHERE usuario_id = ?1 AND created_at >= ?2 AND created_at < ?3`
+    ).bind(uid, desde, hasta).first();
+    return { acciones: Number(f && f.acciones) || 0, dias_activos: Number(f && f.dias) || 0 };
+  }, { acciones: 0, dias_activos: 0 });
+  const pCambiosNivel = seguro(async () => {
+    const { results } = await env.DB.prepare(
+      `SELECT nivel_anterior, nivel_nuevo, created_at FROM nivel_historial
+        WHERE usuario_id = ?1 AND created_at >= ?2 AND created_at < ?3 ORDER BY created_at`
+    ).bind(uid, desde, hasta).all();
+    return (results || []).map((c) => ({ de: Number(c.nivel_anterior), a: Number(c.nivel_nuevo), fecha: String(c.created_at || "").slice(0, 10) }));
+  }, []);
+
+  const articulos = await seguro(async () => {
+    const { results } = await env.DB.prepare(
+      `SELECT id, titulo, tipo, fecha_publicacion, 0 AS coautor FROM articles
+        WHERE autor_id = ?1 AND publicado = 1 AND fecha_publicacion >= ?2 AND fecha_publicacion < ?3
+       UNION ALL
+       SELECT id, titulo, tipo, fecha_publicacion, 1 AS coautor FROM articles
+        WHERE coautor_id = ?1 AND publicado = 1 AND fecha_publicacion >= ?2 AND fecha_publicacion < ?3
+       ORDER BY fecha_publicacion LIMIT 500`
+    ).bind(uid, desde, hasta).all();
+    return results || [];
+  }, []);
+
+  // Visitas: se sigue consultando por lista de ids (así solo se leen las filas de ESTOS artículos y no
+  // todas las del mes), pero los lotes de 90 ya no se esperan uno a uno: salen en paralelo.
+  const visitas = new Map();
+  const ids = articulos.map((a) => a.id);
+  const lotes = [];
+  for (let i = 0; i < ids.length; i += 90) lotes.push(ids.slice(i, i + 90));
+  await Promise.all(lotes.map((lote) => seguro(async () => {
+    const ph = lote.map((_, k) => `?${k + 3}`).join(",");
+    const { results } = await env.DB.prepare(
+      `SELECT article_id, COUNT(*) AS n FROM article_views
+        WHERE created_at >= ?1 AND created_at < ?2 AND article_id IN (${ph}) GROUP BY article_id`
+    ).bind(desde, hasta, ...lote).all();
+    for (const f of results || []) visitas.set(Number(f.article_id), Number(f.n) || 0);
+  }, null)));
+
+  const porTipo = Object.fromEntries(RESUMEN_MES_TIPOS.map((t) => [t, 0]));
+  let comoCoautor = 0;
+  for (const a of articulos) {
+    if (porTipo[a.tipo] !== undefined) porTipo[a.tipo] += 1;
+    if (Number(a.coautor) === 1) comoCoautor += 1;
+  }
+  const lista = articulos.map((a) => ({
+    titulo: a.titulo,
+    tipo: a.tipo,
+    fecha: String(a.fecha_publicacion || "").slice(0, 10),
+    coautor: Number(a.coautor) === 1,
+    visitas: visitas.get(Number(a.id)) || 0,
+  }));
+  const visitasTotal = lista.reduce((s, a) => s + a.visitas, 0);
+  const top = [...lista].sort((x, y) => y.visitas - x.visitas).filter((a) => a.visitas > 0).slice(0, 5);
+
+  const [media, galerias, resultadosCreados, actividad, cambiosNivel] =
+    await Promise.all([pMedia, pGalerias, pResultadosCreados, pActividad, pCambiosNivel]);
+  const contenido = { fotos: 0, videos: 0, bytes: 0 };
+  for (const f of media) {
+    if (f.tipo === "foto") contenido.fotos += Number(f.n) || 0;
+    else if (f.tipo === "video") contenido.videos += Number(f.n) || 0;
+    contenido.bytes += Number(f.bytes) || 0;
+  }
+
+  const totalPublicaciones = lista.length;
+  return {
+    mes,
+    disponible: true,
+    usuario: { id: usuario.id, nombre: usuario.nombre, rol: usuario.rol },
+    publicaciones: { total: totalPublicaciones, por_tipo: porTipo, como_coautor: comoCoautor },
+    visitas: { total: visitasTotal, top },
+    articulos: lista.slice(0, 100),
+    contenido,
+    galerias,
+    resultados_creados: resultadosCreados,
+    actividad,
+    cambios_nivel: cambiosNivel,
+    hay_actividad: totalPublicaciones > 0 || contenido.fotos > 0 || contenido.videos > 0
+      || galerias.fotos_vinculadas > 0 || resultadosCreados > 0 || actividad.acciones > 0,
+  };
+}
+
+// ---------- Reconocimiento público del mes ("Redactor/a del mes" y "Foto del mes") ----------
+// Se apoya en los mismos datos que el resumen mensual (publicaciones, visitas, galerías de partido).
+// El sistema PROPONE candidatos a final de mes y un admin CONFIRMA a quién se reconoce: nada se
+// publica solo. Lo confirmado se guarda en settings, clave "reconocimiento_mes:<AAAA-MM>" (JSON), así
+// que no hace falta migración ni en D1 ni en PostgreSQL. Solo se pueden reconocer meses ya cerrados
+// (los mismos que el resumen mensual: desde el último día del mes, hora de Madrid).
+const RECONOCIMIENTO_PREFIJO = "reconocimiento_mes:";
+const RECONOCIMIENTO_MAX_REDACTORES = 8;
+const RECONOCIMIENTO_MAX_FOTOS = 60;
+// Cómo se decide "quién es el mejor": cada redactor/a recibe una PUNTUACIÓN (0-100 %) = su cuota de las
+// publicaciones del equipo ese mes y su cuota de las visitas, ponderadas con estos pesos (deben sumar 1).
+// Las cuotas se calculan sobre el total de redactores activos con publicaciones, así que las puntuaciones
+// de todos suman 100 %. Para volver al criterio antiguo (solo publicaciones y, a igualdad, visitas) basta
+// con poner PESO_PUBLICACIONES = 1 y PESO_VISITAS = 0.
+const RECONOCIMIENTO_PESO_PUBLICACIONES = 0.6;
+const RECONOCIMIENTO_PESO_VISITAS = 0.4;
+// Selección AUTOMÁTICA del Redactor/a del mes: al cerrarse el mes, el sistema guarda por sí solo a quien
+// tenga la mejor puntuación (la de arriba; a igualdad, más publicaciones, luego más visitas, luego orden
+// alfabético). Un admin puede cambiarlo o quitarlo desde el panel y eso manda siempre sobre lo automático.
+// La Foto del mes sigue siendo manual. Poner a false para volver a que todo lo confirme un admin.
+const RECONOCIMIENTO_AUTOMATICO = true;
+function reconocimientoClave(mes) { return `${RECONOCIMIENTO_PREFIJO}${mes}`; }
+
+async function reconocimientoCandidatos(env, mes, limiteRedactores = RECONOCIMIENTO_MAX_REDACTORES, { fotos: conFotos = true } = {}) {
+  const desde = resumenMesInicioUtc(`${mes}-01`);
+  const hasta = resumenMesInicioUtc(`${resumenMesSiguiente(mes)}-01`);
+  const seguro = async (fn, vacio) => { try { return await fn(); } catch { return vacio; } };
+
+  // Fotos: las públicas que se vincularon a una galería de partido durante el mes. Se lanza ya, en
+  // paralelo con el cálculo de redactores (y se salta cuando solo se necesita validar a una persona).
+  const pFotos = !conFotos ? Promise.resolve([]) : seguro(async () => {
+    const consulta = (conVisibilidad) => `SELECT m.id AS media_id, m.cloudinary_url AS url, m.titulo AS titulo, m.autor_id AS autor_id, m.autor_nombre AS autor_nombre
+        FROM match_gallery mg JOIN media m ON m.id = mg.media_id
+       WHERE mg.created_at >= ?1 AND mg.created_at < ?2 AND (m.tipo = 'foto' OR m.tipo IS NULL)${conVisibilidad ? " AND m.visibilidad = 'publico'" : ""}
+       GROUP BY m.id, m.cloudinary_url, m.titulo, m.autor_id, m.autor_nombre
+       ORDER BY MAX(mg.created_at) DESC LIMIT ${RECONOCIMIENTO_MAX_FOTOS}`;
+    const { results } = await consultaConAlternativas(env, [consulta(true), consulta(false)], [desde, hasta]);
+    return (results || []).filter((f) => f.url).map((f) => ({
+      media_id: Number(f.media_id), url: f.url, titulo: f.titulo || "", autor_id: f.autor_id == null ? null : Number(f.autor_id), autor_nombre: f.autor_nombre || "",
+    }));
+  }, []);
+
+  // Redactores. Rendimiento: la base de datos ya devuelve los datos AGREGADOS (una fila por persona o por
+  // pareja autor/coautor) en vez de miles de artículos que se sumaban aquí; y las tres consultas van a la vez.
+  const [filasPublicaciones, filasVisitas, usuarios] = await Promise.all([
+    // Publicaciones del mes por persona (autoría o coautoría).
+    seguro(async () => {
+      const { results } = await env.DB.prepare(
+        `SELECT t.uid AS uid, COUNT(*) AS n FROM (
+           SELECT autor_id AS uid FROM articles
+            WHERE publicado = 1 AND fecha_publicacion >= ?1 AND fecha_publicacion < ?2 AND autor_id IS NOT NULL
+           UNION ALL
+           SELECT coautor_id AS uid FROM articles
+            WHERE publicado = 1 AND fecha_publicacion >= ?1 AND fecha_publicacion < ?2
+              AND coautor_id IS NOT NULL AND (autor_id IS NULL OR coautor_id <> autor_id)
+         ) t GROUP BY t.uid`
+      ).bind(desde, hasta).all();
+      return results || [];
+    }, []),
+    // Visitas que esas publicaciones recibieron en el propio mes, agrupadas por pareja autor/coautor.
+    seguro(async () => {
+      const { results } = await env.DB.prepare(
+        `SELECT a.autor_id AS autor_id, a.coautor_id AS coautor_id, COUNT(*) AS n FROM article_views v
+           JOIN articles a ON a.id = v.article_id
+          WHERE a.publicado = 1 AND a.fecha_publicacion >= ?1 AND a.fecha_publicacion < ?2
+            AND v.created_at >= ?1 AND v.created_at < ?2
+          GROUP BY a.autor_id, a.coautor_id`
+      ).bind(desde, hasta).all();
+      return results || [];
+    }, []),
+    seguro(async () => {
+      const { results } = await env.DB.prepare(
+        "SELECT id, nombre, avatar_url FROM users WHERE activo = 1 AND rol = 'redactor'"
+      ).all();
+      return results || [];
+    }, []),
+  ]);
+  const porUsuario = new Map();
+  const cifras = (uid) => {
+    const k = Number(uid);
+    let s = porUsuario.get(k);
+    if (!s) { s = { publicaciones: 0, visitas: 0 }; porUsuario.set(k, s); }
+    return s;
+  };
+  for (const f of filasPublicaciones) cifras(f.uid).publicaciones += Number(f.n) || 0;
+  for (const f of filasVisitas) {
+    const n = Number(f.n) || 0;
+    if (f.autor_id != null) cifras(f.autor_id).visitas += n;
+    if (f.coautor_id != null && Number(f.coautor_id) !== Number(f.autor_id)) cifras(f.coautor_id).visitas += n;
+  }
+  const elegibles = usuarios
+    .map((u) => ({ id: Number(u.id), nombre: u.nombre, avatar_url: u.avatar_url || null, ...(porUsuario.get(Number(u.id)) || { publicaciones: 0, visitas: 0 }) }))
+    .filter((u) => u.publicaciones > 0);
+
+  // Cuotas y puntuación. Si ese mes no hay ninguna visita registrada, todo el peso pasa a las publicaciones.
+  const totalPublicaciones = elegibles.reduce((s, u) => s + u.publicaciones, 0);
+  const totalVisitas = elegibles.reduce((s, u) => s + u.visitas, 0);
+  const pesoPub = totalVisitas > 0 ? RECONOCIMIENTO_PESO_PUBLICACIONES : 1;
+  const pesoVis = totalVisitas > 0 ? RECONOCIMIENTO_PESO_VISITAS : 0;
+  const un = (x) => Math.round(x * 10) / 10;
+  const conPuntos = elegibles.map((u) => {
+    const cuotaPub = totalPublicaciones > 0 ? (u.publicaciones / totalPublicaciones) * 100 : 0;
+    const cuotaVis = totalVisitas > 0 ? (u.visitas / totalVisitas) * 100 : 0;
+    return { ...u, cuotaPub, cuotaVis, puntos: pesoPub * cuotaPub + pesoVis * cuotaVis };
+  }).sort((a, b) => b.puntos - a.puntos || b.publicaciones - a.publicaciones || b.visitas - a.visitas || String(a.nombre).localeCompare(String(b.nombre), "es"));
+  const mejorPuntos = conPuntos.length ? conPuntos[0].puntos : 0;
+  const hayEmpate = conPuntos.length > 1 && Math.abs(conPuntos[1].puntos - mejorPuntos) < 1e-9;
+  const redactores = conPuntos.slice(0, limiteRedactores).map((u, i) => ({
+    id: u.id, nombre: u.nombre, avatar_url: u.avatar_url, publicaciones: u.publicaciones, visitas: u.visitas,
+    pct_publicaciones: un(u.cuotaPub),
+    pct_visitas: un(u.cuotaVis),
+    puntuacion: un(u.puntos),
+    pct_del_mejor: mejorPuntos > 0 ? un((u.puntos / mejorPuntos) * 100) : 0,
+    posicion: i + 1,
+    es_mejor: i === 0,
+    empate_en_cabeza: hayEmpate && Math.abs(u.puntos - mejorPuntos) < 1e-9,
+  }));
+
+  return {
+    redactores,
+    fotos: await pFotos,
+    equipo: {
+      redactores: elegibles.length,
+      publicaciones: totalPublicaciones,
+      visitas: totalVisitas,
+      peso_publicaciones: pesoPub,
+      peso_visitas: pesoVis,
+    },
+  };
+}
+
+async function reconocimientoLeer(env, mes) {
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(reconocimientoClave(mes)).first();
+    return reconocimientoNormalizar(row && row.value);
+  } catch { return null; }
+}
+// Guarda automáticamente al mejor redactor/a de un mes CERRADO si todavía no hay nada guardado para ese
+// mes. No pisa nunca nada existente (ON CONFLICT DO NOTHING): ni lo confirmado por un admin ni un "quitar".
+// Si ese mes nadie publicó, o falla la consulta, no se guarda nada y se volverá a intentar más tarde.
+async function reconocimientoAutoGenerar(env, mes) {
+  const c = await reconocimientoCandidatos(env, mes, 1, { fotos: false });
+  const mejor = c.redactores[0];
+  if (!mejor) return null;
+  const valor = {
+    redactor: { id: mejor.id, publicaciones: mejor.publicaciones, visitas: mejor.visitas },
+    foto: null, confirmado_por: null, confirmado_at: new Date().toISOString(), auto: true, avisados: [],
+  };
+  await env.DB.prepare(
+    "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO NOTHING"
+  ).bind(reconocimientoClave(mes), JSON.stringify(valor)).run();
+  return reconocimientoLeer(env, mes);
+}
+// Devuelve lo guardado para el mes y, si no hay nada y la selección automática está activa, lo genera.
+async function reconocimientoAsegurarAuto(env, mes) {
+  const guardado = await reconocimientoLeer(env, mes);
+  if (guardado || !RECONOCIMIENTO_AUTOMATICO) return guardado;
+  try { return await reconocimientoAutoGenerar(env, mes); } catch { return null; }
+}
+// Convierte el JSON guardado en settings en un objeto saneado (o null si no hay nada válido).
+function reconocimientoNormalizar(valorCrudo) {
+  try {
+    const v = valorCrudo ? JSON.parse(valorCrudo) : null;
+    if (!v || typeof v !== "object") return null;
+    return {
+      redactor: v.redactor && Number(v.redactor.id) > 0
+        ? { id: Number(v.redactor.id), publicaciones: Number(v.redactor.publicaciones) || 0, visitas: Number(v.redactor.visitas) || 0 } : null,
+      foto: v.foto && Number(v.foto.media_id) > 0 ? { media_id: Number(v.foto.media_id) } : null,
+      confirmado_por: v.confirmado_por == null ? null : Number(v.confirmado_por),
+      confirmado_at: v.confirmado_at || null,
+      auto: v.auto === true,
+      suprimido: v.suprimido === true,
+      avisados: Array.isArray(v.avisados) ? v.avisados.filter((k) => /^[rf]:\d+$/.test(String(k))).map(String) : [],
+    };
+  } catch { return null; }
+}
+
+// Convierte lo guardado (ids + cifras) en lo que se puede mostrar en público. Si la persona ya no
+// está activa o la foto se borró o pasó a privada, ese reconocimiento simplemente no sale.
+async function reconocimientoHidratar(env, guardado) {
+  if (!guardado) return { redactor: null, foto: null };
+  let redactor = null, foto = null;
+  if (guardado.redactor) {
+    try {
+      const u = await env.DB.prepare("SELECT id, nombre, avatar_url FROM users WHERE id = ? AND activo = 1 AND rol = 'redactor'").bind(guardado.redactor.id).first();
+      if (u) redactor = { id: Number(u.id), nombre: u.nombre, avatar_url: u.avatar_url || null, publicaciones: guardado.redactor.publicaciones, visitas: guardado.redactor.visitas };
+    } catch { /* sin redactor */ }
+  }
+  if (guardado.foto) {
+    try {
+      const consulta = (conVisibilidad) => `SELECT id, cloudinary_url, titulo, autor_id, autor_nombre FROM media
+         WHERE id = ? AND (tipo = 'foto' OR tipo IS NULL)${conVisibilidad ? " AND visibilidad = 'publico'" : ""}`;
+      const { results } = await consultaConAlternativas(env, [consulta(true), consulta(false)], [guardado.foto.media_id]);
+      const m = (results || [])[0];
+      if (m && m.cloudinary_url) foto = { url: m.cloudinary_url, titulo: m.titulo || "", autor_id: m.autor_id == null ? null : Number(m.autor_id), autor_nombre: m.autor_nombre || "" };
+    } catch { /* sin foto */ }
+  }
+  return { redactor, foto };
+}
+
+const RECONOCIMIENTO_MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
+function reconocimientoNombreMes(mes) { return `${RECONOCIMIENTO_MESES[Number(mes.slice(5, 7)) - 1]} de ${mes.slice(0, 4)}`; }
+
+// Correo de enhorabuena a quien ha sido reconocido (redactor/a del mes y/o autor/a de la foto del mes).
+// Nunca rompe el guardado: si no hay correo entregable o falla el envío, solo devuelve false.
+async function enviarCorreoReconocimientoMes(env, usuario, { mes, esRedactor, esFoto, fotoTitulo }) {
+  try {
+    if (!usuario || !emailLectorEntregable(usuario.email)) return false;
+    const nombre = String(usuario.nombre || "").trim().split(/\s+/)[0] || "";
+    const mesTexto = reconocimientoNombreMes(mes);
+    const titulos = [];
+    if (esRedactor) titulos.push("Redactor/a del mes");
+    if (esFoto) titulos.push("Foto del mes");
+    const cual = titulos.join(" y ");
+    const motivo = esRedactor && esFoto
+      ? `Has sido elegido/a Redactor/a del mes y tu foto${fotoTitulo ? ` «${fotoTitulo}»` : ""} ha sido la Foto del mes de ${mesTexto}.`
+      : esRedactor
+        ? `Has sido elegido/a Redactor/a del mes de ${mesTexto} por tu trabajo en ElOtroFútbol.`
+        : `Tu foto${fotoTitulo ? ` «${fotoTitulo}»` : ""} ha sido elegida Foto del mes de ${mesTexto}.`;
+    const publico = "Aparecerá en la portada de la web, con tu nombre y un enlace a tu perfil de autor/a.";
+    const asunto = `¡Enhorabuena${nombre ? ", " + nombre : ""}! ${cual} de ${mesTexto} · ElOtroFútbol`;
+    const parrafo = (nombre ? `Hola ${nombre}, ` : "") + motivo;
+    const texto = [parrafo, "", publico, "", "Gracias por todo lo que aportas al medio.", "", "Un abrazo,", "El equipo de ElOtroFútbol", SITIO_URL].join("\n");
+    const bloqueHtml = `<div class="eof-ficha eof-texto" style="margin:18px 0 6px;padding:16px 18px;background:#fdecef;border-left:4px solid #d1132e;border-radius:8px;font-family:Georgia,'Times New Roman',serif;font-size:16px;line-height:1.6;color:#0c1b2e;">`
+      + escapeHtmlEmail(publico) + `</div>`
+      + `<p class="eof-texto" style="margin:18px 0 0;font-family:Georgia,'Times New Roman',serif;font-size:16px;line-height:1.5;color:#0c1b2e;">Gracias por todo lo que aportas al medio.<br><br>Un abrazo,<br><strong>El equipo de ElOtroFútbol</strong></p>`;
+    const html = plantillaEmail({
+      etiqueta: "Reconocimiento del mes",
+      titulo: nombre ? `¡Enhorabuena, ${nombre}!` : "¡Enhorabuena!",
+      tono: "marca",
+      preheader: `${cual} de ${mesTexto}.`,
+      parrafo,
+      bloqueHtml,
+      boton: { texto: "Ver la portada", url: SITIO_URL },
+      pieHtml: "Este correo se ha enviado porque la dirección de ElOtroFútbol te ha reconocido este mes. Puedes responder a este mensaje si tienes cualquier duda.",
+    });
+    return await enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario: String(usuario.email).trim(), replyTo: EMAIL_NOTIFICACIONES });
+  } catch (e) {
+    console.log("Correo de reconocimiento: no se pudo enviar:", e && e.message);
+    return false;
+  }
+}
+
+// Avisa por correo a quien aún no se ha avisado de ESE reconocimiento (claves "r:<id>" y "f:<id>"), de modo
+// que volver a guardar el mismo mes no repite el correo. Devuelve las claves ya avisadas y cuántos correos salieron.
+async function reconocimientoAvisar(env, mes, hidratado, yaAvisados) {
+  const avisados = new Set(yaAvisados || []);
+  const porPersona = new Map();
+  const anotar = (uid, campo, extra) => {
+    if (!(Number(uid) > 0)) return;
+    const k = Number(uid);
+    porPersona.set(k, { ...(porPersona.get(k) || {}), [campo]: true, ...(extra || {}) });
+  };
+  if (hidratado.redactor && !avisados.has(`r:${hidratado.redactor.id}`)) anotar(hidratado.redactor.id, "esRedactor");
+  if (hidratado.foto && hidratado.foto.autor_id != null && !avisados.has(`f:${hidratado.foto.autor_id}`)) anotar(hidratado.foto.autor_id, "esFoto", { fotoTitulo: hidratado.foto.titulo });
+  let enviados = 0;
+  for (const [uid, datos] of porPersona) {
+    let u = null;
+    try { u = await env.DB.prepare("SELECT id, nombre, email FROM users WHERE id = ? AND activo = 1").bind(uid).first(); } catch { u = null; }
+    if (!u) continue;
+    if (await enviarCorreoReconocimientoMes(env, u, { mes, esRedactor: !!datos.esRedactor, esFoto: !!datos.esFoto, fotoTitulo: datos.fotoTitulo })) {
+      enviados += 1;
+      if (datos.esRedactor) avisados.add(`r:${uid}`);
+      if (datos.esFoto) avisados.add(`f:${uid}`);
+    }
+  }
+  return { avisados: [...avisados], enviados };
+}
+
+// ---------- Niveles de fotografía (F1–F2) ----------
+// Los colaboradores de fotografía (users.rol = 'fotografo') tienen su propio sistema
+// de progresión, distinto del N1–N4 de redacción: F1 (Fotógrafo colaborador) y F2
+// (Fotógrafo de referencia). Se guarda en la MISMA columna users.nivel (1 = F1, 2 = F2),
+// así que no hace falta migración: todo fotógrafo existente es F1 por defecto.
+//
+// A diferencia de la redacción, NO hay cifras mínimas (ni de partidos ni de fotografías):
+// la disponibilidad y las oportunidades de cobertura varían de una persona a otra. El
+// ascenso es una valoración global de unos criterios cualitativos (NIVELES_FOTO_CRITERIOS),
+// propuesta por el responsable de fotografía si existe y SIEMPRE autorizada por dirección
+// (aquí: un admin, vía PUT /api/users/:id/nivel). La pérdida de nivel solo se valora ante
+// problemas reiterados y de forma proporcional: un error puntual no baja de nivel.
+//
+// El nivel de fotografía NUNCA concede permisos editoriales: obtenerNivelUsuario devuelve
+// siempre 1 para un fotógrafo, y no garantiza coordinación, acreditaciones, partidos
+// concretos ni publicación de todo el material entregado.
+const NIVEL_MAXIMO_FOTOGRAFO = 2;
+
+const NIVELES_FOTO_INFO = {
+  1: {
+    etiqueta: "F1", nombre: "Fotógrafo colaborador", emoji: "📷",
+    descripcion: "Nivel general de participación fotográfica: coberturas según tu disponibilidad y las necesidades del medio, con material de calidad técnica adecuada.",
+    funciones: [
+      "Realizar coberturas fotográficas según su disponibilidad y las necesidades del medio.",
+      "Seguir las indicaciones de cobertura y respetar las condiciones de acceso y acreditación.",
+      "Seleccionar y entregar fotografías con una calidad técnica adecuada.",
+      "Identificar correctamente el partido, los equipos y la autoría del material.",
+      "Solicitar orientación o ayuda cuando lo necesite.",
+    ],
+    ventajas: "Recibe indicaciones y comentarios para mejorar, y puede usar material autorizado de EOF en su portfolio profesional respetando las condiciones de uso y los derechos correspondientes.",
+  },
+  2: {
+    etiqueta: "F2", nombre: "Fotógrafo de referencia", emoji: "🌟",
+    descripcion: "Fotógrafo con calidad, autonomía y responsabilidad demostradas de forma consistente. Prioridad orientativa en coberturas especiales y proyectos de mayor interés editorial.",
+    funciones: [
+      "Todas las funciones de F1.",
+      "Realizar coberturas con un alto grado de autonomía.",
+      "Captar momentos relevantes y ofrecer variedad en el material entregado.",
+      "Cumplir los plazos y mantener una comunicación fluida con el equipo.",
+      "Proponer reportajes fotográficos, coberturas especiales o proyectos visuales.",
+      "Ayudar a orientar a nuevos fotógrafos cuando se le solicite.",
+    ],
+    ventajas: "Prioridad orientativa en la consideración para coberturas especiales y proyectos de mayor interés editorial; puede ser considerado para tareas de coordinación fotográfica (el cargo depende de una designación específica de la dirección).",
+  },
+};
+
+// Criterios de la valoración global F1 → F2 (sin mínimo obligatorio de partidos ni de fotos).
+const NIVELES_FOTO_CRITERIOS = [
+  { id: "calidad_tecnica", nombre: "Calidad técnica", descripcion: "Nitidez, exposición, encuadre y presentación del material." },
+  { id: "criterio_periodistico", nombre: "Criterio periodístico", descripcion: "Capacidad para captar momentos relevantes y representar adecuadamente el acontecimiento." },
+  { id: "variedad", nombre: "Variedad", descripcion: "Diversidad de situaciones, protagonistas y planos." },
+  { id: "fiabilidad", nombre: "Fiabilidad", descripcion: "Cumplimiento de los compromisos y plazos acordados." },
+  { id: "autonomia", nombre: "Autonomía", descripcion: "Capacidad para preparar, realizar y entregar una cobertura correctamente." },
+  { id: "profesionalidad", nombre: "Profesionalidad", descripcion: "Comunicación, respeto a las normas y coordinación con el resto del equipo." },
+  { id: "evolucion", nombre: "Evolución", descripcion: "Capacidad para incorporar indicaciones y mejorar el trabajo." },
+];
+
+// ---------- RACHAS SEMANALES ----------
+// "Semanas seguidas con actividad" de un colaborador (redactor o fotógrafo). Una semana (lunes a
+// domingo, hora de Madrid) cuenta como activa si la persona publicó al menos un artículo (como
+// autora o coautora) o vinculó al menos una foto a una galería de partido. No se guarda nada
+// aparte: se deduce de articles.fecha_publicacion y match_gallery.created_at, así que cuenta
+// también lo que se hizo antes de existir esta función y no necesita migraciones.
+// La semana en curso NO rompe la racha mientras no termine: si todavía no hay actividad en ella,
+// la racha sigue viva ("en riesgo") hasta el domingo.
+const RACHA_SEMANAS_VISIBLES = 12;
+const RACHA_HITOS = [
+  { semanas: 2, nombre: "En marcha" },
+  { semanas: 4, nombre: "Constancia" },
+  { semanas: 8, nombre: "Imparable" },
+  { semanas: 12, nombre: "Trimestre redondo" },
+  { semanas: 26, nombre: "Medio año" },
+  { semanas: 52, nombre: "Un año entero" },
+];
+
+// "YYYY-MM-DD HH..." (UTC, como datetime('now')) -> "YYYY-MM-DD" en hora de Madrid.
+function rachaDiaMadrid(textoUtc) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2})/.exec(String(textoUtc || "").trim());
+  if (!m) return null;
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4])));
+  if (Number.isNaN(d.getTime())) return null;
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+}
+// Día "YYYY-MM-DD" -> número de día (desde 1970) de su lunes.
+function rachaLunesOrdinal(dia) {
+  const [a, m, d] = dia.split("-").map(Number);
+  const ms = Date.UTC(a, m - 1, d);
+  return Math.floor(ms / 86400000) - ((new Date(ms).getUTCDay() + 6) % 7);
+}
+function rachaOrdinalAFecha(n) { return new Date(n * 86400000).toISOString().slice(0, 10); }
+
+// Función pura (testeable): filas = [{ h: "YYYY-MM-DD HH", tipo: "publicacion"|"foto", n }].
+function calcularRachaDesdeActividad(filas, hoyMadrid) {
+  const hoyOrd = Math.floor(Date.UTC(...hoyMadrid.split("-").map((v, i) => (i === 1 ? Number(v) - 1 : Number(v)))) / 86400000);
+  const semanaActual = rachaLunesOrdinal(hoyMadrid);
+  const semanas = new Map();
+  for (const f of filas) {
+    const dia = rachaDiaMadrid(f.h);
+    if (!dia) continue;
+    const lunes = rachaLunesOrdinal(dia);
+    if (lunes > semanaActual) continue; // nada del futuro
+    const s = semanas.get(lunes) || { publicaciones: 0, fotos: 0 };
+    if (f.tipo === "foto") s.fotos += Number(f.n) || 0; else s.publicaciones += Number(f.n) || 0;
+    semanas.set(lunes, s);
+  }
+  const activa = (l) => { const s = semanas.get(l); return !!s && (s.publicaciones + s.fotos) > 0; };
+
+  const estaSemanaActiva = activa(semanaActual);
+  let racha = 0;
+  for (let l = estaSemanaActiva ? semanaActual : semanaActual - 7; activa(l); l -= 7) racha++;
+
+  // Mejor racha histórica (la actual puede ser la mejor).
+  const ordenadas = [...semanas.keys()].filter(activa).sort((a, b) => a - b);
+  let mejor = 0, corrida = 0, previa = null;
+  for (const l of ordenadas) {
+    corrida = previa !== null && l - previa === 7 ? corrida + 1 : 1;
+    if (corrida > mejor) mejor = corrida;
+    previa = l;
+  }
+  mejor = Math.max(mejor, racha);
+
+  const lista = [];
+  for (let i = RACHA_SEMANAS_VISIBLES - 1; i >= 0; i--) {
+    const l = semanaActual - 7 * i;
+    const s = semanas.get(l) || { publicaciones: 0, fotos: 0 };
+    lista.push({ inicio: rachaOrdinalAFecha(l), publicaciones: s.publicaciones, fotos: s.fotos, activa: (s.publicaciones + s.fotos) > 0, actual: l === semanaActual });
+  }
+
+  const hitoActual = [...RACHA_HITOS].reverse().find((h) => racha >= h.semanas) || null;
+  const proximo = RACHA_HITOS.find((h) => racha < h.semanas) || null;
+  return {
+    actual: racha,
+    mejor,
+    esta_semana_activa: estaSemanaActiva,
+    // Solo tiene sentido hablar de "riesgo" si hay una racha que perder.
+    en_riesgo: !estaSemanaActiva && racha > 0,
+    dias_restantes: semanaActual + 6 - hoyOrd, // hoy incluido: domingo = 0
+    semanas_activas_total: ordenadas.length,
+    semanas: lista,
+    hito_actual: hitoActual,
+    proximo_hito: proximo ? { ...proximo, faltan: proximo.semanas - racha } : null,
+    hitos: RACHA_HITOS,
+  };
+}
+
+async function calcularRachaSemanal(env, usuario) {
+  const uid = usuario.id;
+  const filas = [];
+  const leer = async (sql, tipo) => {
+    try {
+      const { results } = await env.DB.prepare(sql).bind(uid).all();
+      for (const r of results || []) filas.push({ h: r.h, tipo, n: r.n });
+    } catch { /* tabla o columna aún inexistente (p. ej. en la réplica): esa fuente cuenta 0 */ }
+  };
+  // Se agrupa por hora (no por día) para poder pasar a hora de Madrid sin errores en el cambio de día.
+  await leer(
+    `SELECT substr(fecha_publicacion, 1, 13) AS h, COUNT(*) AS n FROM articles
+      WHERE autor_id = ?1 AND publicado = 1 GROUP BY substr(fecha_publicacion, 1, 13)
+     UNION ALL
+     SELECT substr(fecha_publicacion, 1, 13) AS h, COUNT(*) AS n FROM articles
+      WHERE coautor_id = ?1 AND publicado = 1 GROUP BY substr(fecha_publicacion, 1, 13)`,
+    "publicacion"
+  );
+  await leer(
+    `SELECT substr(created_at, 1, 13) AS h, COUNT(*) AS n FROM match_gallery
+      WHERE vinculado_por_id = ?1 GROUP BY substr(created_at, 1, 13)`,
+    "foto"
+  );
+  return calcularRachaDesdeActividad(filas, resumenMesFechaMadrid());
+}
+
+// ---------- INSIGNIAS POR HITOS ----------
+// Logros puntuales que se muestran junto al nivel actual en "Mi progreso" (GET /api/me/nivel,
+// campo `insignias`). A diferencia del nivel, NO dan permisos ni cuentan para ascender: son un
+// reconocimiento. Hitos:
+//   - primera_cronica: primera crónica PUBLICADA (como autor/a o coautor/a; sale del conteo de
+//     publicaciones que ya calcula construirProgresoNivel, no hay consulta nueva).
+//   - fotos_10: 10 fotos vinculadas por la persona a galerías de partido y visibles en la web
+//     (match_gallery.vinculado_por_id + media.visibilidad = 'publico').
+//   - primer_directo: primer partido cubierto en directo, es decir, un partido cuyo cronómetro se
+//     arrancó desde el panel (results.inicio_cronometro_at) y en el que la persona añadió su primer
+//     evento mientras se jugaba (ver insigniaEventoEnDirecto). Corregir eventos a posteriori o
+//     rellenar un partido ya acabado NO cuenta.
+// Una insignia, una vez conseguida, es permanente: se guarda en settings (clave
+// "insignias_hitos:<id de usuario>", JSON {id_insignia: "YYYY-MM-DD HH:MM:SS"}) para que no se
+// pierda si luego se despublica algo, y para no repetir consultas en cada refresco de "Mi
+// progreso" (se refresca cada 30 s). Se guarda en settings, igual que resumen_mensual_prefs, para
+// no necesitar tablas nuevas en D1 ni en PostgreSQL. La fecha guardada es la de la DETECCIÓN: lo
+// que ya se había hecho antes de existir esta función se marca la primera vez que se consulta.
+// Roles: redactor = las tres; fotógrafo = solo fotos_10 (no escribe crónicas ni cubre en directo);
+// admin = ninguna (como con las rachas, no tiene que demostrar nada).
+const INSIGNIAS_HITOS = [
+  { id: "primera_cronica", nombre: "Primera crónica", emoji: "📝", descripcion: "Publica tu primera crónica de un partido.", objetivo: 1, roles: ["redactor"] },
+  { id: "fotos_10", nombre: "10 fotos publicadas", emoji: "📷", descripcion: "Sube 10 fotos a galerías de partido visibles en la web.", objetivo: 10, roles: ["redactor", "fotografo"] },
+  { id: "primer_directo", nombre: "Primer directo", emoji: "🔴", descripcion: "Cubre tu primer partido en directo con el minuto a minuto.", objetivo: 1, roles: ["redactor"] },
+];
+// Un partido "en directo" admite eventos desde que arranca el cronómetro hasta ~4 h después
+// (90' + descanso + prórroga + descuentos con margen). Pequeña tolerancia por delante por si el
+// primer evento (p. ej. "inicio_partido") se registra a la vez que se marca el inicio.
+const INSIGNIAS_VENTANA_DIRECTO_MS = 4 * 3600000;
+const INSIGNIAS_TOLERANCIA_DIRECTO_MS = 5 * 60000;
+
+function insigniaClaveRol(rol) { return rol === "fotografo" ? "fotografo" : "redactor"; }
+
+// "YYYY-MM-DD HH:MM:SS[.fff][+00]" (UTC, como datetime('now')) -> milisegundos, o null.
+function insigniaMs(texto) {
+  if (texto instanceof Date) return Number.isNaN(texto.getTime()) ? null : texto.getTime();
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(String(texto || "").trim());
+  if (!m) return null;
+  return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]));
+}
+
+// Función pura (testeable): ¿el primer evento de la persona en ese partido se registró en directo?
+function insigniaEventoEnDirecto(inicioCronometro, primerEvento) {
+  const ini = insigniaMs(inicioCronometro);
+  const ev = insigniaMs(primerEvento);
+  if (ini === null || ev === null) return false;
+  return ev >= ini - INSIGNIAS_TOLERANCIA_DIRECTO_MS && ev <= ini + INSIGNIAS_VENTANA_DIRECTO_MS;
+}
+
+// Función pura (testeable). medidas = { id: número } SOLO de las insignias que aún no estaban
+// guardadas (las ya conseguidas no se vuelven a medir). guardadas = { id: fecha }.
+// Devuelve la lista para el rol y las insignias recién conseguidas (para guardarlas).
+function evaluarInsignias(rol, medidas, guardadas, ahoraTexto) {
+  const clave = insigniaClaveRol(rol);
+  const lista = [];
+  const nuevas = {};
+  for (const h of INSIGNIAS_HITOS) {
+    if (!h.roles.includes(clave)) continue;
+    const ya = !!(guardadas && guardadas[h.id]);
+    const medido = Math.max(0, Number(medidas && medidas[h.id]) || 0);
+    const actual = ya ? h.objetivo : Math.min(h.objetivo, medido);
+    const conseguida = ya || actual >= h.objetivo;
+    if (conseguida && !ya) nuevas[h.id] = ahoraTexto;
+    lista.push({ id: h.id, nombre: h.nombre, emoji: h.emoji, descripcion: h.descripcion, objetivo: h.objetivo, actual, conseguida });
+  }
+  return { lista, nuevas };
+}
+
+async function leerInsigniasGuardadas(env, uid) {
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(`insignias_hitos:${uid}`).first();
+    const p = row && row.value ? JSON.parse(row.value) : {};
+    return p && typeof p === "object" && !Array.isArray(p) ? p : {};
+  } catch { return {}; }
+}
+async function guardarInsigniasGuardadas(env, uid, guardadas) {
+  try {
+    await env.DB.prepare(
+      "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+    ).bind(`insignias_hitos:${uid}`, JSON.stringify(guardadas)).run();
+  } catch { /* no es crítico: se volverá a detectar en la siguiente consulta */ }
+}
+
+// Fotos vinculadas por la persona a galerías y visibles en la web. Se acota a 10 filas leídas.
+async function contarFotosPublicadasInsignias(env, uid) {
+  try {
+    const f = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM (
+         SELECT mg.id FROM match_gallery mg JOIN media m ON m.id = mg.media_id
+          WHERE mg.vinculado_por_id = ? AND m.visibilidad = 'publico' LIMIT 10
+       ) t`
+    ).bind(uid).first();
+    return Number(f && f.n) || 0;
+  } catch { return 0; }
+}
+
+// ¿Ha cubierto la persona algún partido en directo? Mira el primer evento que registró en cada
+// partido (activity_log, accion crear_evento_partido) y lo compara con el arranque del cronómetro.
+// La ventana se evalúa en JS (no en SQL) para no depender de aritmética de fechas, que SQLite y
+// PostgreSQL escriben distinto. Se consideran como máximo sus 60 primeros partidos.
+async function haCubiertoPartidoEnDirecto(env, uid) {
+  try {
+    const { results: primeros } = await env.DB.prepare(
+      `SELECT entidad_id AS rid, MIN(created_at) AS primero FROM activity_log
+        WHERE usuario_id = ? AND accion = 'crear_evento_partido'
+        GROUP BY entidad_id ORDER BY MIN(created_at) LIMIT 60`
+    ).bind(uid).all();
+    const primeroPorId = new Map();
+    for (const f of primeros || []) {
+      const id = Number(f.rid);
+      if (Number.isInteger(id) && id > 0) primeroPorId.set(id, f.primero);
+    }
+    if (!primeroPorId.size) return false;
+    const ids = [...primeroPorId.keys()];
+    const placeholders = ids.map((_, i) => `?${i + 1}`).join(",");
+    const { results: partidos } = await env.DB.prepare(
+      `SELECT id, inicio_cronometro_at FROM results WHERE id IN (${placeholders}) AND inicio_cronometro_at IS NOT NULL`
+    ).bind(...ids).all();
+    return (partidos || []).some((p) => insigniaEventoEnDirecto(p.inicio_cronometro_at, primeroPorId.get(Number(p.id))));
+  } catch { return false; }
+}
+
+// Devuelve la lista de insignias del usuario (o null si no aplica: admin). `publicaciones` es el
+// conteo por tipo que ya trae construirProgresoNivel (progreso.publicaciones).
+async function calcularInsignias(env, usuario, publicaciones) {
+  if (!usuario || usuario.rol === "admin") return null;
+  try {
+    const clave = insigniaClaveRol(usuario.rol);
+    const guardadas = await leerInsigniasGuardadas(env, usuario.id);
+    const pendiente = (id) => !guardadas[id] && INSIGNIAS_HITOS.some((h) => h.id === id && h.roles.includes(clave));
+    const medidas = {};
+    if (pendiente("primera_cronica")) medidas.primera_cronica = Number(publicaciones && publicaciones.cronica) || 0;
+    if (pendiente("fotos_10")) medidas.fotos_10 = await contarFotosPublicadasInsignias(env, usuario.id);
+    if (pendiente("primer_directo")) medidas.primer_directo = (await haCubiertoPartidoEnDirecto(env, usuario.id)) ? 1 : 0;
+    const ahora = new Date().toISOString().slice(0, 19).replace("T", " ");
+    const { lista, nuevas } = evaluarInsignias(usuario.rol, medidas, guardadas, ahora);
+    if (Object.keys(nuevas).length) await guardarInsigniasGuardadas(env, usuario.id, { ...guardadas, ...nuevas });
+    return lista;
+  } catch { return null; }
+}
+
+// ---------- RUTA DE BIENVENIDA (14 días) ----------
+// Checklist corta para colaboradores nuevos (GET /api/me/ruta-bienvenida): 5 hitos pequeños que dan
+// sensación de avance, el último es el ascenso de nivel. Se cuentan 14 días desde el primer acceso (o,
+// si no consta, desde la creación de la cuenta). Admins: no aplica.
+//   Redactor : perfil completo (foto + biografía) · tutorial · primer borrador · primera publicación
+//              aprobada (publicada) · subir al nivel 2.
+//   Fotógrafo: perfil completo · tutorial · primera foto en una galería · primera foto publicada en la
+//              web · subir a F2.
+// Igual que las insignias, un hito conseguido es PERMANENTE: se guarda en settings
+// ("ruta_bienvenida:<id>", JSON {id_hito: "YYYY-MM-DD HH:MM:SS"}), sin tablas nuevas, y solo se miden
+// los hitos aún pendientes (con todo hecho son 2 lecturas). El tutorial lo notifica el panel
+// (POST /api/me/ruta-bienvenida/tutorial) porque solo existe en el navegador.
+// No hay hito de "responder un comentario": hoy ningún colaborador puede responder comentarios desde
+// el panel (la moderación es solo de admins).
+const RUTA_BIENVENIDA_DIAS = 14;
+const RUTA_BIENVENIDA_HITOS = {
+  redactor: [
+    { id: "perfil", titulo: "Completa tu perfil", descripcion: "Sube tu foto y escribe una biografía corta: es lo que se ve en tu página de autor.", ir: "ajustes.perfil" },
+    { id: "tutorial", titulo: "Lee el tutorial", descripcion: "Un repaso rápido por el panel para saber dónde está cada cosa.", ir: "tutorial" },
+    { id: "borrador", titulo: "Guarda tu primer borrador", descripcion: "Empieza una noticia y guárdala como borrador: no tiene que ser perfecta.", ir: "noticias.nueva" },
+    { id: "publicacion", titulo: "Consigue tu primera publicación", descripcion: "Termina una pieza y consigue que se apruebe y se publique en la web.", ir: "noticias.lista" },
+    { id: "nivel", titulo: "Sube al nivel 2", descripcion: "Con tus publicaciones, el equipo te subirá de nivel y tendrás más libertad.", ir: "ajustes.progreso" },
+  ],
+  fotografo: [
+    { id: "perfil", titulo: "Completa tu perfil", descripcion: "Sube tu foto y escribe una biografía corta: es lo que se ve en tu página de autor.", ir: "ajustes.perfil" },
+    { id: "tutorial", titulo: "Lee el tutorial", descripcion: "Un repaso rápido por el panel para saber dónde está cada cosa.", ir: "tutorial" },
+    { id: "galeria", titulo: "Sube tu primera foto a una galería", descripcion: "Elige un partido y vincula tu primera foto a su galería.", ir: "contenido" },
+    { id: "foto_publica", titulo: "Consigue tu primera foto publicada", descripcion: "Que una de tus fotos se vea en la galería pública del partido.", ir: "contenido" },
+    { id: "nivel", titulo: "Sube a F2", descripcion: "Con tu actividad, el equipo te subirá de nivel.", ir: "ajustes.progreso" },
+  ],
+};
+
+async function leerRutaBienvenidaGuardada(env, uid) {
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(`ruta_bienvenida:${uid}`).first();
+    const p = row && row.value ? JSON.parse(row.value) : {};
+    return p && typeof p === "object" && !Array.isArray(p) ? p : {};
+  } catch { return {}; }
+}
+async function guardarRutaBienvenidaGuardada(env, uid, guardado) {
+  try {
+    await env.DB.prepare(
+      "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+    ).bind(`ruta_bienvenida:${uid}`, JSON.stringify(guardado)).run();
+  } catch { /* no es crítico: se volverá a detectar en la siguiente consulta */ }
+}
+
+// Función pura (testeable). medidas = { id: true/false } SOLO de los hitos que aún no estaban guardados.
+// guardado = { id: fecha }. inicioTexto = primer acceso o alta de la cuenta. Devuelve el estado
+// completo y los hitos recién conseguidos (nuevos) para guardarlos.
+function evaluarRutaBienvenida(rol, medidas, guardado, ahoraTexto, inicioTexto) {
+  const defs = RUTA_BIENVENIDA_HITOS[rol === "fotografo" ? "fotografo" : "redactor"];
+  const nuevos = {};
+  const hitos = defs.map((d) => {
+    let fecha = guardado && guardado[d.id] ? guardado[d.id] : null;
+    if (!fecha && medidas && medidas[d.id]) { fecha = ahoraTexto; nuevos[d.id] = ahoraTexto; }
+    return { ...d, hecho: !!fecha, fecha };
+  });
+  const hechos = hitos.filter((h) => h.hecho).length;
+  const ini = insigniaMs(inicioTexto);
+  const ahora = insigniaMs(ahoraTexto);
+  const dia = ini !== null && ahora !== null ? Math.max(1, Math.floor((ahora - ini) / 86400000) + 1) : 1;
+  return {
+    aplica: true,
+    rol: rol === "fotografo" ? "fotografo" : "redactor",
+    dia,
+    dias_total: RUTA_BIENVENIDA_DIAS,
+    dias_restantes: Math.max(0, RUTA_BIENVENIDA_DIAS - dia + 1),
+    caducada: dia > RUTA_BIENVENIDA_DIAS,
+    hitos,
+    hechos,
+    total: hitos.length,
+    completa: hechos === hitos.length,
+    siguiente: (hitos.find((h) => !h.hecho) || {}).id || null,
+    nuevos,
+  };
+}
+
+async function calcularRutaBienvenida(env, usuario) {
+  if (!usuario || usuario.rol === "admin") return { aplica: false };
+  try {
+    const guardado = await leerRutaBienvenidaGuardada(env, usuario.id);
+    const defs = RUTA_BIENVENIDA_HITOS[usuario.rol === "fotografo" ? "fotografo" : "redactor"];
+    const pendiente = (id) => defs.some((d) => d.id === id) && !guardado[id];
+    const uid = usuario.id;
+    const medidas = {};
+    const uno = async (sql, ...binds) => { try { return !!(await env.DB.prepare(sql).bind(...binds).first()); } catch { return false; } };
+    if (pendiente("perfil")) {
+      const p = await env.DB.prepare("SELECT bio, avatar_url FROM users WHERE id = ?").bind(uid).first();
+      medidas.perfil = !!(p && String(p.bio || "").trim().length >= 10 && String(p.avatar_url || "").trim());
+    }
+    if (pendiente("borrador")) medidas.borrador = await uno("SELECT id FROM articles WHERE autor_id = ? LIMIT 1", uid);
+    if (pendiente("publicacion")) {
+      medidas.publicacion = await uno(
+        `SELECT id FROM (SELECT id FROM articles WHERE autor_id = ?1 AND publicado = 1 UNION ALL SELECT id FROM articles WHERE coautor_id = ?1 AND publicado = 1) t LIMIT 1`,
+        uid
+      );
+    }
+    if (pendiente("galeria")) medidas.galeria = await uno("SELECT id FROM match_gallery WHERE vinculado_por_id = ? LIMIT 1", uid);
+    if (pendiente("foto_publica")) medidas.foto_publica = (await contarFotosPublicadasInsignias(env, uid)) >= 1;
+    if (pendiente("nivel")) medidas.nivel = nivelEfectivoUsuario(usuario) >= 2;
+    const ahora = new Date().toISOString().slice(0, 19).replace("T", " ");
+    const fila = await env.DB.prepare("SELECT primer_acceso_at, created_at FROM users WHERE id = ?").bind(uid).first();
+    const inicio = (fila && (fila.primer_acceso_at || fila.created_at)) || ahora;
+    const r = evaluarRutaBienvenida(usuario.rol, medidas, guardado, ahora, inicio);
+    if (Object.keys(r.nuevos).length) await guardarRutaBienvenidaGuardada(env, uid, { ...guardado, ...r.nuevos });
+    delete r.nuevos;
+    return r;
+  } catch { return { aplica: false }; }
+}
+
+// Nivel efectivo de una fila de users según su rol: admin = máximo; fotógrafo = F1/F2
+// (se recorta a 1..2 por si venía de un nivel de redacción más alto); redactor = su nivel.
+function nivelEfectivoUsuario(user) {
+  if (!user) return 1;
+  if (user.rol === "admin") return NIVEL_MAXIMO;
+  const n = Math.max(1, Number(user.nivel) || 1);
+  return user.rol === "fotografo" ? Math.min(n, NIVEL_MAXIMO_FOTOGRAFO) : n;
+}
+
+// "F1"/"F2" para un fotógrafo, "1".."4" para el resto (mensajes y actividad).
+function etiquetaNivelUsuario(user, nivel) {
+  return user && user.rol === "fotografo" ? `F${nivel}` : String(nivel);
+}
+
+// Progreso de un fotógrafo: no hay cifras, solo nivel actual, siguiente y criterios.
+function construirProgresoFotografo(usuario) {
+  const nivelActual = nivelEfectivoUsuario(usuario);
+  const siguiente = nivelActual < NIVEL_MAXIMO_FOTOGRAFO ? nivelActual + 1 : null;
+  return {
+    tipo_nivel: "fotografo",
+    es_fotografo: true,
+    es_admin: false,
+    nivel_actual: nivelActual,
+    nivel_info: NIVELES_FOTO_INFO[nivelActual],
+    nivel_nota: usuario.nivel_nota || null,
+    publicaciones: {},
+    nivel_maximo: nivelActual >= NIVEL_MAXIMO_FOTOGRAFO,
+    siguiente_nivel: siguiente,
+    siguiente_nivel_info: siguiente ? NIVELES_FOTO_INFO[siguiente] : null,
+    progreso: null,
+    criterios: NIVELES_FOTO_CRITERIOS,
+  };
+}
+
 // Construye el objeto de progreso completo de un usuario: nivel
 // actual, conteo de publicaciones, progreso hacia el siguiente nivel
 // (si existe uno por encima de NIVEL_MAXIMO) y si ya está en
@@ -6334,6 +8370,8 @@ function calcularProgresoNivel(conteo, requisitos) {
 const NIVEL_MAXIMO = 4;
 
 async function construirProgresoNivel(env, usuario, conteoPrecalculado) {
+  // Fotografía (F1–F2): sistema propio, sin conteo de publicaciones.
+  if (usuario.rol === "fotografo") return construirProgresoFotografo(usuario);
   // Los admins publican directamente, revisan todo y no tienen que
   // demostrar nada con cifras: a efectos de "Mi progreso" y de la
   // tabla de Usuarios se muestran siempre en el nivel máximo, aunque
@@ -6678,11 +8716,12 @@ async function tienePermisoTemporal(env, payload, tipoEntidad, entidadId) {
 
 // Combina las comprobaciones: autoría directa (o coautoría, si se
 // pasa), atajo general para "resultado" (cualquier redactor puede
-// editar/borrar el resultado de cualquier otro, incluido su minuto a
+// editar el resultado de cualquier otro, incluido su minuto a
 // minuto/cronómetro en directo -decisión explícita: los partidos son
 // contenido compartido del equipo, no propiedad exclusiva de quien lo
 // creó, y cualquier redactor puede necesitar tomar el relevo de un
-// partido en directo-), nivel 4 para "articulo" (revisa/corrige
+// partido en directo-; BORRAR un partido no entra en este atajo: ver
+// puedeBorrarResultado), nivel 4 para "articulo" (revisa/corrige
 // contenido de cualquiera sin tener que pedir permiso, ver documento
 // de niveles), o permiso temporal concedido por una solicitud aprobada.
 async function puedeEditar(env, payload, tipoEntidad, entidadId, autorId, coautorId) {
@@ -6695,6 +8734,16 @@ async function puedeEditar(env, payload, tipoEntidad, entidadId, autorId, coauto
     if (nivel >= 4) return true;
   }
   return tienePermisoTemporal(env, payload, tipoEntidad, entidadId);
+}
+
+// Borrar un partido es más grave que tomar el relevo en directo (que sí
+// puede hacer cualquier redactor, ver puedeEditar): solo el autor, un admin
+// o quien tenga una solicitud de edición aprobada y vigente. Un partido sin
+// autor (importado/creado por el sistema) solo lo borra un admin.
+async function puedeBorrarResultado(env, payload, resultadoId, autorId) {
+  if (payload.rol === "admin") return true;
+  if (autorId && autorId === payload.uid) return true;
+  return tienePermisoTemporal(env, payload, "resultado", resultadoId);
 }
 
 // Publica las noticias programadas cuyo "programado_para" ya se ha
@@ -6769,6 +8818,10 @@ async function iniciarCronometroPartido(env, resultadoId, minutoInicial = 0, opc
   } catch (err) {
     console.log("[añadido] no se pudo limpiar el añadido anunciado:", err.message);
   }
+  // El "Seguir jugando" también es de una sola parte: se borra con el añadido
+  // (al arrancar de cero o al empezar la 2ª parte). Si se retoma tras una pausa
+  // normal en la misma parte, se conserva.
+  if (minutos === 0 || opciones.segundaParte) await limpiarAnadidoSeguir(env, resultadoId);
 }
 
 // Revisa cada minuto (mismo cron que ya revisaba artículos programados)
@@ -6885,6 +8938,34 @@ async function iniciarPartidosProgramadosCuyaHoraHaLlegado(env) {
 // minuto, sin esperar a que el redactor pulse el botón del panel.
 const MINUTO_DESCANSO_AUTOMATICO = 45;
 
+// Margen que se da al redactor cuando se agota el añadido ANUNCIADO (45+N /
+// 90+N) antes de poner solo el descanso / el final. En ese minuto el panel de
+// Minuto a Minuto abre un aviso con cuenta atrás: puede pulsar "Seguir jugando"
+// (prolongar_anadido, +1') o cerrar ya; si no hace nada, se cierra solo al
+// acabar el margen. El descanso / final se registra igualmente en 45+N / 90+N.
+// Es un nº entero de minutos porque el reloj del servidor va por minutos.
+const MINUTOS_GRACIA_FIN_ANADIDO = 1;
+
+// "Seguir jugando" en el aviso de fin de añadido: el redactor decide que el reloj
+// siga corriendo SIN tocar el añadido anunciado (se queda en +6', por ejemplo).
+// Se guarda en results.anadido_seguir (migracion_anadido_seguir.sql). Con ese
+// indicador puesto, ni el cron ni "cerrar_anadido" paran el reloj: el descanso /
+// el final los pita el redactor a mano. Las dos funciones son a prueba de
+// migración sin aplicar: sin la columna, el indicador cuenta como "no puesto".
+async function anadidoSeguirActivo(env, resultadoId) {
+  try {
+    const f = await env.DB.prepare("SELECT anadido_seguir FROM results WHERE id = ?").bind(resultadoId).first();
+    return !!(f && Number(f.anadido_seguir) === 1);
+  } catch (err) {
+    return false;
+  }
+}
+async function limpiarAnadidoSeguir(env, resultadoId) {
+  try {
+    await env.DB.prepare("UPDATE results SET anadido_seguir = NULL WHERE id = ?").bind(resultadoId).run();
+  } catch (err) { /* migración sin aplicar: no hay nada que limpiar */ }
+}
+
 // Revisa cada minuto (mismo cron que ya revisa partidos programados y
 // partidos desatendidos) los partidos "en_juego" cuyo cronómetro sigue
 // corriendo y ya ha alcanzado el final de la 1ª parte (45, o 45+N si el
@@ -6892,7 +8973,7 @@ const MINUTO_DESCANSO_AUTOMATICO = 45;
 // si todavía no existe uno. Se limita a partidos con el cronómetro
 // corriendo: si ya está pausado es que alguien ya ha pitado algo
 // (descanso, hidratación...) y no hay que tocarlo.
-async function crearDescansoAutomaticoAlMinuto45(env, partidosEnJuego) {
+async function crearDescansoAutomaticoAlMinuto45(env, partidosEnJuego, opciones) {
   // partidosEnJuego (opcional): lista ya cargada por el cron (ver
   // "scheduled" -- se pide UNA sola vez por minuto en vez de que cada
   // una de las funciones que miran 'en_juego' repita la misma consulta).
@@ -6907,7 +8988,12 @@ async function crearDescansoAutomaticoAlMinuto45(env, partidosEnJuego) {
     // Con añadido anunciado el reloj NO se para en el 45 sino en 45+N.
     const anadido = anadidoAnunciado(partido, 1);
     const minutoDescanso = MINUTO_DESCANSO_AUTOMATICO + anadido;
-    if (minuto < minutoDescanso) continue;
+    // Con añadido anunciado se espera el margen del aviso con cuenta atrás
+    // (salvo cierre pedido a mano desde el panel: opciones.sinGracia).
+    const gracia = anadido > 0 && !(opciones && opciones.sinGracia) ? MINUTOS_GRACIA_FIN_ANADIDO : 0;
+    if (minuto < minutoDescanso + gracia) continue;
+    // "Seguir jugando": el redactor ha decidido que el reloj siga; el descanso lo pita él.
+    if (anadido > 0 && await anadidoSeguirActivo(env, partido.id)) continue;
 
     const yaHuboDescanso = await env.DB.prepare(
       "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = 'descanso' LIMIT 1"
@@ -6926,6 +9012,9 @@ async function crearDescansoAutomaticoAlMinuto45(env, partidosEnJuego) {
     await env.DB.prepare(
       `INSERT INTO match_events (resultado_id, tipo, equipo, minuto, minuto_extra, orden, var_motivo) VALUES (?, 'descanso', 'ninguno', ?, ?, 0, 'automatico')`
     ).bind(partido.id, MINUTO_DESCANSO_AUTOMATICO, anadido > 0 ? anadido : null).run();
+    // Aviso push del descanso: notificarPushPartido lo descarta si el partido
+    // no está cubierto (ningún evento puesto a mano).
+    await notificarPushPartido(env, partido.id, "descanso", { automatico: true });
   }
 }
 
@@ -6976,12 +9065,12 @@ async function reanudarSegundaParteAutomatica(env, partidosEnJuego) {
 
 // Minuto real (de cronómetro) a partir del cual se considera que nadie
 // va a cubrir ya el final del partido y el cron lo cierra solo. Se ha
-// subido de 100 a 150 para dar mucho más margen antes de intervenir
+// fijado en 105 (90+15): un partido sin cubrir se cierra pronto. Antes 150, que dejaba el partido abierto demasiado tiempo
 // (tiempo añadido, prórroga de Copa/playoffs, tanda de penaltis...): un
 // partido real casi nunca llega aquí sin que alguien haya pitado ya el
 // final, así que sigue siendo una red de seguridad, no la forma habitual
 // de cerrar partidos.
-const MINUTO_FIN_PARTIDO_AUTOMATICO = 150;
+const MINUTO_FIN_PARTIDO_AUTOMATICO = 105; // 90+15: antes 150 (90+60), demasiado tarde para un partido sin cubrir
 
 // Minuto con el que se REGISTRA el evento "fin_partido" y el marcador
 // del partido cuando lo cierra el cron (no el minuto real en el que se
@@ -7037,6 +9126,10 @@ async function crearFinPartidoAutomaticoAlMinuto90(env, partidosEnJuego) {
       "UPDATE results SET estado = 'finalizado', aviso_desatendido_mitad = NULL, finalizado_no_cubierto = 1 WHERE id = ?"
     ).bind(partido.id).run();
     await invalidarCacheArticuloPartido(env, partido.id);
+    // NO se envía aviso push de final: un partido cerrado por el cron sin que
+    // nadie lo cubriera (finalizado_no_cubierto = 1) nunca notifica el final,
+    // porque su marcador no es fiable. (Además notificarPushPartido lo
+    // descarta por su cuenta como segunda barrera.)
   }
 }
 
@@ -7045,7 +9138,7 @@ async function crearFinPartidoAutomaticoAlMinuto90(env, partidosEnJuego) {
 // hace nada: el final sigue siendo manual (o el cierre de red de seguridad
 // de crearFinPartidoAutomaticoAlMinuto90). Es un cierre deliberado, no un
 // partido sin cubrir: finalizado_no_cubierto = 0.
-async function cerrarPartidoAlTerminarAnadido(env, ctx, partidosEnJuego) {
+async function cerrarPartidoAlTerminarAnadido(env, ctx, partidosEnJuego, opciones) {
   const partidos = (partidosEnJuego ?? (await env.DB.prepare(
     `SELECT id, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos, anadido_minutos, anadido_parte
      FROM results WHERE estado = 'en_juego' AND cronometro_pausado_en IS NULL`
@@ -7054,7 +9147,12 @@ async function cerrarPartidoAlTerminarAnadido(env, ctx, partidosEnJuego) {
     const anadido = anadidoAnunciado(partido, 2);
     if (!anadido) continue;
     const limite = 90 + anadido;
-    if (minutoEnVivoServidor(partido) < limite) continue;
+    // El cierre espera el margen del aviso con cuenta atrás (el reloj se
+    // registra igualmente en 90+N), salvo cierre pedido a mano (sinGracia).
+    const gracia = opciones && opciones.sinGracia ? 0 : MINUTOS_GRACIA_FIN_ANADIDO;
+    if (minutoEnVivoServidor(partido) < limite + gracia) continue;
+    // "Seguir jugando": el reloj sigue y el final lo pita el redactor a mano.
+    if (await anadidoSeguirActivo(env, partido.id)) continue;
 
     const yaHuboFin = await env.DB.prepare(
       "SELECT id FROM match_events WHERE resultado_id = ? AND tipo = 'fin_partido' LIMIT 1"
@@ -7068,6 +9166,9 @@ async function cerrarPartidoAlTerminarAnadido(env, ctx, partidosEnJuego) {
       "UPDATE results SET cronometro_pausado_en = ?, estado = 'finalizado', aviso_desatendido_mitad = NULL, finalizado_no_cubierto = 0 WHERE id = ?"
     ).bind(limite, partido.id).run();
     await invalidarCacheArticuloPartido(env, partido.id);
+    // Aviso push de final también en el cierre automático al acabar el añadido.
+    const avisoFin = notificarPushPartido(env, partido.id, "fin_partido", { automatico: true });
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(avisoFin); else await avisoFin;
   }
 }
 
@@ -7719,11 +9820,11 @@ async function publicarArticulosProgramados(env) {
     await marcarFueraDeCalendario(env, articulo.id, { tipo: articulo.tipo, resultado_id: articulo.resultado_id });
     // Aviso push a quien lo tenga activado (nunca lanza ni bloquea la publicacion).
     await notificarPushArticulo(env, articulo);
-    await notificarStaffArticulo(env, articulo, { excluirUid: articulo.autor_id || null });
+    await notificarStaffArticulo(env, articulo, { excluirUid: articulo.autor_id || null, sinRevisionUid: articulo.autor_id || null });
     // Aviso a los buscadores (IndexNow); nunca lanza.
     await notificarIndexNow(env, [urlNoticia(articulo.categoria, articulo.slug)]);
 
-    const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista", uno_por_uno: "1x1 de jugadores" }[articulo.tipo] || "Artículo";
+    const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista", uno_por_uno: "1x1 de jugadores", rdp_previa: "Rueda de prensa previa", rdp_post: "Rueda de prensa posterior" }[articulo.tipo] || "Artículo";
     const firmaAutores = articulo.coautor_nombre ? `${articulo.autor_nombre} y ${articulo.coautor_nombre}` : articulo.autor_nombre;
 
     await enviarEmailNotificacion(env, {
@@ -8841,6 +10942,244 @@ function construirEmailRecordatorioInactividad({ nombre, diasSinSubir, numeroAvi
   return { asunto, texto, html };
 }
 
+/*
+ * ================================================================
+ * RECORDATORIO DE GALERÍA A FOTÓGRAFOS ACREDITADOS
+ * ================================================================
+ * Al acabar un partido, cada fotógrafo con la acreditación APROBADA para ese
+ * partido recibe un correo (con el diseño de los demás avisos) preguntándole
+ * si ya ha subido la galería fotográfica y explicándole cómo hacerlo.
+ *
+ *   - Quién: solicitudes de acreditación en estado 'aprobada' cuyo tipo es de
+ *     fotógrafo (p. ej. "Fotógrafo (césped)").
+ *   - A qué partido corresponde cada una: la solicitud no guarda el id del
+ *     partido, así que se empareja por EQUIPO + (fecha_partido, si el admin la
+ *     puso, o el número de "Jornada N" que figura en jornada_partido). Solo se
+ *     miran los partidos 'finalizado' de hoy y de ayer (hora de Madrid). Si no
+ *     hay fecha ni jornada, o salen varios partidos posibles, NO se adivina:
+ *     no se envía nada.
+ *   - Cuándo: partido con hora -> a partir de 120 min tras el inicio (90' +
+ *     descanso + margen). Partido solo con fecha -> a partir de las 22:00
+ *     (Madrid) del mismo día, o ya al día siguiente.
+ *   - No se envía si el fotógrafo ya tiene fotos suyas en la galería de ese
+ *     partido (cuenta de la web con el mismo correo). Si no se encuentra su
+ *     cuenta, se mira si el partido tiene alguna galería; si no, se envía y el
+ *     correo le dice que responda si aún no tiene acceso al panel.
+ *   - Una sola vez por solicitud y partido: se reclama en la tabla
+ *     recordatorios_galeria ANTES de enviar (si el envío falla se libera para
+ *     reintentar en la siguiente pasada).
+ *
+ * Solo corre en el Worker principal (D1), no en el cron de respaldo de Railway
+ * (saldrían los correos duplicados). Pasada cada 10 min como mucho; apagable con
+ * la variable RECORDATORIO_GALERIA_DESACTIVADO=1.
+ */
+const GALERIA_RECORDATORIO_INTERVALO_MS = 10 * 60 * 1000;
+const GALERIA_RECORDATORIO_ESPERA_MIN = 120;
+const GALERIA_RECORDATORIO_HORA_SOLO_FECHA = 22;
+const GALERIA_RECORDATORIO_MAX_POR_PASADA = 20;
+const GALERIA_RECORDATORIO_KV = "recordatorio_galeria:ultimo_ms";
+let GALERIA_RECORDATORIO_ULTIMO_MS = 0;
+let GALERIA_RECORDATORIO_TABLA_LISTA = false;
+
+function claveEquipoGaleria(nombre) {
+  const canonico = canonicoClubPorAlias(nombre) || nombre;
+  return syncClaveEquipo(canonico);
+}
+function mismoEquipoGaleria(a, b) {
+  const x = claveEquipoGaleria(a), y = claveEquipoGaleria(b);
+  return !!x && !!y && x === y;
+}
+function esAcreditacionFotografo(tipo) {
+  return /fot[oó]graf|c[eé]sped/i.test(String(tipo || ""));
+}
+
+// Partido (de la lista de finalizados recientes) al que corresponde una
+// acreditación, o null si no se puede saber con seguridad.
+function partidoDeAcreditacionGaleria(a, partidos) {
+  const propios = (partidos || []).filter((p) => mismoEquipoGaleria(a.equipo, p.equipo_local) || mismoEquipoGaleria(a.equipo, p.equipo_visitante));
+  if (!propios.length) return null;
+  let candidatos;
+  const fechaA = String(a.fecha_partido || "").slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(fechaA)) {
+    candidatos = propios.filter((p) => String(p.fecha_partido || "").slice(0, 10) === fechaA);
+  } else {
+    const m = /(?:jornada|j\.?)\s*(\d{1,2})\b/i.exec(String(a.jornada_partido || ""));
+    if (!m) return null;
+    candidatos = propios.filter((p) => Number(p.jornada) === Number(m[1]));
+  }
+  if (candidatos.length > 1) {
+    const texto = syncClaveEquipo(a.jornada_partido || "");
+    const porRival = candidatos.filter((p) => {
+      const rival = mismoEquipoGaleria(a.equipo, p.equipo_local) ? p.equipo_visitante : p.equipo_local;
+      const k = claveEquipoGaleria(rival);
+      return !!k && texto.includes(k);
+    });
+    return porRival.length === 1 ? porRival[0] : null;
+  }
+  return candidatos.length === 1 ? candidatos[0] : null;
+}
+
+// ¿Ya toca avisar de este partido? (instante `ahora`, ms UTC)
+function partidoListoParaRecordatorioGaleria(p, ahora) {
+  const fecha = String(p.fecha_partido || "");
+  if (fecha.length === 16) {
+    const utc = fechaPartidoAUtcSqlite(fecha);
+    const ms = utc ? msDesdeFechaBD(utc) : null;
+    return ms !== null && ahora >= ms + GALERIA_RECORDATORIO_ESPERA_MIN * 60000;
+  }
+  const dia = fecha.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dia)) return false;
+  const { dia: hoy, hora } = diaYHoraEnMadrid(new Date(ahora));
+  if (dia < hoy) return true;
+  return dia === hoy && hora >= GALERIA_RECORDATORIO_HORA_SOLO_FECHA;
+}
+
+async function asegurarTablaRecordatoriosGaleria(env) {
+  if (GALERIA_RECORDATORIO_TABLA_LISTA) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS recordatorios_galeria (
+       acreditacion_id INTEGER NOT NULL,
+       result_id INTEGER NOT NULL,
+       email TEXT,
+       enviado_at TEXT NOT NULL DEFAULT (datetime('now')),
+       PRIMARY KEY (acreditacion_id, result_id)
+     )`
+  ).run();
+  GALERIA_RECORDATORIO_TABLA_LISTA = true;
+}
+
+// true = ya tiene galería (no avisar), false = no la tiene, null = no se pudo comprobar.
+async function fotografoYaSubioGaleria(env, resultId, userId) {
+  try {
+    const fila = userId
+      ? await env.DB.prepare(
+          `SELECT 1 AS x FROM match_gallery mg JOIN media m ON m.id = mg.media_id
+            WHERE mg.result_id = ? AND (m.autor_id = ? OR mg.vinculado_por_id = ?) LIMIT 1`
+        ).bind(resultId, userId, userId).first()
+      : await env.DB.prepare("SELECT 1 AS x FROM match_gallery WHERE result_id = ? LIMIT 1").bind(resultId).first();
+    return !!fila;
+  } catch (err) {
+    console.log("Recordatorio de galería: no se pudo comprobar la galería:", err.message);
+    return null;
+  }
+}
+
+// Correo con el diseño de los avisos del medio. Devuelve true si salió.
+async function enviarCorreoRecordatorioGaleria(env, a, p, { tieneCuenta = true } = {}) {
+  if (!a || !a.email) return false;
+  const primerNombre = String(a.nombre || "").trim().split(/\s+/)[0] || "";
+  const partido = `${p.equipo_local} - ${p.equipo_visitante}`;
+  const marcador = p.goles_local !== null && p.goles_local !== undefined && p.goles_visitante !== null && p.goles_visitante !== undefined
+    ? `${p.equipo_local} ${p.goles_local}-${p.goles_visitante} ${p.equipo_visitante}` : "";
+  const dia = String(p.fecha_partido || "").slice(0, 10);
+  const fechaLegible = /^\d{4}-\d{2}-\d{2}$/.test(dia) ? dia.split("-").reverse().join("/") : "";
+  const urlPanel = `${SITIO_URL}/admin/panel.html`;
+  const intro = `${primerNombre ? "Hola " + primerNombre + ", g" : "G"}racias por cubrir ${partido} con ElOtroFútbol. ¿Has podido subir ya la galería fotográfica del partido?`;
+  const pasos = [
+    "En el panel, entra en <strong>Contenido &rsaquo; Subir contenido</strong> y sube tus fotos.",
+    "Después, en <strong>Contenido &rsaquo; Galería de partido</strong>, elige el partido y añade las fotos a su galería.",
+  ];
+  const bloques = [
+    `<p style="margin:0 0 10px;font-weight:700;color:#0c1b2e;">Si todavía no la has subido, son dos pasos:</p>`,
+    `<ol style="margin:0 0 16px;padding-left:20px;">${pasos.map((t) => `<li style="margin:0 0 8px;">${t}</li>`).join("")}</ol>`,
+    `<p style="margin:0 0 12px;">Si ya la tienes subida, ¡mil gracias! Tus fotos se publican con tu crédito.</p>`,
+    `<p style="margin:0;color:#5a6270;font-size:14px;">${tieneCuenta
+      ? "¿Algún problema con el acceso, con las fotos o no pudiste hacerlas? Responde a este correo y lo vemos sin problema."
+      : "Si aún no tienes acceso al panel, responde a este correo y te lo damos."}</p>`,
+  ];
+  const texto = [
+    intro, "",
+    marcador ? `Partido: ${marcador}` : `Partido: ${partido}`,
+    p.jornada ? `Jornada: ${p.jornada}` : "",
+    fechaLegible ? `Fecha: ${fechaLegible}` : "",
+    "",
+    "Si todavía no la has subido, son dos pasos:",
+    "1. En el panel, entra en Contenido > Subir contenido y sube tus fotos.",
+    "2. Después, en Contenido > Galería de partido, elige el partido y añade las fotos a su galería.",
+    "",
+    `Panel: ${urlPanel}`,
+    "",
+    "Si ya la tienes subida, ¡mil gracias! Tus fotos se publican con tu crédito.",
+    tieneCuenta ? "¿Algún problema o no pudiste hacer fotos? Responde a este correo y lo vemos." : "Si aún no tienes acceso al panel, responde a este correo y te lo damos.",
+    "", "Este es un mensaje automático de ElOtroFútbol; puedes responder a este correo.",
+  ].filter((l, i, arr) => !(l === "" && arr[i - 1] === "")).join("\n");
+  const html = plantillaEmail({
+    etiqueta: "Galería de partido",
+    titulo: "¿Has subido ya la galería del partido?",
+    preheader: `Recordatorio de la galería de ${partido}`,
+    parrafo: intro,
+    filas: [
+      { etiqueta: "Partido", valor: marcador || partido },
+      { etiqueta: "Jornada", valor: p.jornada ? String(p.jornada) : "" },
+      { etiqueta: "Fecha", valor: fechaLegible },
+    ],
+    bloqueHtml: bloques.join(""),
+    boton: { texto: "Ir al panel", url: urlPanel },
+    pieHtml: "Mensaje automático de ElOtroFútbol: lo recibes porque tenías acreditación de fotógrafo para este partido. Puedes responder a este correo.",
+  });
+  return enviarEmailNotificacion(env, { asunto: `¿Has subido ya la galería de ${partido}? · ElOtroFútbol`, texto, html }, { destinatario: a.email, replyTo: EMAIL_NOTIFICACIONES });
+}
+
+// Una pasada (cada 10 min como mucho). Devuelve cuántos correos salieron.
+async function enviarRecordatoriosGaleriaSiToca(env) {
+  if (env.RECORDATORIO_GALERIA_DESACTIVADO === "1" || env.RECORDATORIO_GALERIA_DESACTIVADO === 1) return 0;
+  const ahora = Date.now();
+  if (ahora - GALERIA_RECORDATORIO_ULTIMO_MS < GALERIA_RECORDATORIO_INTERVALO_MS) return 0;
+  GALERIA_RECORDATORIO_ULTIMO_MS = ahora;
+  try {
+    if (env.ELOTROFUTBOL_KV) {
+      const previo = Number(await env.ELOTROFUTBOL_KV.get(GALERIA_RECORDATORIO_KV)) || 0;
+      if (ahora - previo < GALERIA_RECORDATORIO_INTERVALO_MS) return 0;
+      await env.ELOTROFUTBOL_KV.put(GALERIA_RECORDATORIO_KV, String(ahora), { expirationTtl: 3600 });
+    }
+    const hoy = diaYHoraEnMadrid(new Date(ahora)).dia;
+    const ayer = diaYHoraEnMadrid(new Date(ahora - 24 * 3600 * 1000)).dia;
+    const { results: partidos } = await env.DB.prepare(
+      `SELECT id, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido
+         FROM results
+        WHERE estado = 'finalizado' AND substr(fecha_partido, 1, 10) IN (?, ?)`
+    ).bind(hoy, ayer).all();
+    const listos = (partidos || []).filter((p) => partidoListoParaRecordatorioGaleria(p, ahora));
+    if (!listos.length) return 0;
+
+    const { results: acreditaciones } = await env.DB.prepare(
+      `SELECT id, nombre, email, equipo, tipo_acreditacion, jornada_partido, fecha_partido
+         FROM acreditaciones
+        WHERE estado = 'aprobada' AND email <> ''
+          AND (tipo_acreditacion LIKE '%fot%graf%' OR tipo_acreditacion LIKE '%c_sped%')`
+    ).all();
+    if (!(acreditaciones || []).length) return 0;
+
+    await asegurarTablaRecordatoriosGaleria(env);
+    let enviados = 0;
+    for (const a of acreditaciones) {
+      if (enviados >= GALERIA_RECORDATORIO_MAX_POR_PASADA) break;
+      if (!esAcreditacionFotografo(a.tipo_acreditacion)) continue;
+      const p = partidoDeAcreditacionGaleria(a, listos);
+      if (!p) continue;
+      const ya = await env.DB.prepare("SELECT 1 AS x FROM recordatorios_galeria WHERE acreditacion_id = ? AND result_id = ?").bind(a.id, p.id).first();
+      if (ya) continue;
+      const cuenta = await env.DB.prepare("SELECT id FROM users WHERE LOWER(email) = ? AND activo = 1 LIMIT 1").bind(String(a.email).trim().toLowerCase()).first();
+      const subida = await fotografoYaSubioGaleria(env, p.id, cuenta ? cuenta.id : null);
+      if (subida === null) continue; // no se pudo comprobar: se reintenta en la siguiente pasada
+      // Se reclama antes de enviar (también si ya subió: así no se vuelve a comprobar cada pasada).
+      const r = await env.DB.prepare("INSERT OR IGNORE INTO recordatorios_galeria (acreditacion_id, result_id, email) VALUES (?, ?, ?)").bind(a.id, p.id, a.email).run();
+      if (!(r && r.meta && r.meta.changes)) continue;
+      if (subida) continue;
+      const ok = await enviarCorreoRecordatorioGaleria(env, a, p, { tieneCuenta: !!cuenta });
+      if (ok) {
+        enviados++;
+      } else {
+        await env.DB.prepare("DELETE FROM recordatorios_galeria WHERE acreditacion_id = ? AND result_id = ?").bind(a.id, p.id).run();
+      }
+    }
+    return enviados;
+  } catch (err) {
+    console.log("Error en los recordatorios de galería a fotógrafos:", err && err.message);
+    return 0;
+  }
+}
+
 async function enviarRecordatoriosInactividadSiToca(env) {
   const ahora = new Date();
   const { dia, hora } = diaYHoraEnMadrid(ahora);
@@ -9778,18 +12117,54 @@ async function notificarPushArticulo(env, articulo) {
   }
 }
 
-// Aviso de gol o de final de partido. Se llama DESPUES de recalcular el
+// ¿Hay un redactor cubriendo de verdad el partido? Los eventos que se crean
+// solos (arranque, descanso, reanudación y final del cron) no cuentan: solo
+// cuenta cualquier otro evento (gol, tarjeta, cambio, añadido...), que siempre
+// lo mete una persona desde el panel de Minuto a Minuto.
+async function partidoTieneCoberturaManual(env, resultadoId) {
+  try {
+    const f = await env.DB.prepare(
+      "SELECT 1 AS x FROM match_events WHERE resultado_id = ? AND tipo NOT IN ('inicio_partido', 'descanso', 'fin_descanso', 'fin_partido') LIMIT 1"
+    ).bind(resultadoId).first();
+    return !!f;
+  } catch (err) {
+    return false;
+  }
+}
+
+// Aviso de gol, descanso o final de partido. Se llama DESPUES de recalcular el
 // marcador, para que lo que se envia sea el resultado ya actualizado.
 async function notificarPushPartido(env, resultadoId, tipo, evento = {}) {
   try {
     const r = await env.DB.prepare(
-      "SELECT equipo_local, equipo_visitante, goles_local, goles_visitante, estado FROM results WHERE id = ?"
+      "SELECT equipo_local, equipo_visitante, goles_local, goles_visitante, estado, finalizado_no_cubierto FROM results WHERE id = ?"
     ).bind(resultadoId).first();
     if (!r) return;
+    // Interruptor "Notificaciones push" del panel de Minuto a Minuto: results.avisos_push
+    // = 0 silencia TODOS los avisos de este partido (también los automáticos: descanso,
+    // final, añadido). NULL/1 = avisa (por defecto sí). Si la columna aún no existe
+    // (migración sin aplicar) se avisa como siempre.
+    try {
+      const pref = await env.DB.prepare("SELECT avisos_push FROM results WHERE id = ?").bind(resultadoId).first();
+      if (pref && pref.avisos_push !== null && pref.avisos_push !== undefined && Number(pref.avisos_push) === 0) return;
+    } catch { /* columna sin migrar: se avisa */ }
+    // Partido marcado como NO CUBIERTO: jamás se avisa del final.
+    if (tipo === "fin_partido" && Number(r.finalizado_no_cubierto) === 1) return;
+    // Descanso: solo de partidos CUBIERTOS. Si lo pita el redactor a mano, está
+    // cubierto por definición. Si lo pone solo el cron (evento.automatico), solo
+    // se avisa cuando hay señales de que alguien lo está cubriendo (algún evento
+    // metido a mano); en un partido sin cubrir no se avisa nunca.
+    if (tipo === "descanso") {
+      if (r.estado !== "en_juego" || Number(r.finalizado_no_cubierto) === 1) return;
+      if (evento.automatico === true && !(await partidoTieneCoberturaManual(env, resultadoId))) return;
+    }
     const marcador = `${r.equipo_local} ${r.goles_local ?? 0}-${r.goles_visitante ?? 0} ${r.equipo_visitante}`;
     let titulo, cuerpo;
     if (tipo === "fin_partido") {
       titulo = "\uD83C\uDFC1 Final";
+      cuerpo = marcador;
+    } else if (tipo === "descanso") {
+      titulo = "\u23F8\uFE0F Descanso";
       cuerpo = marcador;
     } else if (tipo === "gol_var" || tipo === "correccion") {
       // Anulaciones por VAR y correcciones de marcador: van en el mismo grupo
@@ -9816,7 +12191,7 @@ async function notificarPushPartido(env, resultadoId, tipo, evento = {}) {
       cuerpo = `${marcador} \u00B7 ${parteTxt}`;
     } else if (tipo === "gol" || tipo === "gol_pp") {
       const minuto = evento.minuto ? ` (${parseInt(evento.minuto, 10)}'${evento.minuto_extra ? "+" + parseInt(evento.minuto_extra, 10) : ""})` : "";
-      titulo = tipo === "gol_pp" ? "\u26BD Gol en propia puerta" : "\u26BD \u00A1Gol!";
+      titulo = tipo === "gol_pp" ? "\u26BD Gol en propia puerta" : (evento.es_penalti ? "\u26BD \u00A1Gol de penalti!" : "\u26BD \u00A1Gol!");
       cuerpo = `${marcador}${minuto}${evento.jugador && tipo === "gol" ? " \u00B7 " + pushRecortar(evento.jugador, 40) : ""}`;
     } else {
       return;
@@ -10062,16 +12437,33 @@ async function staffPushEnviar(env, categoria, mensaje, { excluirUid = null, sol
   }
 }
 
+// ¿Quien publica lo hace SIN revisión de nadie Y sin poder subirla a redes? Solo un
+// redactor de Nivel 2: publica directo (ver obtenerNivelUsuario) y ningún Nivel 4 /
+// admin pasa por la noticia, así que nadie la lleva a redes si no se les avisa. El
+// Nivel 3 ya puede subir a redes (Instagram/TikTok), y el 4 y admin las organizan
+// ellos mismos: no necesitan el aviso.
+async function autorPublicaSinRevision(env, uid) {
+  try {
+    if (!uid) return false;
+    const u = await env.DB.prepare("SELECT rol, nivel FROM users WHERE id = ?").bind(uid).first();
+    const nivel = Number(u && u.nivel) || 1;
+    return !!u && u.rol === "redactor" && nivel === 2;
+  } catch { return false; }
+}
+
 // Noticia/cronica subida por otra persona: publicada, o borrador terminado
 // pendiente de revisar. "art" necesita titulo, slug, categoria y tipo.
-async function notificarStaffArticulo(env, art, { excluirUid = null, borrador = false } = {}) {
+async function notificarStaffArticulo(env, art, { excluirUid = null, borrador = false, sinRevisionUid = null } = {}) {
   try {
     if (!art || !art.titulo) return;
-    const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista", uno_por_uno: "1x1 de jugadores" }[art.tipo] || "Artículo";
+    const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista", uno_por_uno: "1x1 de jugadores", rdp_previa: "Rueda de prensa previa", rdp_post: "Rueda de prensa posterior" }[art.tipo] || "Artículo";
     const firma = art.coautor_nombre ? `${art.autor_nombre} y ${art.coautor_nombre}` : (art.autor_nombre || "");
+    // Publicada por alguien de Nivel 2 (sin revisión): se pide expresamente que un
+    // Nivel 4 la suba a redes, porque si no nadie lo hace.
+    const sinRevision = !borrador && sinRevisionUid ? await autorPublicaSinRevision(env, sinRevisionUid) : false;
     await staffPushEnviar(env, "noticias", {
-      titulo: borrador ? `${tipoLabel}: borrador terminado` : `${tipoLabel} publicada`,
-      cuerpo: `${art.titulo}${firma ? ` · ${firma}` : ""}`,
+      titulo: borrador ? `${tipoLabel}: borrador terminado` : (sinRevision ? `${tipoLabel} publicada sin revisión` : `${tipoLabel} publicada`),
+      cuerpo: `${art.titulo}${firma ? ` · ${firma}` : ""}${sinRevision ? " — falta subirla a redes" : ""}`,
       ir: "noticias",
       url: !borrador && art.slug ? urlNoticia(art.categoria, art.slug) : undefined,
       tag: `noticia-${art.slug || pushClaveClub(art.titulo)}`,
@@ -10412,9 +12804,13 @@ export default {
         // Si la base de datos falla, mejor devolver un sitemap vacío pero
         // válido que un error 500: así un rastreador que llegue en ese
         // momento no ve un sitemap "roto", solo uno sin URLs esta vez.
+        // Un fallo de base de datos NO debe responder 200 con un sitemap vacío:
+        // el worker del sitio lo cachearía y Google creería que se han borrado
+        // todas las URLs. Un 503 con Retry-After hace que se siga sirviendo la
+        // última copia buena y que los buscadores reintenten más tarde.
         return cors(new Response(
-          `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>\n`,
-          { status: 200, headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "no-store" } }
+          "Servicio temporalmente no disponible",
+          { status: 503, headers: { "Content-Type": "text/plain; charset=UTF-8", "Retry-After": "300", "Cache-Control": "no-store" } }
         ), ORIGEN_PETICION_ACTUAL);
       }
     }
@@ -10457,6 +12853,13 @@ export default {
               : `${articulo.fecha_publicacion.replace(" ", "T")}Z`
           );
           if (Number.isNaN(fecha.getTime())) return null;
+          // fecha_publicacion se guarda con dos formatos (ISO con "T" al crear/editar y
+          // "YYYY-MM-DD HH:MM:SS" al publicar una programada), y el filtro SQL compara
+          // texto: una noticia ISO de hace ~70 h se colaba. Se filtra aquí con la fecha
+          // ya interpretada: Google News solo admite las últimas 48 h y descarta
+          // fechas de publicación futuras.
+          const ahoraMs = Date.now();
+          if (fecha.getTime() < ahoraMs - 48 * 3600 * 1000 || fecha.getTime() > ahoraMs + 5 * 60 * 1000) return null;
 
           return [
             "  <url>",
@@ -10495,9 +12898,13 @@ export default {
           },
         }), ORIGEN_PETICION_ACTUAL);
       } catch (err) {
+        // Un fallo de base de datos NO debe responder 200 con un sitemap vacío:
+        // el worker del sitio lo cachearía y Google creería que se han borrado
+        // todas las URLs. Un 503 con Retry-After hace que se siga sirviendo la
+        // última copia buena y que los buscadores reintenten más tarde.
         return cors(new Response(
-          `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9"></urlset>\n`,
-          { status: 200, headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "no-store" } }
+          "Servicio temporalmente no disponible",
+          { status: 503, headers: { "Content-Type": "text/plain; charset=UTF-8", "Retry-After": "300", "Cache-Control": "no-store" } }
         ), ORIGEN_PETICION_ACTUAL);
       }
     }
@@ -10546,9 +12953,13 @@ export default {
           headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "public, max-age=3600" },
         }), ORIGEN_PETICION_ACTUAL);
       } catch (err) {
+        // Un fallo de base de datos NO debe responder 200 con un sitemap vacío:
+        // el worker del sitio lo cachearía y Google creería que se han borrado
+        // todas las URLs. Un 503 con Retry-After hace que se siga sirviendo la
+        // última copia buena y que los buscadores reintenten más tarde.
         return cors(new Response(
-          `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>\n`,
-          { status: 200, headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "no-store" } }
+          "Servicio temporalmente no disponible",
+          { status: 503, headers: { "Content-Type": "text/plain; charset=UTF-8", "Retry-After": "300", "Cache-Control": "no-store" } }
         ), ORIGEN_PETICION_ACTUAL);
       }
     }
@@ -10679,7 +13090,9 @@ export default {
      * ============================================================
      */
 
-    if (env.FAILOVER_TEST === "1") {
+    // Con la secundaria desactivada (SECONDARY_ENABLED distinto de "true", ver
+    // wrangler.toml) FAILOVER_TEST se ignora: no se reenvía nada a Railway.
+    if (env.FAILOVER_TEST === "1" && env.SECONDARY_ENABLED === "true") {
       console.log("[FAILOVER] TEST ACTIVADO → Railway");
 
       return await fetchRailway(
@@ -10875,7 +13288,8 @@ export default {
       const funciones = P.funciones.activa ? (body.funciones ? String(body.funciones) : "").trim().slice(0, 2000) : "";
       const jornadaPartido = P.jornada_partido.activa ? limpiar(body.jornada_partido, 500) : "";
 
-      if (!nombre) return json({ error: P.nombre.error }, 400);
+      // Nombre completo obligatorio: al menos nombre y apellido (dos palabras).
+      if (nombre.split(" ").filter(Boolean).length < 2) return json({ error: P.nombre.error }, 400);
       if (!emailValido(email)) return json({ error: P.email.error }, 400);
       if (P.dni.activa) {
         if (dni ? (dni.length < 5 || !/^[A-Z0-9]+$/.test(dni)) : P.dni.obligatoria) return json({ error: P.dni.error }, 400);
@@ -10994,7 +13408,9 @@ export default {
       }
       try {
         await env.DB.prepare("INSERT INTO formularios_respuestas (formulario_id, datos) VALUES (?, ?)")
-          .bind(f.id, JSON.stringify(v.datos)).run();
+          // "_usuario" liga esta respuesta con la cuenta recién creada: al borrar el usuario se localiza
+          // sin depender de que su nombre, equipo o rol sigan iguales. Los campos con "_" no se muestran.
+          .bind(f.id, JSON.stringify(usuarioCreado ? { ...v.datos, _usuario: usuarioCreado } : v.datos)).run();
       } catch (err) {
         console.error("[formularios/responder]", err);
         if (usuarioCreado) { try { await env.DB.prepare("DELETE FROM users WHERE username = ?").bind(usuarioCreado).run(); } catch {} }
@@ -11303,6 +13719,21 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
         );
       }
 
+      // Secundaria desactivada: un 5xx del principal se devuelve tal cual (con
+      // CORS para que el navegador muestre el error real); no se reenvía a
+      // Railway. El aviso por email de enviarAlerta se mantiene.
+      if (env.SECONDARY_ENABLED !== "true") {
+        const cabecerasPrincipal = new Headers(primaryResponse.headers);
+        cabecerasPrincipal.set(FAILOVER_HEADER, "PRIMARY");
+        cabecerasPrincipal.set(FAILOVER_TEST_HEADER, "false");
+        ctx.waitUntil(enviarAlerta(env, `principal:${primaryResponse.status}`, `El principal respondió ${primaryResponse.status} (secundaria desactivada)`, `${method} ${path}`));
+        return cors(new Response(primaryResponse.body, {
+          status: primaryResponse.status,
+          statusText: primaryResponse.statusText,
+          headers: cabecerasPrincipal
+        }), request.headers.get("Origin"));
+      }
+
       /*
        * ==========================================================
        * PRINCIPAL RESPONDE 5XX
@@ -11341,6 +13772,11 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
        * ==========================================================
        */
 
+      if (esErrorJsonDelCliente(primaryError, request)) {
+        console.warn(`[JSON no válido] ${method} ${path}: ${primaryError.message}`);
+        return json({ error: "El cuerpo de la petición no es un JSON válido" }, 400);
+      }
+
       console.error(
         "[FAILOVER] Error en backend principal:",
         primaryError
@@ -11350,6 +13786,14 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
       if (esSubidaDeArchivo) {
         return json({
           error: "Error interno del servidor al procesar el archivo. Puede ser demasiado pesado.",
+          detail: primaryError && primaryError.message ? primaryError.message : String(primaryError),
+        }, 500);
+      }
+
+      // Secundaria desactivada: error 500 JSON (con CORS) en vez de reenviar a Railway.
+      if (env.SECONDARY_ENABLED !== "true") {
+        return json({
+          error: "Error interno del servidor",
           detail: primaryError && primaryError.message ? primaryError.message : String(primaryError),
         }, 500);
       }
@@ -11439,6 +13883,9 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
     // Recordatorios a redactores inactivos (una pasada al día; ver
     // "RECORDATORIOS DE INACTIVIDAD DE REDACTORES" arriba).
     ctx.waitUntil(enviarRecordatoriosInactividadSiToca(env));
+    // Recordatorio a fotógrafos acreditados de subir la galería del partido
+    // (ver "RECORDATORIO DE GALERÍA A FOTÓGRAFOS ACREDITADOS" arriba).
+    ctx.waitUntil(enviarRecordatoriosGaleriaSiToca(env));
     // Partidazo de la jornada por liga (ver "PARTIDAZO DE LA JORNADA" arriba).
     // Se autolimita a una pasada cada PARTIDAZO_INTERVALO_MS.
     ctx.waitUntil(calcularPartidazosSiToca(env));
@@ -11449,6 +13896,8 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
     // Relleno automatico de partidos que nadie cubre (ver "RELLENO AUTOMATICO
     // DE PARTIDOS" arriba). Se autolimita: un ciclo diario + refresco vivo.
     ctx.waitUntil(sincronizarPartidosAutomaticosSiToca(env));
+    // Borra las carpetas privadas de contenido que llevan 5 días vacías (una pasada por hora).
+    ctx.waitUntil(limpiarCarpetasVaciasSiToca(env));
   },
 };
 
@@ -11558,6 +14007,49 @@ const ALIAS_CLUBES_CANONICOS = {
   "real sociedad gimnastica": "RS Gimnástica de Torrelavega",
   "real sociedad gimnastica de torrelavega": "RS Gimnástica de Torrelavega",
   "real sociedad gimnastica torrelavega": "RS Gimnástica de Torrelavega",
+  // Club Portugalete (Segunda RFEF, Grupo 1)
+  "portugalete": "Club Portugalete",
+  "cd portugalete": "Club Portugalete",
+  "club deportivo portugalete": "Club Portugalete",
+  // Club Marino de Luanco (Segunda RFEF, Grupo 1)
+  "marino de luanco": "Club Marino de Luanco",
+  "marino luanco": "Club Marino de Luanco",
+  "cd marino de luanco": "Club Marino de Luanco",
+  "cd marino luanco": "Club Marino de Luanco",
+  "club deportivo marino de luanco": "Club Marino de Luanco",
+  // Atlético Osasuna B (Segunda RFEF, Grupo 2)
+  "osasuna b": "Atlético Osasuna B",
+  "ca osasuna b": "Atlético Osasuna B",
+  "osasuna ii": "Atlético Osasuna B",
+  "ca osasuna ii": "Atlético Osasuna B",
+  "osasuna promesas": "Atlético Osasuna B",
+  "ca osasuna promesas": "Atlético Osasuna B",
+  "atletico osasuna": "Atlético Osasuna B",
+  "club atletico osasuna b": "Atlético Osasuna B",
+  // SCR Peña Deportiva (Segunda RFEF, Grupo 3)
+  "pena deportiva": "SCR Peña Deportiva",
+  "penya deportiva": "SCR Peña Deportiva",
+  "scr penya deportiva": "SCR Peña Deportiva",
+  "pena deportiva rociera": "SCR Peña Deportiva",
+  "sociedad cultural recreativa pena deportiva": "SCR Peña Deportiva",
+  // CD Minera (Segunda RFEF, Grupo 3)
+  "deportiva minera": "CD Minera",
+  "cd deportiva minera": "CD Minera",
+  "minera": "CD Minera",
+  // CDA Navalcarnero (Segunda RFEF, Grupo 5)
+  "navalcarnero": "CDA Navalcarnero",
+  "cd navalcarnero": "CDA Navalcarnero",
+  "ad navalcarnero": "CDA Navalcarnero",
+  "club deportivo agrupacion navalcarnero": "CDA Navalcarnero",
+  // RSD Alcalá (Segunda RFEF, Grupo 5)
+  "alcala": "RSD Alcalá",
+  "real sociedad deportiva alcala": "RSD Alcalá",
+  "rs deportiva alcala": "RSD Alcalá",
+  // Atlético de Madrid C (Segunda RFEF, Grupo 5)
+  "atletico madrid c": "Atlético de Madrid C",
+  "atletico de madrid iii": "Atlético de Madrid C",
+  "atletico madrid iii": "Atlético de Madrid C",
+  "club atletico de madrid c": "Atlético de Madrid C",
 };
 
 // Nombre oficial del club si el texto es un alias conocido; null si no.
@@ -11837,13 +14329,17 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
   // Partidos existentes de esta competicion/grupo (y los sin grupo, que
   // son los que un redactor dejo sin grupo) en la temporada actual.
   ctr.sub++;
-  const { results: filas } = await env.DB.prepare(
-    `SELECT id, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido,
-            estado, ubicacion, fuente, external_id, autor_id, inicio_cronometro_at
+  // horario_manual (migración migracion_horario_manual.sql): si aún no existe en esta BD
+  // se lee sin ella y el relleno funciona como antes.
+  const sqlFilas = (extra) => `SELECT id, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido,
+            estado, ubicacion, fuente, external_id, autor_id, inicio_cronometro_at${extra}
      FROM results
      WHERE competicion = ? AND (grupo IS ? OR grupo = ? OR grupo IS NULL)
-       AND (fecha_partido IS NULL OR fecha_partido >= ?)`
-  ).bind(liga.competicion, liga.grupo, liga.grupo, inicioTemporada).all();
+       AND (fecha_partido IS NULL OR fecha_partido >= ?)`;
+  const { results: filas } = await consultaConAlternativas(
+    env, [sqlFilas(", horario_manual, finalizado_no_cubierto"), sqlFilas(", horario_manual"), sqlFilas("")],
+    [liga.competicion, liga.grupo, liga.grupo, inicioTemporada]
+  );
   const existentes = filas || [];
 
   const conocidos = new Set();
@@ -11946,6 +14442,9 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
     // redactor haya editado el partido; en equipos y marcador solo manda si el
     // partido nacio del relleno y nadie lo esta cubriendo en directo.
     if (!fila.id) continue; // insertado hace un momento en este mismo lote
+    // Aplazado reprogramado a mano: el relleno NO toca nada (ni horario, ni jornada, ni sede,
+    // ni equipos, ni marcador), tampoco en «Sincronizar todo». Se gestiona solo desde el panel.
+    if (Number(fila.horario_manual) === 1) { resumen.protegidos_manual = (resumen.protegidos_manual || 0) + 1; continue; }
     // Enlazado a OTRO evento de esta misma tanda: no es el mismo partido.
     // Si el enlace es antiguo (la API cambio el id del evento), se reenlaza.
     if (fila.external_id && fila.external_id !== externalId && idsLote.has(fila.external_id)) continue;
@@ -11982,6 +14481,9 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
         if (fila.estado !== "finalizado") cambios.estado = "finalizado";
         if (golesL !== fila.goles_local) cambios.goles_local = golesL;
         if (golesV !== fila.goles_visitante) cambios.goles_visitante = golesV;
+        // La API da el marcador oficial: ya no es un "finalizado no cubierto" con
+        // marcador sin fiar (si no, seguiría oculto al público y con sus porras sin resolver).
+        if (Number(fila.finalizado_no_cubierto) === 1) cambios.finalizado_no_cubierto = 0;
       }
     } else if (!bloqueaHorario) {
       if (origenAuto && fila.external_id !== externalId) cambios.external_id = externalId;
@@ -12050,7 +14552,7 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
 // ---- Texto legible para el historial del panel (Funcionalidades > Historial) ----
 function syncFechaLegible(v) { return v ? String(v).replace("T", " ") : ""; }
 
-const SYNC_ETIQUETAS_CAMPO = { fuente: "origen", fecha_partido: "fecha", jornada: "jornada", ubicacion: "sede", equipo_local: "local", equipo_visitante: "visitante", estado: "estado" };
+const SYNC_ETIQUETAS_CAMPO = { fuente: "origen", fecha_partido: "fecha", jornada: "jornada", ubicacion: "sede", equipo_local: "local", equipo_visitante: "visitante", estado: "estado", finalizado_no_cubierto: "no cubierto" };
 
 // "fecha: 2026-10-18 16:15 → 2026-10-18 18:30; resultado: -- → 2-1"
 function syncTextoCambio(fila, cambios, visibles) {
@@ -13652,7 +16154,14 @@ const CACHE_PUBLICA_TTL_MS = {
   "/api/settings": 60000,
   "/api/club-info": 60000,
   "/api/media/publica": 30000,
+  "/api/galerias/partidos": 60000,
   "/api/custom-clubs": 60000,
+  // Partidos y filtros (clasificación, calendario, resultados, portada): son las
+  // lecturas más pesadas de la web (SELECT * de hasta 500 filas) y antes solo
+  // tenían 8 s de caché por isolate. El TTL real de /api/results se ajusta en
+  // ttlCachePublica (más corto si pide partidos en juego).
+  "/api/results": 10000,
+  "/api/results/filtros": 30000,
 };
 const CACHE_PUBLICA = new Map(); // clave -> { exp, texto }
 // Máximo de caracteres de "contenido" que devuelven los listados públicos de /api/articles.
@@ -13713,6 +16222,9 @@ function ttlCachePublica(request, url) {
   if (request.headers.get("X-Write-Id")) return 0;
   const p = url.pathname;
   if (p === "/api/articles" && url.searchParams.get("admin") === "1") return 0;
+  // Partidos EN JUEGO: marcador en vivo, caché cortísima (5 s). Se mira también
+  // "limit=0", que solo vale para staff (lleva Authorization y ya salió arriba).
+  if (p === "/api/results" && url.searchParams.get("estado") === "en_juego") return 5000;
   if (Object.prototype.hasOwnProperty.call(CACHE_PUBLICA_TTL_MS, p)) return CACHE_PUBLICA_TTL_MS[p];
   // Ficha de noticia: /api/articles/:slug (la version sin sesion solo
   // devuelve noticias publicadas; el borrador del autor exige Authorization).
@@ -13923,13 +16435,21 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
         }
 
+        // Tope de fallos por CUENTA (todas las IPs juntas): ver cuentaBloqueada().
+        if (await cuentaBloqueada(env, "lector-login-cuenta", email, 30, 900)) {
+          return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        }
         const lector = await env.DB.prepare("SELECT * FROM readers WHERE email = ? AND activo = 1").bind(email).first();
         if (!lector) {
           await hashPassword(password, SAL_FICTICIA_LOGIN);
+          await registrarFalloCuenta(env, "lector-login-cuenta", email, 900);
           return json({ error: "Correo o contraseña incorrectos" }, 401);
         }
         const hash = await hashPassword(password, lector.salt);
-        if (!comparacionConstante(hash, lector.password_hash)) return json({ error: "Correo o contraseña incorrectos" }, 401);
+        if (!comparacionConstante(hash, lector.password_hash)) {
+          await registrarFalloCuenta(env, "lector-login-cuenta", email, 900);
+          return json({ error: "Correo o contraseña incorrectos" }, 401);
+        }
         if (!lector.email_verificado) {
           return json({ error: "Todavía no has confirmado tu correo. Revisa tu bandeja de entrada.", sinVerificar: true }, 403);
         }
@@ -14704,8 +17224,10 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/readers/me/password" && method === "PUT") {
         const payload = await requireReaderAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        const { actual, nueva } = await request.json();
-        if (!actual || !nueva) return json({ error: "Faltan campos" }, 400);
+        if (await limiteExcedido(request, env, "lector-cambiar-pass", 10, 900, String(payload.rid))) return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        const { actual, nueva } = await request.json().catch(() => ({}));
+        if (typeof actual !== "string" || typeof nueva !== "string" || !actual || !nueva) return json({ error: "Faltan campos" }, 400);
+        if (actual.length > 1024 || nueva.length > 1024) return json({ error: "Datos no válidos" }, 400);
         if (nueva.length < 8) return json({ error: "La nueva contraseña debe tener al menos 8 caracteres" }, 400);
 
         const lector = await env.DB.prepare("SELECT * FROM readers WHERE id = ? AND activo = 1").bind(payload.rid).first();
@@ -14891,8 +17413,11 @@ async function handlePrimary(request, env, ctx) {
 
       // ---------- Recuperar contraseña de lector: paso 2 ----------
       if (path === "/api/readers/forgot-password/confirmar" && method === "POST") {
-        const { token, nueva } = await request.json();
-        if (!token || !nueva) return json({ error: "Faltan campos" }, 400);
+        if (await limiteExcedido(request, env, "reset-confirmar", 20, 900)) return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        const { token, nueva } = await request.json().catch(() => ({}));
+        if (typeof token !== "string" || typeof nueva !== "string" || !token || !nueva) return json({ error: "Faltan campos" }, 400);
+        // SEGURIDAD: tope de longitud (PBKDF2 sobre un texto enorme es un vector de DoS)
+        if (token.length > 200 || nueva.length > 1024) return json({ error: "Datos no válidos" }, 400);
         if (nueva.length < 8) return json({ error: "La nueva contraseña debe tener al menos 8 caracteres" }, 400);
 
         const lector = await env.DB.prepare("SELECT * FROM readers WHERE reset_token = ? AND activo = 1").bind(await sha256Texto(String(token))).first();
@@ -14925,23 +17450,32 @@ async function handlePrimary(request, env, ctx) {
         if (await limiteExcedido(request, env, "login", 20, 900) || await limiteExcedido(request, env, "login-user", 30, 900, username)) {
           return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
         }
+        // Tope de fallos por CUENTA (todas las IPs juntas): ver cuentaBloqueada().
+        if (await cuentaBloqueada(env, "login-cuenta", username, 30, 900)) {
+          return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        }
         const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? AND activo = 1").bind(username).first();
         if (!user) {
           await hashPassword(password, SAL_FICTICIA_LOGIN); // mismo coste de tiempo que un usuario real
+          await registrarFalloCuenta(env, "login-cuenta", username, 900);
           return json({ error: "Usuario o contraseña incorrectos" }, 401);
         }
         const hash = await hashPassword(password, user.salt);
-        if (!comparacionConstante(hash, user.password_hash)) return json({ error: "Usuario o contraseña incorrectos" }, 401);
+        if (!comparacionConstante(hash, user.password_hash)) {
+          await registrarFalloCuenta(env, "login-cuenta", username, 900);
+          return json({ error: "Usuario o contraseña incorrectos" }, 401);
+        }
         // Dispositivo de confianza: contraseña correcta + token de dispositivo válido => sin pedir el código.
         if (ROLES_CON_2FA_OBLIGATORIO.includes(user.rol) || ROLES_CON_2FA_OPCIONAL.includes(user.rol)) {
           await asegurarColumnas2fa(env);
           if (user.totp_activo && await dispositivoConfianzaValido(env, user, cuerpoLogin.dispositivo)) {
+            const primerAccesoConfiable = await marcarPrimerAcceso(env, user);
             const tokenConfiable = await crearSesion(env, request, user, { tfa: true });
             ctx.waitUntil(registrarActividad(env, request, { uid: user.id, nombre: user.nombre, rol: user.rol }, {
               accion: "login", entidad: "sesion", descripcion: `${user.nombre} ha iniciado sesión (dispositivo de confianza, sin pedir el código)`,
             }));
             // Se renueva el token: mientras se use, el dispositivo sigue siendo de confianza.
-            return json({ token: tokenConfiable, user: usuarioParaRespuestaLogin(user), dispositivo: await crearDispositivoConfianza(env, user) });
+            return json({ token: tokenConfiable, user: usuarioParaRespuestaLogin(user), dispositivo: await crearDispositivoConfianza(env, user), primer_acceso: primerAccesoConfiable });
           }
         }
         // 2FA obligatorio (admins): contraseña correcta NO basta para tener sesión.
@@ -14960,11 +17494,12 @@ async function handlePrimary(request, env, ctx) {
             return json({ requiere_2fa: true, desafio: await crearDesafio2fa(env, user) });
           }
         }
+        const primerAcceso = await marcarPrimerAcceso(env, user);
         const token = await crearSesion(env, request, user);
         ctx.waitUntil(registrarActividad(env, request, { uid: user.id, nombre: user.nombre, rol: user.rol }, {
-          accion: "login", entidad: "sesion", descripcion: `${user.nombre} ha iniciado sesión`,
+          accion: "login", entidad: "sesion", descripcion: `${user.nombre} ha iniciado sesión${primerAcceso ? " (primer acceso)" : ""}`,
         }));
-        return json({ token, user: { id: user.id, username: user.username, nombre: user.nombre, rol: user.rol, nivel: user.rol === "admin" ? NIVEL_MAXIMO : (user.nivel || 1), email: user.email || null, avatar_url: user.avatar_url || null, avatar_foco: user.avatar_foco || null, categorias_fijas: parsearCategoriasFijas(user.categorias_fijas) } });
+        return json({ primer_acceso: primerAcceso, token, user: { id: user.id, username: user.username, nombre: user.nombre, rol: user.rol, nivel: nivelEfectivoUsuario(user), email: user.email || null, avatar_url: user.avatar_url || null, avatar_foco: user.avatar_foco || null, categorias_fijas: parsearCategoriasFijas(user.categorias_fijas) } });
       }
 
       // ---------- 2FA OBLIGATORIO (admins): configurar, activar y verificar ----------
@@ -14985,14 +17520,19 @@ async function handlePrimary(request, env, ctx) {
         if (await limiteExcedido(request, env, "login-2fa-user", 8, 900, String(user2fa.id))) {
           return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
         }
+        // Tope de códigos 2FA fallidos por CUENTA (todas las IPs juntas).
+        if (await cuentaBloqueada(env, "login-2fa-cuenta", user2fa.id, 15, 900)) {
+          return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        }
         const abrirSesion2fa = async (extra = {}) => {
+          const primerAcceso2fa = await marcarPrimerAcceso(env, user2fa);
           const tokenSesion = await crearSesion(env, request, user2fa, { tfa: true });
           ctx.waitUntil(registrarActividad(env, request, { uid: user2fa.id, nombre: user2fa.nombre, rol: user2fa.rol }, {
             accion: "login", entidad: "sesion", descripcion: `${user2fa.nombre} ha iniciado sesión (verificación en dos pasos)`,
           }));
           // "Confiar en este dispositivo": la casilla del login manda recordar = true.
           const confianza = cuerpo2fa.recordar === true ? { dispositivo: await crearDispositivoConfianza(env, user2fa) } : {};
-          return json({ token: tokenSesion, user: usuarioParaRespuestaLogin(user2fa), ...confianza, ...extra });
+          return json({ token: tokenSesion, user: usuarioParaRespuestaLogin(user2fa), primer_acceso: primerAcceso2fa, ...confianza, ...extra });
         };
 
         if (path === "/api/login/2fa/setup") {
@@ -15009,6 +17549,7 @@ async function handlePrimary(request, env, ctx) {
           if (!secreto) return json({ error: "Primero escanea el código QR." }, 400);
           const paso = await totpVerificar(secreto, cuerpo2fa.codigo, null);
           if (paso === null) {
+            await registrarFalloCuenta(env, "login-2fa-cuenta", user2fa.id, 900);
             return json({ error: "El código no es correcto. Comprueba que la hora de tu móvil esté en automático e inténtalo con el código nuevo." }, 401);
           }
           const codigos = generarCodigosRecuperacion();
@@ -15028,7 +17569,10 @@ async function handlePrimary(request, env, ctx) {
         if (/^[\d\s]{6,8}$/.test(entrada)) {
           const secreto = await descifrarSecretoTotp(env, user2fa.totp_secret);
           const paso = secreto ? await totpVerificar(secreto, entrada, user2fa.totp_ultimo_paso) : null;
-          if (paso === null) return json({ error: "Código incorrecto o ya utilizado. Espera al siguiente código de tu app e inténtalo de nuevo." }, 401);
+          if (paso === null) {
+            await registrarFalloCuenta(env, "login-2fa-cuenta", user2fa.id, 900);
+            return json({ error: "Código incorrecto o ya utilizado. Espera al siguiente código de tu app e inténtalo de nuevo." }, 401);
+          }
           await env.DB.prepare("UPDATE users SET totp_ultimo_paso = ? WHERE id = ?").bind(paso, user2fa.id).run();
           return abrirSesion2fa();
         }
@@ -15036,7 +17580,10 @@ async function handlePrimary(request, env, ctx) {
         try { hashesGuardados = JSON.parse(user2fa.totp_recovery || "[]"); } catch { hashesGuardados = []; }
         const hashIntento = await hashCodigoRecuperacion(entrada);
         const indice = hashesGuardados.findIndex((h) => comparacionConstante(h, hashIntento));
-        if (indice < 0) return json({ error: "Código incorrecto." }, 401);
+        if (indice < 0) {
+          await registrarFalloCuenta(env, "login-2fa-cuenta", user2fa.id, 900);
+          return json({ error: "Código incorrecto." }, 401);
+        }
         hashesGuardados.splice(indice, 1);
         await env.DB.prepare("UPDATE users SET totp_recovery = ? WHERE id = ?").bind(JSON.stringify(hashesGuardados), user2fa.id).run();
         ctx.waitUntil(registrarActividad(env, request, { uid: user2fa.id, nombre: user2fa.nombre, rol: user2fa.rol }, {
@@ -15119,8 +17666,11 @@ async function handlePrimary(request, env, ctx) {
 
       // ---------- RECUPERAR CONTRASEÑA: paso 2, usar el enlace del correo ----------
       if (path === "/api/forgot-password/confirmar" && method === "POST") {
-        const { token, nueva } = await request.json();
-        if (!token || !nueva) return json({ error: "Faltan campos" }, 400);
+        if (await limiteExcedido(request, env, "reset-confirmar", 20, 900)) return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        const { token, nueva } = await request.json().catch(() => ({}));
+        if (typeof token !== "string" || typeof nueva !== "string" || !token || !nueva) return json({ error: "Faltan campos" }, 400);
+        // SEGURIDAD: tope de longitud (PBKDF2 sobre un texto enorme es un vector de DoS)
+        if (token.length > 200 || nueva.length > 1024) return json({ error: "Datos no válidos" }, 400);
         if (nueva.length < 8) return json({ error: "La nueva contraseña debe tener al menos 8 caracteres" }, 400);
 
         const user = await env.DB.prepare(
@@ -15526,7 +18076,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/me/perfil" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        try { await asegurarColumnaSinApellidos(env); } catch (e) { /* si falla, se usa la consulta sin esa columna */ }
         const { results: filasPerfil } = await consultaConAlternativas(env, [
+          "SELECT id, username, nombre, rol, email, bio, experiencia, avatar_url, avatar_foco, equipo, redes_sociales, sin_apellidos FROM users WHERE id = ?",
           "SELECT id, username, nombre, rol, email, bio, experiencia, avatar_url, avatar_foco, equipo, redes_sociales FROM users WHERE id = ?",
           "SELECT id, username, nombre, rol, email, bio, experiencia, avatar_url, equipo, redes_sociales FROM users WHERE id = ?",
         ], [payload.uid]);
@@ -15557,8 +18109,12 @@ async function handlePrimary(request, env, ctx) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const body = await request.json();
-        const nombre = typeof body.nombre === "string" ? body.nombre.trim() : "";
+        const nombre = typeof body.nombre === "string" ? capitalizarNombrePropio(body.nombre) : "";
         if (!nombre) return json({ error: "El nombre no puede estar vacío" }, 400);
+        // Redactores y fotógrafos: nombre y apellidos obligatorios (mínimo dos palabras).
+        if ((payload.rol === "redactor" || payload.rol === "fotografo") && nombre.split(/\s+/).filter(Boolean).length < 2 && !(await usuarioSinApellidos(env, payload.uid))) {
+          return json({ error: "Indica tu nombre y apellidos" }, 400);
+        }
         let email = null;
         if (body.email !== undefined && body.email !== null && body.email.trim() !== "") {
           email = body.email.trim();
@@ -15645,6 +18201,26 @@ async function handlePrimary(request, env, ctx) {
         });
       }
 
+      // ---------- ÚLTIMA HORA: comprobar el PIN sin consumirlo ----------
+      // Lo usa el panel para mostrar el interruptor "Publicada" a un
+      // redactor de Nivel 1 solo cuando ha introducido un PIN correcto.
+      // NO regenera el PIN (eso ocurre al publicar de verdad, en
+      // comprobarUltimaHora): el PIN se vuelve a mandar al guardar. Con
+      // límite de intentos para que no se pueda adivinar por fuerza bruta.
+      if (path === "/api/ultima-hora/verificar" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (await limiteExcedido(request, env, "pin-ultima-hora", 10, 600, String(payload.uid))) {
+          return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        }
+        let cuerpoPin = {};
+        try { cuerpoPin = await request.json(); } catch { cuerpoPin = {}; }
+        const pinRecibido = cuerpoPin && cuerpoPin.pin;
+        if (!validarPin4Digitos(pinRecibido)) return json({ ok: false });
+        const pinActual = await obtenerUltimaHoraPin(env);
+        return json({ ok: !!pinActual && pinRecibido === pinActual });
+      }
+
       // ---------- MI PROGRESO (nivel y publicaciones) ----------
       // Progreso propio del colaborador conectado: nivel actual,
       // publicaciones contabilizadas y lo que le falta para el
@@ -15662,12 +18238,208 @@ async function handlePrimary(request, env, ctx) {
         // progreso" pueda dibujar el pase de niveles completo sin duplicar
         // las cifras en el frontend. Solo va en este endpoint, no en el
         // listado de usuarios, para no engordar esa respuesta.
+        if (user.rol === "fotografo") {
+          const nivelesFoto = Object.keys(NIVELES_FOTO_INFO).map((n) => ({
+            nivel: Number(n),
+            ...NIVELES_FOTO_INFO[n],
+            requisitos: null,
+          }));
+          // Dato informativo (NO es un requisito: no hay mínimos de partidos ni fotos).
+          let actividad = { partidos: 0, fotos: 0 };
+          try {
+            const f = await env.DB.prepare(
+              "SELECT COUNT(*) AS n, COUNT(DISTINCT result_id) AS partidos FROM match_gallery WHERE vinculado_por_id = ?"
+            ).bind(user.id).first();
+            actividad = { partidos: Number(f && f.partidos) || 0, fotos: Number(f && f.n) || 0 };
+          } catch { /* sin galerías: se queda en 0 */ }
+          const racha = await calcularRachaSemanal(env, user);
+          const insignias = await calcularInsignias(env, user, progreso.publicaciones);
+          return json({ ...progreso, niveles: nivelesFoto, actividad, racha, insignias });
+        }
         const niveles = Object.keys(NIVELES_INFO).map((n) => ({
           nivel: Number(n),
           ...NIVELES_INFO[n],
           requisitos: NIVELES_REQUISITOS[n] || null,
         }));
-        return json({ ...progreso, niveles });
+        const racha = user.rol === "admin" ? null : await calcularRachaSemanal(env, user);
+        const insignias = await calcularInsignias(env, user, progreso.publicaciones);
+        return json({ ...progreso, niveles, racha, insignias });
+      }
+
+      // ---------- RUTA DE BIENVENIDA (14 días): ver calcularRutaBienvenida ----------
+      if (path === "/api/me/ruta-bienvenida" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const user = await env.DB.prepare("SELECT id, nivel, rol FROM users WHERE id = ?").bind(payload.uid).first();
+        if (!user) return json({ error: "Usuario no encontrado" }, 404);
+        return json(await calcularRutaBienvenida(env, user));
+      }
+      // El tutorial solo existe en el navegador: el panel avisa aquí cuando se ha visto o cerrado.
+      if (path === "/api/me/ruta-bienvenida/tutorial" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const user = await env.DB.prepare("SELECT id, nivel, rol FROM users WHERE id = ?").bind(payload.uid).first();
+        if (!user || user.rol === "admin") return json({ ok: true });
+        const guardado = await leerRutaBienvenidaGuardada(env, user.id);
+        if (!guardado.tutorial) {
+          await guardarRutaBienvenidaGuardada(env, user.id, { ...guardado, tutorial: new Date().toISOString().slice(0, 19).replace("T", " ") });
+        }
+        return json({ ok: true });
+      }
+
+      // ---------- RESUMEN MENSUAL DE COLABORADORES (ver construirResumenMensual) ----------
+      // /estado: qué mes se puede consultar ya, qué meses hay y si toca avisar a la persona.
+      if (path === "/api/me/resumen-mensual/estado" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const estado = resumenMesEstado(resumenMesFechaMadrid());
+        const prefs = await resumenMesLeerPrefs(env, payload.uid);
+        const primerMes = await resumenMesPrimerMes(env, payload.uid);
+        const meses = resumenMesLista(estado.ultimo_mes_disponible, primerMes);
+        const hayMes = meses.length > 0;
+        return json({
+          ...estado,
+          meses_disponibles: meses,
+          prefs,
+          // El aviso solo sale si la persona no lo ha desactivado, ya existe un mes consultable
+          // (con cuenta en ese mes) y todavía no lo ha abierto.
+          aviso_pendiente: prefs.aviso && hayMes && prefs.visto < estado.ultimo_mes_disponible,
+        });
+      }
+
+      if (path === "/api/me/resumen-mensual/prefs" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        let body = {};
+        try { body = await request.json(); } catch { body = {}; }
+        const estado = resumenMesEstado(resumenMesFechaMadrid());
+        const prefs = await resumenMesLeerPrefs(env, payload.uid);
+        if (typeof body.aviso === "boolean") prefs.aviso = body.aviso;
+        // "visto" solo puede avanzar y nunca pasar del último mes ya disponible.
+        if (resumenMesValido(body.visto) && body.visto <= estado.ultimo_mes_disponible && body.visto > prefs.visto) prefs.visto = body.visto;
+        await resumenMesGuardarPrefs(env, payload.uid, prefs);
+        return json({ prefs });
+      }
+
+      if (path === "/api/me/resumen-mensual" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const user = await env.DB.prepare("SELECT id, nombre, rol FROM users WHERE id = ?").bind(payload.uid).first();
+        if (!user) return json({ error: "Usuario no encontrado" }, 404);
+        const estado = resumenMesEstado(resumenMesFechaMadrid());
+        const pedido = url.searchParams.get("mes");
+        const mes = pedido || estado.ultimo_mes_disponible;
+        if (!resumenMesValido(mes)) return json({ error: "Mes no válido (usa AAAA-MM)" }, 400);
+        const disponibleDesde = resumenMesUltimoDia(mes);
+        // Control de acceso: antes del último día del mes NO se devuelve nada del resumen.
+        if (estado.hoy < disponibleDesde) {
+          return json({ mes, disponible: false, disponible_desde: disponibleDesde, hoy: estado.hoy });
+        }
+        const primerMes = await resumenMesPrimerMes(env, payload.uid);
+        const permitidos = resumenMesLista(estado.ultimo_mes_disponible, primerMes);
+        if (!permitidos.includes(mes)) return json({ error: "Ese mes ya no está disponible" }, 404);
+        return json(await construirResumenMensual(env, user, mes));
+      }
+
+      // ---------- RECONOCIMIENTO PÚBLICO DEL MES (ver reconocimientoCandidatos) ----------
+      // GET público: el último mes cerrado con algún reconocimiento confirmado y visible. Alimenta la
+      // tarjeta de la portada y la del panel. No pide sesión; solo devuelve datos ya pensados como públicos.
+      if (path === "/api/reconocimientos" && method === "GET") {
+        const estado = resumenMesEstado(resumenMesFechaMadrid());
+        // Caché corta por isolate: la portada y el panel lo piden en cada carga y el dato cambia, como mucho,
+        // una vez al mes. Se invalida al confirmar un reconocimiento (PUT de abajo).
+        const publico = await memoCorta(`reconocimientos:publico:${estado.ultimo_mes_disponible}`, 60000, async () => {
+          // Si el último mes cerrado aún no tiene nada guardado, se elige solo al mejor redactor/a.
+          await reconocimientoAsegurarAuto(env, estado.ultimo_mes_disponible);
+          let filas = [];
+          try {
+            const { results } = await env.DB.prepare(
+              "SELECT key, value FROM settings WHERE key LIKE ?1 AND key <= ?2 ORDER BY key DESC LIMIT 6"
+            ).bind(`${RECONOCIMIENTO_PREFIJO}%`, reconocimientoClave(estado.ultimo_mes_disponible)).all();
+            filas = results || [];
+          } catch { filas = []; }
+          for (const f of filas) {
+            const mes = String(f.key).slice(RECONOCIMIENTO_PREFIJO.length);
+            if (!resumenMesValido(mes)) continue;
+            const h = await reconocimientoHidratar(env, reconocimientoNormalizar(f.value));
+            if (h.redactor || h.foto) return { mes, redactor: h.redactor, foto: h.foto };
+          }
+          return { mes: null, redactor: null, foto: null };
+        });
+        return json(publico);
+      }
+
+      // Gestión (solo admin): candidatos del mes y lo ya confirmado.
+      if (path === "/api/reconocimientos/gestion" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar los reconocimientos" }, 403);
+        const estado = resumenMesEstado(resumenMesFechaMadrid());
+        const mes = url.searchParams.get("mes") || estado.ultimo_mes_disponible;
+        if (!resumenMesValido(mes)) return json({ error: "Mes no válido (usa AAAA-MM)" }, 400);
+        if (mes > estado.ultimo_mes_disponible) return json({ mes, disponible: false, disponible_desde: resumenMesUltimoDia(mes) });
+        // Los candidatos se cachean unos segundos por mes (cambiar de mes en el selector y volver no repite los cálculos);
+        // lo confirmado se lee siempre fresco.
+        const [candidatos, guardado] = await Promise.all([
+          memoCorta(`reconocimientos:candidatos:${mes}`, 60000, () => reconocimientoCandidatos(env, mes)),
+          reconocimientoAsegurarAuto(env, mes),
+        ]);
+        return json({ mes, disponible: true, meses: resumenMesLista(estado.ultimo_mes_disponible, ""), candidatos, confirmado: guardado });
+      }
+
+      // Confirmar (o quitar, mandando ambos a null) el reconocimiento de un mes cerrado.
+      if (path === "/api/reconocimientos/gestion" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar los reconocimientos" }, 403);
+        let body = {};
+        try { body = await request.json(); } catch { body = {}; }
+        const estado = resumenMesEstado(resumenMesFechaMadrid());
+        const mes = body.mes;
+        if (!resumenMesValido(mes)) return json({ error: "Mes no válido (usa AAAA-MM)" }, 400);
+        if (mes > estado.ultimo_mes_disponible) return json({ error: "Ese mes aún no ha terminado" }, 400);
+        const redactorId = body.redactor_id == null ? null : Number(body.redactor_id);
+        const mediaId = body.media_id == null ? null : Number(body.media_id);
+        if ((redactorId != null && !(redactorId > 0)) || (mediaId != null && !(mediaId > 0))) return json({ error: "Identificador no válido" }, 400);
+        if (redactorId == null && mediaId == null) {
+          if (RECONOCIMIENTO_AUTOMATICO) {
+            // Con la selección automática activa no se borra la fila: se deja una marca "suprimido" para que
+            // el sistema no vuelva a elegir a nadie en ese mes.
+            const marca = { redactor: null, foto: null, suprimido: true, confirmado_por: payload.uid, confirmado_at: new Date().toISOString(), avisados: [] };
+            await env.DB.prepare(
+              "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+            ).bind(reconocimientoClave(mes), JSON.stringify(marca)).run();
+          } else {
+            await env.DB.prepare("DELETE FROM settings WHERE key = ?").bind(reconocimientoClave(mes)).run();
+          }
+          invalidarCacheCorta("reconocimientos:");
+          return json({ mes, confirmado: null });
+        }
+        const previo = await reconocimientoLeer(env, mes);
+        const valor = { redactor: null, foto: null, confirmado_por: payload.uid, confirmado_at: new Date().toISOString(), avisados: previo ? previo.avisados : [] };
+        if (redactorId != null) {
+          const candidatos = await reconocimientoCandidatos(env, mes, 1000, { fotos: false });
+          const c = candidatos.redactores.find((r) => r.id === redactorId);
+          if (!c) return json({ error: "Esa persona no es una candidata válida: debe ser redactor activo con publicaciones ese mes" }, 400);
+          valor.redactor = { id: c.id, publicaciones: c.publicaciones, visitas: c.visitas };
+        }
+        if (mediaId != null) {
+          const h = await reconocimientoHidratar(env, { redactor: null, foto: { media_id: mediaId } });
+          if (!h.foto) return json({ error: "Esa foto no existe o no es pública" }, 400);
+          valor.foto = { media_id: mediaId };
+        }
+        // Aviso por correo a quien se reconoce (se puede desactivar con avisar:false desde el panel).
+        let correos = 0;
+        if (body.avisar !== false) {
+          const aviso = await reconocimientoAvisar(env, mes, await reconocimientoHidratar(env, valor), valor.avisados);
+          valor.avisados = aviso.avisados;
+          correos = aviso.enviados;
+        }
+        await env.DB.prepare(
+          "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+        ).bind(reconocimientoClave(mes), JSON.stringify(valor)).run();
+        invalidarCacheCorta("reconocimientos:");
+        return json({ mes, correos, confirmado: await reconocimientoLeer(env, mes) });
       }
 
       // ---------- SETTINGS (redes sociales y otros ajustes del medio) ----------
@@ -15745,6 +18517,66 @@ async function handlePrimary(request, env, ctx) {
           accion: "editar_settings", entidad: "settings",
           descripcion: `Ha modificado el organigrama (${r.datos.nodos.length} casillas)`,
         }));
+        return json({ ok: true, ...r.datos });
+      }
+
+      // ---------- RESPONSABILIDADES ESPECÍFICAS (Funcionalidades > Responsabilidades) ----------
+      // Checklists de clubes (relaciones institucionales y recursos humanos) y lista
+      // de personas a fichar. Es cosa exclusiva de un administrador (leer y escribir).
+      if (path === "/api/responsabilidades" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las responsabilidades" }, 403);
+        const row = await env.DB.prepare("SELECT value, updated_at FROM settings WHERE key = 'responsabilidades'").first();
+        let datos = responsabilidadesVacias();
+        if (row) {
+          try {
+            const r = limpiarResponsabilidades(JSON.parse(row.value));
+            if (r.datos) datos = r.datos;
+          } catch { /* valor corrupto: se devuelve vacío */ }
+        }
+        return json({ ...datos, auto: await asignacionesAutoResp(env), activos: await colaboradoresActivosResp(env), updated_at: row ? row.updated_at : null });
+      }
+
+      if (path === "/api/responsabilidades" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede modificar las responsabilidades" }, 403);
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
+        const r = limpiarResponsabilidades(body);
+        if (r.error) return json({ error: r.error }, 400);
+        const previo = await env.DB.prepare("SELECT value FROM settings WHERE key = 'responsabilidades'").first();
+        await env.DB.prepare(
+          `INSERT INTO settings (key, value, updated_at) VALUES ('responsabilidades', ?, datetime('now'))
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+        ).bind(JSON.stringify(r.datos)).run();
+        // Marcar/desmarcar un club es un gesto muy frecuente: solo se anota en el
+        // historial cuando cambia la lista de personas a fichar o la base de contactos.
+        let fichajesPrevios = "[]";
+        try { fichajesPrevios = JSON.stringify(((JSON.parse(previo?.value || "{}").rrhh || {}).fichajes) || []); } catch { /* sin previo */ }
+        if (fichajesPrevios !== JSON.stringify(r.datos.rrhh.fichajes)) {
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "editar_settings", entidad: "settings",
+            descripcion: `Ha actualizado la lista de personas a fichar (${r.datos.rrhh.fichajes.length} personas)`,
+          }));
+        }
+        let contactoMensualPrevio = "[]";
+        try { contactoMensualPrevio = JSON.stringify((((JSON.parse(previo?.value || "{}").rrhh || {}).contacto_mensual) || {}).historial || []); } catch { /* sin previo */ }
+        if (contactoMensualPrevio !== JSON.stringify(r.datos.rrhh.contacto_mensual.historial)) {
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "editar_settings", entidad: "settings",
+            descripcion: "Ha actualizado el registro del contacto con los colaboradores activos",
+          }));
+        }
+        let contactosPrevios = "[]";
+        try { contactosPrevios = JSON.stringify(((JSON.parse(previo?.value || "{}").relaciones || {}).contactos) || []); } catch { /* sin previo */ }
+        if (contactosPrevios !== JSON.stringify(r.datos.relaciones.contactos)) {
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "editar_settings", entidad: "settings",
+            descripcion: `Ha actualizado la base de datos de contactos institucionales (${r.datos.relaciones.contactos.length} contactos)`,
+          }));
+        }
         return json({ ok: true, ...r.datos });
       }
 
@@ -15899,8 +18731,8 @@ async function handlePrimary(request, env, ctx) {
       if (autorPublicoMatch && method === "GET") {
         const id = parseInt(autorPublicoMatch[1], 10);
         const { results: filasAutor } = await consultaConAlternativas(env, [
-          "SELECT id, nombre, bio, experiencia, avatar_url, avatar_foco, equipo, redes_sociales FROM users WHERE id = ? AND activo = 1",
-          "SELECT id, nombre, bio, experiencia, avatar_url, equipo, redes_sociales FROM users WHERE id = ? AND activo = 1",
+          "SELECT id, nombre, rol, bio, experiencia, avatar_url, avatar_foco, equipo, redes_sociales FROM users WHERE id = ? AND activo = 1",
+          "SELECT id, nombre, rol, bio, experiencia, avatar_url, equipo, redes_sociales FROM users WHERE id = ? AND activo = 1",
         ], [id]);
         const autor = filasAutor[0] || null;
         if (!autor) return json({ error: "Autor no encontrado" }, 404);
@@ -15916,9 +18748,57 @@ async function handlePrimary(request, env, ctx) {
         ).bind(id, id).all();
         const articulosAutor = await remapearSlugsFusion(env, articulos);
 
+        // Galerías fotográficas del autor: sus fotos PÚBLICAS agrupadas por partido
+        // (match_gallery). Los fotógrafos suben fotos de partidos; el perfil las enseña
+        // como una galería por partido (portada + unas muestras) con enlace a la galería
+        // completa (/galeria/:slug). Las fotos sin partido van aparte. Si algo falla
+        // (columna aún sin migrar, etc.) el perfil sale igual, solo que sin galerías.
+        let galeriasAutor = [];
+        let fotosSinPartido = [];
+        let fotosTotalAutor = 0;
+        try {
+          const consultaFotosAutor = (conVisibilidad, conFoco) => `SELECT m.id AS media_id, m.cloudinary_url, m.titulo${conFoco ? ", m.portada_foco" : ""},
+                    r.slug AS partido_slug, r.equipo_local, r.equipo_visitante, r.escudo_local_url, r.escudo_visitante_url,
+                    r.fecha_partido, r.competicion, r.jornada
+             FROM media m
+             LEFT JOIN match_gallery mg ON mg.media_id = m.id
+             LEFT JOIN results r ON r.id = mg.result_id
+             WHERE m.autor_id = ? AND (m.tipo = 'foto' OR m.tipo IS NULL)${conVisibilidad ? " AND m.visibilidad = 'publico'" : ""}
+             ORDER BY r.fecha_partido DESC, m.created_at DESC LIMIT 600`;
+          const { results: filasFotos } = await consultaConAlternativas(env, [
+            consultaFotosAutor(true, true), consultaFotosAutor(true, false),
+            consultaFotosAutor(false, true), consultaFotosAutor(false, false),
+          ], [id]);
+          const porPartido = new Map();
+          for (const f of filasFotos || []) {
+            if (!f.cloudinary_url) continue;
+            fotosTotalAutor++;
+            const foto = { url: f.cloudinary_url, titulo: f.titulo || "", foco: normalizarFocoOpcional(f.portada_foco) };
+            if (!f.partido_slug) { if (fotosSinPartido.length < 12) fotosSinPartido.push(foto); continue; }
+            let g = porPartido.get(f.partido_slug);
+            if (!g) {
+              g = {
+                slug: f.partido_slug, equipo_local: f.equipo_local, equipo_visitante: f.equipo_visitante,
+                escudo_local_url: f.escudo_local_url || "", escudo_visitante_url: f.escudo_visitante_url || "",
+                fecha_partido: f.fecha_partido || null, competicion: f.competicion || "", jornada: f.jornada ?? null,
+                total: 0, fotos: [],
+              };
+              porPartido.set(f.partido_slug, g);
+            }
+            g.total++;
+            if (g.fotos.length < 4) g.fotos.push(foto);
+          }
+          galeriasAutor = [...porPartido.values()].slice(0, 24);
+        } catch (err) {
+          console.error("Perfil de autor: no se pudieron cargar sus galerías (se continúa sin ellas):", err.message);
+        }
+
         return json({
-          autor: { id: autor.id, nombre: autor.nombre, bio: autor.bio || "", experiencia: autor.experiencia || "", avatar_url: autor.avatar_url || "", avatar_foco: normalizarFoco(autor.avatar_foco), equipo: parsearEquipos(autor.equipo), redes },
+          autor: { id: autor.id, nombre: autor.nombre, rol: autor.rol === "fotografo" ? "fotografo" : "redactor", bio: autor.bio || "", experiencia: autor.experiencia || "", avatar_url: autor.avatar_url || "", avatar_foco: normalizarFoco(autor.avatar_foco), equipo: parsearEquipos(autor.equipo), redes },
           articulos: articulosAutor.map((a) => ({ ...a, imagen_foco: focoDePortada(a), imagenes: undefined })),
+          galerias: galeriasAutor,
+          fotos_sin_partido: fotosSinPartido,
+          fotos_total: fotosTotalAutor,
         });
       }
 
@@ -16132,7 +19012,7 @@ async function handlePrimary(request, env, ctx) {
           const v = limpiarDatosAcreditacionAdmin(f);
           if (v.error) { errores.push({ fila: i + 1, motivo: v.error }); continue; }
           const d = v.datos;
-          const estado = ["pendiente", "aprobada", "rechazada"].includes(String(f.estado || "").toLowerCase()) ? String(f.estado).toLowerCase() : "pendiente";
+          const estado = ACRED_ESTADOS_VALIDOS.includes(String(f.estado || "").toLowerCase()) ? String(f.estado).toLowerCase() : "pendiente";
           const nota = (f.nota_admin ? String(f.nota_admin) : "").trim().slice(0, 1000) || null;
           const fechaOk = typeof f.created_at === "string" && /^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?/.test(f.created_at.trim());
           const creada = fechaOk ? f.created_at.trim().replace("T", " ").slice(0, 19) : null;
@@ -16173,16 +19053,185 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- ACREDITACIONES: bandeja del panel (solo admins) ----------
+      // Huella ligera de la bandeja: el panel la consulta cada pocos segundos y solo pide la lista
+      // completa si ha cambiado (así varias personas ven los cambios de las demás casi al instante).
+      // "reciente" avisa de que el último cambio es de hace nada: el panel no se fía de esa huella
+      // todavía, porque otro cambio en el mismo segundo no la alteraría.
+      if (path === "/api/acreditaciones/huella" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las acreditaciones" }, 403);
+        const f = await env.DB.prepare("SELECT COUNT(*) AS n, MAX(updated_at) AS ultimo, MAX(id) AS max_id FROM acreditaciones").first();
+        const ultimo = f && f.ultimo ? String(f.ultimo) : "";
+        let reciente = false;
+        if (ultimo) {
+          let t = ultimo.trim().replace(" ", "T");
+          if (/[+-]\d\d$/.test(t)) t += ":00";
+          else if (!/(Z|[+-]\d\d:?\d\d)$/.test(t)) t += "Z";
+          const ms = Date.parse(t);
+          reciente = Number.isFinite(ms) ? Math.abs(Date.now() - ms) < 4000 : true;
+        }
+        return json({ huella: `${Number(f && f.n) || 0}|${Number(f && f.max_id) || 0}|${ultimo}`, reciente });
+      }
+
+      // ---------- NOTICIAS Y RESULTADOS: huella ligera para el "en vivo" del panel ----------
+      // Igual que /api/acreditaciones/huella: el panel la consulta cada pocos segundos (solo con la pestaña a la vista
+      // y la lista abierta) y descarga la lista completa únicamente si la huella ha cambiado. Basta con tener sesión.
+      // Si falta alguna columna (migración sin aplicar) se prueba con una consulta más simple en vez de fallar.
+      if ((path === "/api/articles/huella" || path === "/api/results/huella") && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const consultas = path === "/api/articles/huella"
+          ? [
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id, MAX(updated_at) AS ultimo, COALESCE(SUM(publicado), 0) AS a FROM articles",
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id, MAX(updated_at) AS ultimo FROM articles",
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id FROM articles",
+            ]
+          : [
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id, MAX(updated_at) AS ultimo," +
+                " COALESCE(SUM(COALESCE(goles_local, 0) * 31 + COALESCE(goles_visitante, 0) * 17), 0) AS a," +
+                " COALESCE(SUM(id * CASE estado WHEN 'en_juego' THEN 3 WHEN 'finalizado' THEN 5 ELSE 1 END), 0) AS b," +
+                " COALESCE(SUM(id * COALESCE(finalizado_no_cubierto, 0)), 0) AS c," +
+                " COALESCE(SUM(COALESCE(anadido_minutos, 0) * 13 + COALESCE(anadido_seguir, 0) * 11 + COALESCE(ajuste_cronometro_minutos, 0) * 7 + CASE WHEN cronometro_pausado_en IS NULL THEN 0 ELSE id END), 0) AS d FROM results",
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id, MAX(updated_at) AS ultimo," +
+                " COALESCE(SUM(COALESCE(goles_local, 0) * 31 + COALESCE(goles_visitante, 0) * 17), 0) AS a," +
+                " COALESCE(SUM(id * CASE estado WHEN 'en_juego' THEN 3 WHEN 'finalizado' THEN 5 ELSE 1 END), 0) AS b FROM results",
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id," +
+                " COALESCE(SUM(COALESCE(goles_local, 0) * 31 + COALESCE(goles_visitante, 0) * 17), 0) AS a," +
+                " COALESCE(SUM(id * CASE estado WHEN 'en_juego' THEN 3 WHEN 'finalizado' THEN 5 ELSE 1 END), 0) AS b FROM results",
+              "SELECT COUNT(*) AS n, MAX(id) AS max_id FROM results",
+            ];
+        let f = null;
+        for (const sql of consultas) {
+          try { f = await env.DB.prepare(sql).first(); break; } catch (e) { /* prueba la siguiente */ }
+        }
+        if (!f) return json({ error: "No se pudo calcular la huella" }, 500);
+        const partes = [f.n, f.max_id, f.ultimo || "", f.a, f.b, f.c, f.d].map((v) => (v === null || v === undefined ? "" : String(v)));
+        if (path === "/api/results/huella") {
+          // Los goles, tarjetas y demás eventos del minuto a minuto también cuentan como cambio.
+          try {
+            const ev = await env.DB.prepare("SELECT COUNT(*) AS n, MAX(id) AS max_id FROM match_events").first();
+            partes.push(String(ev && ev.n || 0), String(ev && ev.max_id || 0));
+          } catch (e) { /* sin tabla de eventos: se ignora */ }
+        }
+        return json({ huella: partes.join("|") });
+      }
+
       if (path === "/api/acreditaciones" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las acreditaciones" }, 403);
-        const { results } = await env.DB.prepare(
-          `SELECT id, nombre, email, dni, equipo, tipo_evento, tipo_acreditacion, funciones,
-                  jornada_partido, estado, nota_admin, revisado_por, revisado_at, created_at
-           FROM acreditaciones ORDER BY created_at DESC, id DESC LIMIT 2000`
-        ).all();
-        return json({ acreditaciones: results || [] });
+        const colsBase = "id, nombre, email, dni, equipo, tipo_evento, tipo_acreditacion, funciones, jornada_partido, estado, nota_admin, revisado_por, revisado_at, created_at";
+        let res;
+        try {
+          res = await env.DB.prepare(
+            `SELECT ${colsBase}, fecha_partido, solicitada_at, solicitada_por, asignado_a
+             FROM acreditaciones ORDER BY created_at DESC, id DESC LIMIT 2000`
+          ).all();
+        } catch (err) {
+          // Migración v2 sin aplicar: la bandeja sigue funcionando con las columnas de siempre.
+          console.error("[acreditaciones/listar v2]", err && err.message);
+          res = await env.DB.prepare(`SELECT ${colsBase} FROM acreditaciones ORDER BY created_at DESC, id DESC LIMIT 2000`).all();
+        }
+        return json({ acreditaciones: res.results || [], v2: !!(res.results && res.results[0] ? "asignado_a" in res.results[0] : true) });
+      }
+
+      // Historial de una solicitud (se apoya en activity_log: sin tabla nueva). Se pide solo al abrirla.
+      if (path.match(/^\/api\/acreditaciones\/\d+\/historial$/) && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las acreditaciones" }, 403);
+        const idH = Number(path.split("/")[3]);
+        const { results: filasH } = await env.DB.prepare(
+          `SELECT usuario_nombre, accion, descripcion, detalle, created_at FROM activity_log
+           WHERE entidad = 'acreditacion' AND entidad_id = ? ORDER BY created_at DESC, id DESC LIMIT 40`
+        ).bind(String(idH)).all();
+        return json({
+          historial: (filasH || []).map((r) => {
+            let det = null;
+            try { det = r.detalle ? JSON.parse(r.detalle) : null; } catch { det = null; }
+            return { usuario: r.usuario_nombre, accion: r.accion, descripcion: r.descripcion, detalle: det, fecha: r.created_at };
+          }),
+        });
+      }
+
+      // Cambio de estado en lote (varias solicitudes del mismo partido a la vez).
+      if (path === "/api/acreditaciones/lote" && method === "PATCH") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar las acreditaciones" }, 403);
+        const body = await request.json().catch(() => ({}));
+        const estadoL = String(body.estado || "");
+        if (!ACRED_ESTADOS_VALIDOS.includes(estadoL)) return json({ error: "Estado no válido" }, 400);
+        const ids = [...new Set((Array.isArray(body.ids) ? body.ids : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+        if (!ids.length) return json({ error: "No hay solicitudes seleccionadas" }, 400);
+        const avisarSol = body.avisar_solicitada === true && estadoL === "solicitada";
+        const avisar = (body.enviar_correo === true && (estadoL === "aprobada" || estadoL === "rechazada")) || avisarSol;
+        // Límite bajo para no pasarse de consultas/subpeticiones por invocación.
+        const maxLote = avisar ? 15 : 40;
+        if (ids.length > maxLote) return json({ error: `Máximo ${maxLote} solicitudes por vez${avisar ? " si se avisa por correo" : ""}` }, 400);
+        const marcas = ids.map(() => "?").join(",");
+        const { results: previas } = await env.DB.prepare(
+          `SELECT id, nombre, email, equipo, tipo_evento, tipo_acreditacion, jornada_partido, estado FROM acreditaciones WHERE id IN (${marcas})`
+        ).bind(...ids).all();
+        // Varias personas pueden estar trabajando a la vez: si otra ya cambió una solicitud desde que
+        // este panel la cargó (esperados = estado que veía cada una), no se pisa su trabajo ni se
+        // reenvía su correo. El UPDATE solo se aplica si el estado sigue siendo el que acabamos de leer.
+        const esperados = body.esperados && typeof body.esperados === "object" ? body.esperados : {};
+        const conflictos = [];
+        const cambiar = [];
+        for (const r of (previas || [])) {
+          if (r.estado === estadoL) continue;
+          const esp = esperados[r.id];
+          if (typeof esp === "string" && esp !== r.estado) { conflictos.push(r.id); continue; }
+          const ru = await env.DB.prepare(
+            `UPDATE acreditaciones SET estado = ?, revisado_por = ?, revisado_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND estado = ?`
+          ).bind(estadoL, payload.nombre || null, r.id, r.estado).run();
+          if (ru && ru.meta && ru.meta.changes === 0) { conflictos.push(r.id); continue; }
+          cambiar.push(r);
+        }
+        if (cambiar.length && (estadoL === "solicitada" || estadoL === "pendiente")) {
+          try {
+            const marcasC = cambiar.map(() => "?").join(",");
+            if (estadoL === "solicitada") {
+              await env.DB.prepare(`UPDATE acreditaciones SET solicitada_at = datetime('now'), solicitada_por = ? WHERE id IN (${marcasC})`)
+                .bind(payload.nombre || null, ...cambiar.map((r) => r.id)).run();
+            } else {
+              await env.DB.prepare(`UPDATE acreditaciones SET solicitada_at = NULL, solicitada_por = NULL WHERE id IN (${marcasC})`)
+                .bind(...cambiar.map((r) => r.id)).run();
+            }
+          } catch (err) { console.error("[acreditaciones/lote solicitada]", err && err.message); }
+        }
+        let enviados = 0, fallidos = 0;
+        if (avisar) {
+          let cfgL = {};
+          try { cfgL = await obtenerConfigAcreditacion(env); } catch {}
+          const indLote = body.indicaciones && typeof body.indicaciones === "object" ? body.indicaciones : {};
+          const limpiarIndL = (v, d) => (typeof v === "string" ? v.replace(/\r/g, "").trim().slice(0, ACRED_MAX_INDICACION) : d);
+          for (const r of cambiar) {
+            try {
+              const ok = estadoL === "solicitada"
+                ? await enviarCorreoSolicitadaAcreditacion(env, r)
+                : await enviarCorreoResolucionAcreditacion(env, r, estadoL, {
+                  // Si el panel manda indicaciones propias de esta solicitud (dónde/cuándo recogerla y
+                  // mensaje), van en el correo de aprobación; si no, los textos por defecto.
+                  recogida: limpiarIndL(indLote[r.id] && indLote[r.id].recogida, cfgL.recogida || ""),
+                  mensaje: limpiarIndL(indLote[r.id] && indLote[r.id].mensaje, estadoL === "aprobada" ? (cfgL.instrucciones_aprobada || "") : ""),
+                });
+              if (ok) enviados++; else fallidos++;
+            } catch (err) { console.error("[acreditaciones/lote correo]", err); fallidos++; }
+          }
+        }
+        for (const r of cambiar) {
+          await registrarActividad(env, request, payload, {
+            accion: "acreditacion_" + estadoL,
+            entidad: "acreditacion",
+            entidad_id: r.id,
+            descripcion: `Acreditación de ${r.nombre} marcada como ${estadoL} (en lote)`,
+            detalle: { estado_anterior: r.estado, estado: estadoL, lote: true },
+          });
+        }
+        return json({ ok: true, cambiadas: cambiar.length, sin_cambios: ids.length - cambiar.length - conflictos.length, conflictos, correos_enviados: enviados, correos_fallidos: fallidos });
       }
 
       if (path.match(/^\/api\/acreditaciones\/\d+$/) && method === "PATCH") {
@@ -16195,7 +19244,7 @@ async function handlePrimary(request, env, ctx) {
         if (body.solo_indicaciones === true) {
           const exIn = await env.DB.prepare("SELECT id, nombre, email, equipo, tipo_evento, tipo_acreditacion, jornada_partido, estado FROM acreditaciones WHERE id = ?").bind(id).first();
           if (!exIn) return json({ error: "Solicitud no encontrada" }, 404);
-          const limpiarI = (v) => (typeof v === "string" ? v.replace(/\r/g, "").trim().slice(0, 800) : "");
+          const limpiarI = (v) => (typeof v === "string" ? v.replace(/\r/g, "").trim().slice(0, ACRED_MAX_INDICACION) : "");
           const recogidaI = limpiarI(body.recogida), mensajeI = limpiarI(body.mensaje);
           if (!recogidaI && !mensajeI) return json({ error: "Escribe alguna indicación (dónde recogerla o un mensaje)" }, 400);
           if (!exIn.email) return json({ error: "La solicitud no tiene correo" }, 400);
@@ -16213,14 +19262,65 @@ async function handlePrimary(request, env, ctx) {
           });
           return json({ ok: true, correo: correoI, estado: exIn.estado });
         }
+        // Solo metadatos de gestión: fecha del partido y/o quién se encarga (no toca estado ni nota).
+        if (body.meta && typeof body.meta === "object" && !body.estado && !body.datos) {
+          const sets = [], vals = [], partesLog = [];
+          if ("fecha_partido" in body.meta) {
+            const f = acredFechaPartidoValida(body.meta.fecha_partido);
+            sets.push("fecha_partido = ?"); vals.push(f || null);
+            partesLog.push(f ? `fecha del partido ${f}` : "fecha del partido quitada");
+          }
+          if ("asignado_a" in body.meta) {
+            const quien = String(body.meta.asignado_a || "").replace(/\s+/g, " ").trim().slice(0, 100);
+            sets.push("asignado_a = ?"); vals.push(quien || null);
+            partesLog.push(quien ? `asignada a ${quien}` : "sin asignar");
+          }
+          if (!sets.length) return json({ error: "Nada que actualizar" }, 400);
+          const exM = await env.DB.prepare("SELECT id, nombre FROM acreditaciones WHERE id = ?").bind(id).first();
+          if (!exM) return json({ error: "Solicitud no encontrada" }, 404);
+          // Si el panel dice quién la tenía asignada y ya no es así (otra persona se la quedó o la soltó
+          // mientras tanto), no se pisa: se avisa y el panel se actualiza.
+          if ("asignado_a" in body.meta && "asignado_esperado" in body.meta) {
+            try {
+              const cur = await env.DB.prepare("SELECT asignado_a FROM acreditaciones WHERE id = ?").bind(id).first();
+              const norm = (v) => String(v || "").replace(/\s+/g, " ").trim();
+              const actual = norm(cur && cur.asignado_a), esperadoA = norm(body.meta.asignado_esperado), destino = norm(body.meta.asignado_a);
+              if (actual !== esperadoA && actual !== destino) {
+                return json({ error: actual ? `Ya la tiene asignada ${actual}. He actualizado el panel.` : "Acaban de soltarla. He actualizado el panel.", conflicto: true, asignado_a: actual || null }, 409);
+              }
+            } catch (err) { console.error("[acreditaciones/meta conflicto]", err && err.message); }
+          }
+          try {
+            await env.DB.prepare(`UPDATE acreditaciones SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = ?`).bind(...vals, id).run();
+          } catch (err) {
+            console.error("[acreditaciones/meta]", err && err.message);
+            return json({ error: "Falta aplicar la migración migracion_acreditaciones_v2.sql" }, 500);
+          }
+          await registrarActividad(env, request, payload, {
+            accion: "acreditacion_gestion",
+            entidad: "acreditacion",
+            entidad_id: id,
+            descripcion: `Acreditación de ${exM.nombre}: ${partesLog.join(", ")}`,
+            detalle: { meta: body.meta },
+          });
+          return json({ ok: true });
+        }
         const editaDatos = !!(body.datos && typeof body.datos === "object");
         const estado = String(body.estado || "");
-        if (!(editaDatos && !estado) && !["pendiente", "aprobada", "rechazada"].includes(estado)) {
+        if (!(editaDatos && !estado) && !ACRED_ESTADOS_VALIDOS.includes(estado)) {
           return json({ error: "Estado no válido" }, 400);
         }
         const nota = (body.nota_admin ? String(body.nota_admin) : "").trim().slice(0, 1000);
-        const existente = await env.DB.prepare("SELECT id, nombre, email, equipo, tipo_evento, tipo_acreditacion, jornada_partido, estado FROM acreditaciones WHERE id = ?").bind(id).first();
+        const existente = await env.DB.prepare("SELECT id, nombre, email, equipo, tipo_evento, tipo_acreditacion, jornada_partido, estado, revisado_por FROM acreditaciones WHERE id = ?").bind(id).first();
         if (!existente) return json({ error: "Solicitud no encontrada" }, 404);
+        // Varias personas a la vez: si el panel dice qué estado veía (estado_esperado) y otra persona ya
+        // la ha movido a otro distinto del que se pide, no se pisa su decisión ni se reenvía ningún correo.
+        // Si ya está justo en el estado pedido, no hay conflicto: simplemente no se repite nada.
+        const esperado = typeof body.estado_esperado === "string" ? body.estado_esperado : "";
+        const mensajeConflicto = `Otra persona ya la ha pasado a ${existente.estado}${existente.revisado_por ? " (" + existente.revisado_por + ")" : ""}. He actualizado el panel.`;
+        if (estado && esperado && ACRED_ESTADOS_VALIDOS.includes(esperado) && esperado !== existente.estado && estado !== existente.estado) {
+          return json({ error: mensajeConflicto, conflicto: true, estado_actual: existente.estado }, 409);
+        }
         if (editaDatos) {
           const v = limpiarDatosAcreditacionAdmin(body.datos);
           if (v.error) return json({ error: v.error }, 400);
@@ -16230,6 +19330,11 @@ async function handlePrimary(request, env, ctx) {
                SET nombre = ?, email = ?, dni = ?, equipo = ?, tipo_evento = ?, tipo_acreditacion = ?, funciones = ?, jornada_partido = ?, updated_at = datetime('now')
              WHERE id = ?`
           ).bind(d.nombre, d.email, d.dni, d.equipo, d.tipo_evento, d.tipo_acreditacion, d.funciones, d.jornada_partido, id).run();
+          if (body.datos && "fecha_partido" in body.datos) {
+            try {
+              await env.DB.prepare("UPDATE acreditaciones SET fecha_partido = ? WHERE id = ?").bind(d.fecha_partido || null, id).run();
+            } catch (err) { console.error("[acreditaciones/fecha_partido]", err && err.message); }
+          }
           await registrarActividad(env, request, payload, {
             accion: "acreditacion_editada",
             entidad: "acreditacion",
@@ -16238,16 +19343,35 @@ async function handlePrimary(request, env, ctx) {
           });
           if (!estado) return json({ ok: true });
         }
-        await env.DB.prepare(
+        // Con estado_esperado el UPDATE solo se aplica si sigue en el estado que acabamos de leer
+        // (por si otra persona la ha tocado en estos milisegundos).
+        const casEstado = !!(esperado && estado !== existente.estado);
+        const resUpd = await env.DB.prepare(
           `UPDATE acreditaciones
              SET estado = ?, nota_admin = ?, revisado_por = ?, revisado_at = datetime('now'), updated_at = datetime('now')
-           WHERE id = ?`
-        ).bind(estado, nota || null, payload.nombre || null, id).run();
+           WHERE id = ?${casEstado ? " AND estado = ?" : ""}`
+        ).bind(...[estado, nota || null, payload.nombre || null, id], ...(casEstado ? [existente.estado] : [])).run();
+        if (casEstado && resUpd && resUpd.meta && resUpd.meta.changes === 0) {
+          return json({ error: "Otra persona la acaba de cambiar. He actualizado el panel.", conflicto: true }, 409);
+        }
+        if (estado === "solicitada" && existente.estado !== "solicitada") {
+          try {
+            await env.DB.prepare("UPDATE acreditaciones SET solicitada_at = datetime('now'), solicitada_por = ? WHERE id = ?").bind(payload.nombre || null, id).run();
+          } catch (err) { console.error("[acreditaciones/solicitada]", err && err.message); }
+        } else if (estado === "pendiente" && existente.estado !== "pendiente") {
+          try {
+            await env.DB.prepare("UPDATE acreditaciones SET solicitada_at = NULL, solicitada_por = NULL WHERE id = ?").bind(id).run();
+          } catch (err) { console.error("[acreditaciones/solicitada]", err && err.message); }
+        }
+        const cambioEstado = existente.estado !== estado;
         await registrarActividad(env, request, payload, {
-          accion: "acreditacion_" + estado,
+          accion: cambioEstado ? "acreditacion_" + estado : "acreditacion_nota",
           entidad: "acreditacion",
           entidad_id: id,
-          descripcion: `Acreditación de ${existente.nombre} marcada como ${estado}`,
+          descripcion: cambioEstado
+            ? `Acreditación de ${existente.nombre} marcada como ${estado}`
+            : `Nota guardada en la acreditación de ${existente.nombre}`,
+          detalle: { estado_anterior: existente.estado, estado, nota: nota || null },
         });
         // Correo al solicitante: solo si de verdad cambia a aprobada/rechazada
         // (guardar solo la nota no reenvía nada) y el admin no lo desactiva.
@@ -16255,7 +19379,7 @@ async function handlePrimary(request, env, ctx) {
         if ((estado === "aprobada" || estado === "rechazada") && existente.estado !== estado && body.enviar_correo !== false) {
           try {
             const cfgC = await obtenerConfigAcreditacion(env);
-            const limpiar = (v, d) => (typeof v === "string" ? v.replace(/\r/g, "").trim().slice(0, 800) : d);
+            const limpiar = (v, d) => (typeof v === "string" ? v.replace(/\r/g, "").trim().slice(0, ACRED_MAX_INDICACION) : d);
             const ok = await enviarCorreoResolucionAcreditacion(env, existente, estado, {
               recogida: limpiar(body.recogida, cfgC.recogida),
               mensaje: limpiar(body.mensaje, estado === "aprobada" ? cfgC.instrucciones_aprobada : ""),
@@ -16263,6 +19387,16 @@ async function handlePrimary(request, env, ctx) {
             correo = ok ? "enviado" : "no_enviado";
           } catch (err) {
             console.error("[acreditaciones/correo-resolucion]", err);
+            correo = "no_enviado";
+          }
+        }
+        // Correo OPCIONAL al pasar a "Solicitada" (ya lo hemos pedido al club). Solo si el panel lo pide
+        // expresamente y de verdad cambia de estado (no se repite si otra persona ya la había solicitado).
+        if (estado === "solicitada" && existente.estado !== "solicitada" && body.avisar_solicitada === true) {
+          try {
+            correo = (await enviarCorreoSolicitadaAcreditacion(env, existente)) ? "enviado" : "no_enviado";
+          } catch (err) {
+            console.error("[acreditaciones/correo-solicitada]", err);
             correo = "no_enviado";
           }
         }
@@ -16392,7 +19526,7 @@ async function handlePrimary(request, env, ctx) {
           const personas = [];
           const vistas = new Set();
           for (const p of crudas) {
-            const t = formularioLimpiarTexto(p, 300);
+            const t = normalizarPersonaInvitacionFormulario(formularioLimpiarTexto(p, 300), campo);
             const k = normalizarOpcionUnica(t);
             if (t && !vistas.has(k)) { vistas.add(k); personas.push(t); }
           }
@@ -16700,19 +19834,47 @@ async function handlePrimary(request, env, ctx) {
         if (path === "/api/anuncios/enviar" && method === "POST") {
           const body = await request.json().catch(() => ({}));
           if (!cuentasResend(env).length) return json({ error: "El envío de correo no está configurado (falta RESEND_API_KEY)" }, 503);
-          let anuncio;
+          await asegurarTablaDestinatariosAnuncio(env);
+          let anuncio, aviso = null;
           const anuncioId = body.anuncio_id ? parseInt(body.anuncio_id, 10) : null;
+          const reanudar = body.reanudar === true || body.reanudar === "true" || body.reanudar === 1;
           if (anuncioId) {
-            // Tandas siguientes: el contenido sale de lo guardado, no de lo que mande el navegador.
+            // Tandas siguientes / reanudación: el contenido sale de lo guardado, no de lo que mande el navegador.
             anuncio = await env.DB.prepare("SELECT * FROM anuncios_email WHERE id = ?").bind(anuncioId).first();
             if (!anuncio) return json({ error: "Anuncio no encontrado" }, 404);
             if (anuncio.estado === "completado") return json({ error: "Este anuncio ya se envió por completo" }, 409);
             try { anuncio.audiencias = normalizarSeleccionAnuncio(JSON.parse(anuncio.audiencias)); } catch { anuncio.audiencias = {}; }
+            const previo = await contarDestinatariosAnuncio(env, anuncio.id);
+            if (!Object.values(previo).some((n) => n > 0)) {
+              // Anuncio anterior al registro por destinatario.
+              const ya = await recuperarYaRecibieronAnuncio(env, anuncio, body.ya_recibieron);
+              if (!ya) {
+                return json({
+                  error: "No se puede saber a quién le llegó ya este anuncio (Resend no deja consultar el historial). Pega la lista de correos que ya lo recibieron o revisa el permiso de la clave de Resend.",
+                  codigo: "SIN_REGISTRO",
+                }, 409);
+              }
+              const todos = await resolverDestinatariosAnuncio(env, anuncio.audiencias);
+              const correos = todos.map((d) => String(d.email).trim().toLowerCase());
+              await registrarDestinatariosAnuncio(env, anuncio.id, correos);
+              const recibido = new Set([...ya.desdeResend, ...ya.manuales]);
+              for (const e of correos) {
+                if (recibido.has(e)) await env.DB.prepare("UPDATE anuncios_email_destinatarios SET estado = 'enviado' WHERE anuncio_id = ? AND email = ?").bind(anuncio.id, e).run();
+              }
+              const n = correos.filter((e) => recibido.has(e)).length;
+              aviso = `Se han marcado ${n} correo(s) como ya enviados; a esas personas no se les vuelve a escribir.`;
+            } else if (reanudar) {
+              // Reanudar: los fallidos se reintentan y lo que quedó "enviando" de una llamada cortada se libera.
+              await env.DB.prepare(
+                "UPDATE anuncios_email_destinatarios SET estado = 'pendiente' WHERE anuncio_id = ? AND estado IN ('fallido', 'enviando')"
+              ).bind(anuncio.id).run();
+            }
           } else {
             const v = validarAnuncio(body);
             if (v.error) return json({ error: v.error }, 400);
             if (!Object.keys(v.datos.audiencias).length) return json({ error: "Elige al menos una audiencia o una persona" }, 400);
-            const total = (await resolverDestinatariosAnuncio(env, v.datos.audiencias)).length;
+            const dest0 = await resolverDestinatariosAnuncio(env, v.datos.audiencias);
+            const total = dest0.length;
             if (!total) return json({ error: "No hay ningún destinatario con correo válido en esas audiencias" }, 400);
             const ins = await env.DB.prepare(
               `INSERT INTO anuncios_email (asunto, mensaje, audiencias, boton_texto, boton_url, creado_por_id, creado_por_nombre, total_destinatarios)
@@ -16720,13 +19882,13 @@ async function handlePrimary(request, env, ctx) {
             ).bind(v.datos.asunto, v.datos.mensaje, JSON.stringify(v.datos.audiencias), v.datos.boton_texto, v.datos.boton_url, payload.uid, payload.nombre || null, total).run();
             const id = ins.meta && ins.meta.last_row_id;
             anuncio = { id, ...v.datos, total_destinatarios: total, enviados: 0, fallidos: 0 };
+            await registrarDestinatariosAnuncio(env, id, dest0.map((d) => String(d.email).trim().toLowerCase()));
             ctx.waitUntil(registrarActividad(env, request, payload, {
               accion: "anuncio_email_envio", entidad: "anuncio", entidad_id: id,
               descripcion: `Ha enviado el anuncio por correo "${v.datos.asunto}" a ${total} persona(s) (${describirSeleccionAnuncio(v.datos.audiencias)})`,
             }));
             ctx.waitUntil((async () => {
-              const dest = await resolverDestinatariosAnuncio(env, v.datos.audiencias);
-              const correos = new Set(dest.map((d) => String(d.email).trim().toLowerCase()));
+              const correos = new Set(dest0.map((d) => String(d.email).trim().toLowerCase()));
               await staffPushEnviar(env, "anuncios", {
                 titulo: "Nuevo anuncio",
                 cuerpo: v.datos.asunto,
@@ -16737,22 +19899,41 @@ async function handlePrimary(request, env, ctx) {
 
           const tanda = Math.max(0, parseInt(body.tanda, 10) || 0);
           const destinatarios = await resolverDestinatariosAnuncio(env, anuncio.audiencias);
-          const lote = destinatarios.slice(tanda * ANUNCIO_TAMANO_TANDA, (tanda + 1) * ANUNCIO_TAMANO_TANDA);
-          let ok = 0, ko = 0;
-          for (let i = 0; i < lote.length; i++) {
-            const d = lote[i];
+          const porCorreo = new Map(destinatarios.map((d) => [String(d.email).trim().toLowerCase(), d]));
+          const { results: cola } = await env.DB.prepare(
+            "SELECT email FROM anuncios_email_destinatarios WHERE anuncio_id = ? AND estado = 'pendiente' ORDER BY email LIMIT ?"
+          ).bind(anuncio.id, ANUNCIO_TAMANO_TANDA).all();
+          let enviadosAhora = 0;
+          for (const fila of cola || []) {
+            // Se reclama ANTES de enviar: si otra llamada ya lo cogió, no se manda dos veces.
+            const reclamo = await env.DB.prepare(
+              "UPDATE anuncios_email_destinatarios SET estado = 'enviando' WHERE anuncio_id = ? AND email = ? AND estado = 'pendiente'"
+            ).bind(anuncio.id, fila.email).run();
+            if (!reclamo.meta || !reclamo.meta.changes) continue;
+            const d = porCorreo.get(fila.email);
+            if (!d) { // ya no pertenece a la selección (p. ej. se dio de baja)
+              await env.DB.prepare("UPDATE anuncios_email_destinatarios SET estado = 'omitido' WHERE anuncio_id = ? AND email = ?").bind(anuncio.id, fila.email).run();
+              continue;
+            }
+            if (enviadosAhora > 0) await dormirMs(550); // Resend: ~2 correos/segundo
             const { html, texto } = construirEmailAnuncio(anuncio, d);
             const enviado = await enviarEmailNotificacion(env, { asunto: anuncio.asunto, texto, html }, { destinatario: d.email });
-            if (enviado) ok++; else ko++;
-            if (i < lote.length - 1) await dormirMs(550); // Resend: ~2 correos/segundo
+            enviadosAhora++;
+            await env.DB.prepare("UPDATE anuncios_email_destinatarios SET estado = ? WHERE anuncio_id = ? AND email = ?")
+              .bind(enviado ? "enviado" : "fallido", anuncio.id, fila.email).run();
           }
-          const hayMas = (tanda + 1) * ANUNCIO_TAMANO_TANDA < destinatarios.length;
+          const c = await contarDestinatariosAnuncio(env, anuncio.id);
+          const completado = c.pendiente + c.enviando + c.fallido === 0;
+          const total = c.pendiente + c.enviando + c.enviado + c.fallido;
           await env.DB.prepare(
-            `UPDATE anuncios_email SET enviados = enviados + ?, fallidos = fallidos + ?,
-               total_destinatarios = ?, estado = ?, completado_at = ${hayMas ? "NULL" : "datetime('now')"} WHERE id = ?`
-          ).bind(ok, ko, destinatarios.length, hayMas ? "enviando" : "completado", anuncio.id).run();
-          const fila = await env.DB.prepare("SELECT enviados, fallidos, total_destinatarios FROM anuncios_email WHERE id = ?").bind(anuncio.id).first();
-          return json({ ok: true, anuncio_id: anuncio.id, tanda, siguiente_tanda: hayMas ? tanda + 1 : null, enviados: fila.enviados, fallidos: fila.fallidos, total: fila.total_destinatarios });
+            `UPDATE anuncios_email SET enviados = ?, fallidos = ?, total_destinatarios = ?, estado = ?, completado_at = ${completado ? "datetime('now')" : "NULL"} WHERE id = ?`
+          ).bind(c.enviado, c.fallido, total, completado ? "completado" : "enviando", anuncio.id).run();
+          return json({
+            ok: true, anuncio_id: anuncio.id, tanda,
+            siguiente_tanda: c.pendiente > 0 ? tanda + 1 : null,
+            enviados: c.enviado, fallidos: c.fallido, pendientes: c.pendiente, completado, total,
+            ...(aviso ? { aviso } : {}),
+          });
         }
 
         return json({ error: "No encontrado" }, 404);
@@ -16780,8 +19961,10 @@ async function handlePrimary(request, env, ctx) {
         if (!payload) return json({ error: "No autorizado" }, 401);
         if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver los usuarios" }, 403);
         await asegurarColumnas2fa(env);
+        await asegurarColumnaPrimerAcceso(env);
+        await asegurarColumnaSinApellidos(env);
         const { results } = await env.DB.prepare(
-          "SELECT id, username, nombre, rol, activo, email, equipo, categorias_fijas, avatar_url, nivel, nivel_nota, created_at, totp_activo FROM users ORDER BY nombre"
+          "SELECT id, username, nombre, rol, activo, email, equipo, categorias_fijas, avatar_url, nivel, nivel_nota, created_at, totp_activo, primer_acceso_at, sin_apellidos FROM users ORDER BY nombre"
         ).all();
         // El progreso de nivel de TODOS los usuarios se calcula con una
         // sola consulta agregada (antes: una consulta por usuario,
@@ -16817,7 +20000,7 @@ async function handlePrimary(request, env, ctx) {
         const existe = await env.DB.prepare("SELECT id FROM users WHERE username = ?").bind(username).first();
         if (existe) return json({ error: "Ya existe un usuario con ese nombre de usuario" }, 400);
 
-        const passwordInicial = body.password && body.password.length >= 8 ? body.password : generatePassword();
+        const passwordInicial = typeof body.password === "string" && body.password.length >= 8 && body.password.length <= 1024 ? body.password : generatePassword();
         const salt = randomSalt();
         const hash = await hashPassword(passwordInicial, salt);
         const rol = normalizarRolColaborador(body.rol);
@@ -16836,7 +20019,7 @@ async function handlePrimary(request, env, ctx) {
 
         await env.DB.prepare(
           `INSERT INTO users (username, password_hash, salt, nombre, rol, activo, email, equipo, categorias_fijas) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`
-        ).bind(username, hash, salt, body.nombre, rol, body.email ? body.email.trim() : null, equipoNuevo, categoriasFijasNuevo).run();
+        ).bind(username, hash, salt, capitalizarNombrePropio(body.nombre), rol, body.email ? body.email.trim() : null, equipoNuevo, categoriasFijasNuevo).run();
 
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "crear_usuario", entidad: "usuario", entidad_id: username,
@@ -16881,10 +20064,18 @@ async function handlePrimary(request, env, ctx) {
         if (!user) return json({ error: "Usuario no encontrado" }, 404);
 
         const body = await request.json().catch(() => ({}));
-        const nuevaPassword = body.nueva && body.nueva.length >= 8 ? body.nueva : generatePassword();
+        const nuevaPassword = typeof body.nueva === "string" && body.nueva.length >= 8 && body.nueva.length <= 1024 ? body.nueva : generatePassword();
         const salt = randomSalt();
         const hash = await hashPassword(nuevaPassword, salt);
         await env.DB.prepare("UPDATE users SET password_hash = ?, salt = ? WHERE id = ?").bind(hash, salt, id).run();
+        // Cualquier sesión abierta con la contraseña anterior se cierra. Si el
+        // admin se la restablece a sí mismo, se conserva la sesión actual.
+        if (id === payload.uid && payload.sid) {
+          await env.DB.prepare("UPDATE sessions SET revoked_at = datetime('now') WHERE user_id = ? AND id != ? AND revoked_at IS NULL").bind(id, payload.sid).run();
+        } else {
+          await env.DB.prepare("UPDATE sessions SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL").bind(id).run();
+        }
+        invalidarCacheCorta("sesion:");
 
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "restablecer_password", entidad: "usuario", entidad_id: id,
@@ -16916,21 +20107,18 @@ async function handlePrimary(request, env, ctx) {
         if (user.rol === "admin") {
           return json({ error: "Los administradores están siempre en el nivel máximo y no se puede editar su nivel mientras tengan ese rol" }, 400);
         }
-        // El sistema de niveles mide la confianza para publicar contenido
-        // editorial sin revisión (ver publicarSinRevision): un fotógrafo
-        // no publica noticias ni crónicas, así que no tiene sentido darle
-        // un nivel de redactor.
-        if (esFotografo(user)) {
-          return json({ error: "El nivel de colaborador no aplica a un fotógrafo" }, 400);
-        }
+        // Un fotógrafo tiene su propia escala (F1–F2, guardada como 1–2 en la misma
+        // columna); un redactor, N1–N4. Ver NIVELES_FOTO_INFO.
+        const esFoto = esFotografo(user);
+        const maximoRol = esFoto ? NIVEL_MAXIMO_FOTOGRAFO : NIVEL_MAXIMO;
 
         const body = await request.json().catch(() => ({}));
         const nuevoNivel = parseInt(body.nivel);
-        if (![1, 2, 3, 4].includes(nuevoNivel)) {
-          return json({ error: "El nivel debe ser 1, 2, 3 o 4" }, 400);
+        if (!Number.isInteger(nuevoNivel) || nuevoNivel < 1 || nuevoNivel > maximoRol) {
+          return json({ error: esFoto ? "El nivel de un fotógrafo debe ser F1 o F2 (1 o 2)" : "El nivel debe ser 1, 2, 3 o 4" }, 400);
         }
         const nota = typeof body.nota === "string" ? body.nota.trim().slice(0, 500) : null;
-        const nivelAnterior = user.nivel || 1;
+        const nivelAnterior = nivelEfectivoUsuario(user);
 
         await env.DB.prepare("UPDATE users SET nivel = ?, nivel_nota = ? WHERE id = ?")
           .bind(nuevoNivel, nota, id).run();
@@ -16945,7 +20133,7 @@ async function handlePrimary(request, env, ctx) {
         const subeOBaja = nuevoNivel > nivelAnterior ? "subido" : (nuevoNivel < nivelAnterior ? "bajado" : "actualizado");
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "cambiar_nivel_usuario", entidad: "usuario", entidad_id: id,
-          descripcion: `Ha ${subeOBaja} el nivel de "${user.nombre}" de ${nivelAnterior} a ${nuevoNivel}${nota ? `: ${nota}` : ""}`,
+          descripcion: `Ha ${subeOBaja} el nivel de "${user.nombre}" de ${etiquetaNivelUsuario(user, nivelAnterior)} a ${etiquetaNivelUsuario(user, nuevoNivel)}${nota ? `: ${nota}` : ""}`,
           detalle: { nivel_anterior: nivelAnterior, nivel_nuevo: nuevoNivel, nota },
         }));
 
@@ -17020,7 +20208,7 @@ async function handlePrimary(request, env, ctx) {
         await env.DB.prepare(
           `UPDATE users SET nombre = ?, rol = ?, activo = ?, email = ?, equipo = ?, categorias_fijas = ? WHERE id = ?`
         ).bind(
-          body.nombre !== undefined ? body.nombre : user.nombre,
+          body.nombre !== undefined ? (capitalizarNombrePropio(body.nombre) || user.nombre) : user.nombre,
           body.rol !== undefined ? normalizarRolColaborador(body.rol) : user.rol,
           body.activo === undefined ? user.activo : (body.activo ? 1 : 0),
           body.email !== undefined ? (body.email ? body.email.trim() : null) : user.email,
@@ -17028,6 +20216,35 @@ async function handlePrimary(request, env, ctx) {
           categoriasFijasParaGuardar,
           id
         ).run();
+
+        // Excepción "firma solo con su nombre" (sin apellidos): solo la cambia un admin.
+        if (body.sin_apellidos !== undefined) {
+          await asegurarColumnaSinApellidos(env);
+          await env.DB.prepare("UPDATE users SET sin_apellidos = ? WHERE id = ?").bind(body.sin_apellidos ? 1 : 0, id).run();
+        }
+
+        // Pasar de redactor a fotógrafo (o al revés) reinicia el nivel a 1: las escalas son
+        // distintas (N1–N4 / F1–F2) y un N2 no debe convertirse en F2 ni un F2 en N2, que
+        // daría publicación directa sin revisión.
+        {
+          const rolNuevoNivel = body.rol !== undefined ? normalizarRolColaborador(body.rol) : user.rol;
+          if (rolNuevoNivel !== user.rol && (rolNuevoNivel === "fotografo" || user.rol === "fotografo")) {
+            await env.DB.prepare("UPDATE users SET nivel = 1 WHERE id = ?").bind(id).run();
+            // La nota era sobre el nivel anterior: se limpia a mejor esfuerzo (no bloquea el cambio de rol).
+            try { await env.DB.prepare("UPDATE users SET nivel_nota = NULL WHERE id = ?").bind(id).run(); } catch { /* columna ausente en esquemas antiguos */ }
+          }
+        }
+
+        // Cambiar el rol o desactivar la cuenta cierra sus sesiones abiertas:
+        // la persona tiene que volver a entrar y el panel se reconstruye con
+        // su rol real. (Editar nombre, correo o equipos NO las cierra.) La
+        // validación de sesión se cachea 20 s por isolate, así que se vacía.
+        const rolFinalUsuario = body.rol !== undefined ? normalizarRolColaborador(body.rol) : user.rol;
+        const seDesactivaUsuario = Number(user.activo) === 1 && body.activo !== undefined && !body.activo;
+        if (rolFinalUsuario !== user.rol || seDesactivaUsuario) {
+          await env.DB.prepare("UPDATE sessions SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL").bind(id).run();
+          invalidarCacheCorta("sesion:");
+        }
 
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "editar_usuario", entidad: "usuario", entidad_id: id,
@@ -17044,7 +20261,7 @@ async function handlePrimary(request, env, ctx) {
         if (payload.rol !== "admin") return json({ error: "Solo un administrador puede eliminar usuarios" }, 403);
         const id = parseInt(userMatch[1]);
         if (id === payload.uid) return json({ error: "No puedes eliminar tu propia cuenta" }, 400);
-        const userBorrado = await env.DB.prepare("SELECT username, nombre, rol, equipo, categorias_fijas FROM users WHERE id = ?").bind(id).first();
+        const userBorrado = await env.DB.prepare("SELECT username, nombre, rol, equipo, categorias_fijas, email FROM users WHERE id = ?").bind(id).first();
         // tienda_pedidos.usuario_id es NOT NULL y apunta a users(id): si esta
         // persona tiene pedidos, borrarla rompería la clave foránea. Se avisa
         // con un 409 claro (un 5xx o una excepción harían failover a Railway
@@ -17111,13 +20328,19 @@ async function handlePrimary(request, env, ctx) {
           throw e;
         }
         // Fuera también su respuesta en los formularios con alta de usuario (su nombre vuelve a la lista).
-        try { await borrarRespuestasDeUsuarioFormulario(env, userBorrado); }
+        let respuestasFormularioBorradas = 0;
+        try { respuestasFormularioBorradas = await borrarRespuestasDeUsuarioFormulario(env, userBorrado); }
         catch (e) { console.error("[formularios/usuario-eliminado]", e); }
+        if (!respuestasFormularioBorradas && userBorrado && FORMULARIO_ALTA_ROLES.includes(userBorrado.rol)) {
+          console.warn(`[formularios/usuario-eliminado] No se encontró respuesta de formulario para "${userBorrado.username}" (${userBorrado.nombre})`);
+        }
+        // Correo de despedida y agradecimiento (no bloquea ni rompe el borrado).
+        if (userBorrado) ctx.waitUntil(enviarCorreoDespedidaCuenta(env, userBorrado));
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "eliminar_usuario", entidad: "usuario", entidad_id: id,
           descripcion: `Ha eliminado el usuario "${userBorrado ? userBorrado.username : id}"`,
         }));
-        return json({ ok: true });
+        return json({ ok: true, respuestas_formulario_borradas: respuestasFormularioBorradas });
       }
 
       // ---------- MEDIA: subir contenido (fotos/vídeos) ----------
@@ -17218,6 +20441,10 @@ async function handlePrimary(request, env, ctx) {
         const resultId = resultIdRaw ? parseInt(resultIdRaw) : null;
         let equipoGaleria = (form.get("equipo") || "").toString().trim().toLowerCase();
         if (equipoGaleria !== "local" && equipoGaleria !== "visitante") equipoGaleria = null;
+        // esPortada=1: esta foto es la portada de la galería del partido (solo
+        // vale si es una foto pública y va vinculada a un partido; se comprueba
+        // más abajo, cuando ya se sabe el tipo de archivo).
+        const pideSerPortada = (form.get("esPortada") || "").toString().trim() === "1";
         // Portada elegida por quien sube el vídeo (segundo exacto del que
         // se extrae el fotograma de portada en la galería). Opcional: si
         // no se manda, se sigue usando el segundo 1 por defecto.
@@ -17286,12 +20513,37 @@ async function handlePrimary(request, env, ctx) {
         let duplicado = null;
         try {
           duplicado = await env.DB.prepare(
-            "SELECT id, titulo, autor_nombre FROM media WHERE hash_archivo = ?"
+            "SELECT id, titulo, autor_nombre, autor_id, created_at, tipo FROM media WHERE hash_archivo = ?"
           ).bind(hashArchivo).first();
         } catch (err) {
           console.error("Comprobación de duplicados en /api/media falló (se continúa sin bloquear):", err.message);
         }
         if (duplicado) {
+          // Reintento de la MISMA persona hace un momento (típico: la subida sí
+          // llegó a guardarse pero la respuesta se perdió por la red y el panel
+          // reintentó). No es un error: se da por buena, y si había partido
+          // elegido se asegura que la foto esté en su galería.
+          const creadoRaw = duplicado.created_at;
+          let creadoMs = NaN;
+          if (creadoRaw instanceof Date) creadoMs = creadoRaw.getTime();
+          else if (creadoRaw) {
+            const s = String(creadoRaw);
+            creadoMs = Date.parse(/[zZ]$|[+-]\d\d:?\d\d$/.test(s) ? s : s.replace(" ", "T") + "Z");
+            if (!Number.isFinite(creadoMs)) creadoMs = Date.parse(s);
+          }
+          const edadMs = Date.now() - creadoMs;
+          const mismoAutorReciente = duplicado.autor_id != null && Number(duplicado.autor_id) === Number(payload.uid)
+            && Number.isFinite(edadMs) && edadMs < 15 * 60 * 1000 && edadMs > -60 * 1000;
+          if (mismoAutorReciente) {
+            let vinculadaReuso = null;
+            let slugReuso = null;
+            if (resultadoGaleria) {
+              vinculadaReuso = await vincularMediaAGaleriaPartido(env, resultadoGaleria.id, duplicado.id, payload.uid, equipoGaleria,
+                pideSerPortada && visibilidad === "publico" && duplicado.tipo === "foto");
+              if (vinculadaReuso) slugReuso = await slugPartidoSeguro(env, resultadoGaleria);
+            }
+            return json({ ok: true, reutilizado: true, mediaId: duplicado.id, galeriaPartidoSlug: slugReuso, galeriaVinculada: vinculadaReuso });
+          }
           return json({
             error: `Este archivo ya se subió antes con el título "${duplicado.titulo}"${duplicado.autor_nombre ? ` (por ${duplicado.autor_nombre})` : ""}. No se puede subir el mismo contenido dos veces.`,
             duplicado: true,
@@ -17306,7 +20558,7 @@ async function handlePrimary(request, env, ctx) {
         // punto único que usa /api/subir-imagen.
         let subida;
         try {
-          subida = await procesarSubidaArchivo(env, file, { permitirVideo: true }, fileBytes);
+          subida = await procesarSubidaArchivo(env, file, { permitirVideo: true }, fileBytes, hashArchivo);
         } catch (err) {
           if (err.esValidacion) return json({ error: err.message }, 400);
           // Cloudinary rechaza ESTE archivo (demasiado pesado, demasiados
@@ -17314,6 +20566,15 @@ async function handlePrimary(request, env, ctx) {
           // un fallo del servidor. Antes se devolvía como 502, y el 5xx
           // disparaba el failover a Railway, que respondía "No autorizado"
           // y tapaba la causa real (solo fallaban algunas fotos).
+          // Ninguna cuenta (ni la secundaria, si está configurada) puede aceptar más:
+          // no es un problema del archivo. 507 no se reintenta ni se confunde con
+          // "pesa demasiado" en el panel: falla al momento con un mensaje claro.
+          if (esCuotaCloudinaria(err.cloudinaryStatus, err.cloudinaryMensaje)) {
+            return json({
+              error: "Ninguna cuenta de Cloudinary puede aceptar más archivos ahora mismo (sin cupo o credenciales rechazadas). Avisa a un administrador.",
+              detail: err.message,
+            }, 507);
+          }
           if (err.cloudinaryStatus === 400 || err.cloudinaryStatus === 413) {
             return json({
               error: `Cloudinary ha rechazado este archivo: ${err.cloudinaryMensaje || "no lo acepta"}`,
@@ -17345,15 +20606,31 @@ async function handlePrimary(request, env, ctx) {
         // se reintenta sin ella.
         let mediaInsertado;
         try {
-          mediaInsertado = await env.DB.prepare(
-            `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo, portada_segundo, portada_foco, visibilidad)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          ).bind(
-            subida.publicId, subida.resourceType, subida.url,
-            titulo, descripcion || null, esFoto ? "foto" : "video",
-            file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo,
-            esFoto ? null : portadaSegundo, portadaFoco, visibilidad
-          ).run();
+          // Un corte pasajero de la base de datos justo aquí obligaba a repetir
+          // la subida entera (con el archivo ya en Cloudinary). Se reintenta una
+          // vez; si el primer intento SÍ se había guardado (error "unique" en el
+          // segundo), se da por bueno en vez de borrar el archivo de Cloudinary.
+          for (let intentoBD = 1; ; intentoBD++) {
+            try {
+              mediaInsertado = await env.DB.prepare(
+                `INSERT INTO media (cloudinary_public_id, cloudinary_resource_type, cloudinary_url, titulo, descripcion, tipo, nombre_archivo, content_type, tamano_bytes, autor_id, autor_nombre, club, hash_archivo, portada_segundo, portada_foco, visibilidad)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              ).bind(
+                subida.publicId, subida.resourceType, subida.url,
+                titulo, descripcion || null, esFoto ? "foto" : "video",
+                file.name, file.type, file.size, payload.uid, payload.nombre, club || null, hashArchivo,
+                esFoto ? null : portadaSegundo, portadaFoco, visibilidad
+              ).run();
+              break;
+            } catch (errBD) {
+              if (intentoBD >= 2) throw errBD;
+              if (intentoBD === 1 && esErrorTransitorioBD(errBD)) {
+                await new Promise((r) => setTimeout(r, 300));
+                continue;
+              }
+              throw errBD;
+            }
+          }
         } catch (err) {
           // visibilidad es una columna añadida por una migración manual
           // (migracion_media_visibilidad.sql): si no se ha ejecutado
@@ -17445,19 +20722,23 @@ async function handlePrimary(request, env, ctx) {
         // guardados de todas formas; el redactor siempre puede vincularlo
         // luego a mano desde "Galería de partido").
         let galeriaPartidoSlug = null;
-        if (resultadoGaleria && mediaInsertado?.meta?.last_row_id) {
+        let galeriaVinculada = null; // null = no se pidió partido
+        let mediaIdNuevo = mediaInsertado?.meta?.last_row_id || null;
+        if (!mediaIdNuevo) {
+          // Algunos drivers no devuelven last_row_id: se busca la fila recién creada.
           try {
-            const maxOrdenFila = await env.DB.prepare(
-              "SELECT COALESCE(MAX(orden), -1) AS max_orden FROM match_gallery WHERE result_id = ?"
-            ).bind(resultadoGaleria.id).first();
-            const siguienteOrden = (maxOrdenFila?.max_orden ?? -1) + 1;
-            await env.DB.prepare(
-              `INSERT INTO match_gallery (result_id, media_id, orden, vinculado_por_id, equipo) VALUES (?, ?, ?, ?, ?)`
-            ).bind(resultadoGaleria.id, mediaInsertado.meta.last_row_id, siguienteOrden, payload.uid, equipoGaleria).run();
-            galeriaPartidoSlug = await slugPartidoUnico(env, resultadoGaleria);
+            const fila = await env.DB.prepare("SELECT id FROM media WHERE cloudinary_public_id = ?").bind(subida.publicId).first();
+            mediaIdNuevo = fila?.id || null;
           } catch (err) {
-            console.error("No se pudo vincular automáticamente la foto a la galería del partido:", err.message);
+            console.error("No se pudo localizar el id del archivo recién subido:", err.message);
           }
+        }
+        if (resultadoGaleria) {
+          galeriaVinculada = mediaIdNuevo
+            ? await vincularMediaAGaleriaPartido(env, resultadoGaleria.id, mediaIdNuevo, payload.uid, equipoGaleria,
+                pideSerPortada && esFoto && visibilidad === "publico")
+            : false;
+          if (galeriaVinculada) galeriaPartidoSlug = await slugPartidoSeguro(env, resultadoGaleria);
         }
 
         if (!avisoEnLote) {
@@ -17490,7 +20771,9 @@ async function handlePrimary(request, env, ctx) {
           }, { excluirUid: payload.uid }));
         }
 
-        return json({ ok: true, galeriaPartidoSlug });
+        // galeriaVinculada=false avisa al panel de que la foto se guardó pero NO
+        // quedó en la galería del partido: el panel lo reintenta por su cuenta.
+        return json({ ok: true, galeriaPartidoSlug, mediaId: mediaIdNuevo, galeriaVinculada });
       }
 
       // ---------- SUBIR IMAGEN SUELTA (foto de perfil, fotos de una noticia...) ----------
@@ -18004,6 +21287,15 @@ async function handlePrimary(request, env, ctx) {
               await env.DB.prepare(
                 "UPDATE match_gallery SET result_id = ?, equipo = ? WHERE id = ?"
               ).bind(resultId, equipoGaleria, enlaceExistente.id).run();
+              // La portada lo es de UN partido: si la foto se cambia a otro, en el
+              // nuevo no puede llegar ya marcada (se elegirá desde su galería).
+              if (Number(enlaceExistente.result_id) !== Number(resultId)) {
+                try {
+                  await env.DB.prepare("UPDATE match_gallery SET es_portada = 0 WHERE id = ?").bind(enlaceExistente.id).run();
+                } catch (errPortada) {
+                  if (!esErrorColumnaFaltante(errPortada)) console.error("No se pudo quitar la marca de portada al mover la foto de partido:", errPortada.message);
+                }
+              }
             } else {
               const maxOrdenFila = await env.DB.prepare(
                 "SELECT COALESCE(MAX(orden), -1) AS max_orden FROM match_gallery WHERE result_id = ?"
@@ -18114,16 +21406,22 @@ async function handlePrimary(request, env, ctx) {
           "SELECT id, equipo_local, equipo_visitante, fecha_partido, slug FROM results WHERE id = ?"
         ).bind(resultId).first();
         if (!resultado) return json({ error: "Partido no encontrado" }, 404);
-        const { results } = await env.DB.prepare(
-          `SELECT mg.id, mg.orden, mg.created_at, mg.equipo,
+        // es_portada y visibilidad son columnas añadidas por migraciones manuales:
+        // de la consulta más completa a la más básica, por si aún no existen.
+        const consultaGaleriaPanel = (conPortada, conVisibilidad) => `SELECT mg.id, mg.orden, mg.created_at, mg.equipo${conPortada ? ", mg.es_portada" : ""},
                   m.id AS media_id, m.cloudinary_url, m.titulo, m.descripcion,
-                  m.tipo, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre
+                  m.tipo, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre${conVisibilidad ? ", m.visibilidad" : ""}
            FROM match_gallery mg
            JOIN media m ON m.id = mg.media_id
            LEFT JOIN users u ON u.id = m.autor_id
            WHERE mg.result_id = ?
-           ORDER BY mg.orden ASC, mg.created_at ASC`
-        ).bind(resultId).all();
+           ORDER BY mg.orden ASC, mg.created_at ASC`;
+        const { results: filasPanel } = await consultaConAlternativas(env, [
+          consultaGaleriaPanel(true, true), consultaGaleriaPanel(true, false),
+          consultaGaleriaPanel(false, true), consultaGaleriaPanel(false, false),
+        ], [resultId]);
+        const results = filasPanel.map((f) => ({ ...f, es_portada: Number(f.es_portada) === 1 ? 1 : 0 }));
+        const filaPortada = results.find((f) => f.es_portada === 1);
         // El link público solo tiene sentido si ya hay al menos una foto
         // vinculada; no se genera un slug "en vacío" para un partido sin
         // galería todavía.
@@ -18134,6 +21432,9 @@ async function handlePrimary(request, env, ctx) {
           equipoVisitante: resultado.equipo_visitante,
           slug,
           urlPublica: slug ? `${SITIO_URL}/galeria/${slug}` : null,
+          // Portada elegida (media_id) o null si la galería aún no tiene.
+          portadaMediaId: filaPortada ? filaPortada.media_id : null,
+          tienePortada: !!filaPortada,
         });
       }
 
@@ -18160,6 +21461,9 @@ async function handlePrimary(request, env, ctx) {
         // para foto general), igual criterio que en POST /api/media.
         let equipoGaleria = (body.equipo || "").toString().trim().toLowerCase();
         if (equipoGaleria !== "local" && equipoGaleria !== "visitante") equipoGaleria = null;
+        // portada: true -> deja como portada de la galería la foto portadaMediaId
+        // (o, si no se indica, la primera de mediaIds).
+        const marcarPortada = body.portada === true || body.portada === 1 || body.portada === "1";
 
         // Siguiente número de orden libre, para que las imágenes nuevas
         // se añadan al final de la galería en vez de mezclarse con las
@@ -18204,7 +21508,15 @@ async function handlePrimary(request, env, ctx) {
           }));
         }
 
-        return json({ ok: true, vinculadas, errores });
+        let portadaFijada = false;
+        if (marcarPortada) {
+          const candidata = Number.isInteger(parseInt(body.portadaMediaId)) ? parseInt(body.portadaMediaId) : mediaIds[0];
+          const validacion = await validarPortadaGaleria(env, resultId, candidata);
+          if (validacion.error) errores.push({ mediaId: candidata, error: validacion.error });
+          else portadaFijada = await fijarPortadaGaleria(env, resultId, candidata);
+        }
+
+        return json({ ok: true, vinculadas, errores, portadaFijada });
       }
 
       // ---------- GALERÍA DE PARTIDO: reordenar ----------
@@ -18249,9 +21561,23 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: "Un redactor no puede editar la galería de un partido" }, 403);
         }
         const id = parseInt(galeriaItemMatch[1]);
-        const enlace = await env.DB.prepare("SELECT id FROM match_gallery WHERE id = ?").bind(id).first();
+        const enlace = await env.DB.prepare("SELECT id, result_id, media_id FROM match_gallery WHERE id = ?").bind(id).first();
         if (!enlace) return json({ error: "No encontrado" }, 404);
         const body = await request.json().catch(() => ({}));
+        // { portada: true }: esta foto pasa a ser la portada de la galería de su
+        // partido (la que hubiera deja de serlo). No toca el equipo.
+        if (body.portada === true || body.portada === 1 || body.portada === "1") {
+          const validacion = await validarPortadaGaleria(env, enlace.result_id, enlace.media_id);
+          if (validacion.error) return json({ error: validacion.error }, validacion.status);
+          const fijada = await fijarPortadaGaleria(env, enlace.result_id, enlace.media_id);
+          if (!fijada) return json({ error: "No se pudo guardar la portada. Falta ejecutar la migración migracion_galeria_portada.sql en la base de datos." }, 409); // 409 y no 5xx: un 5xx dispara el failover y taparía este mensaje
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "portada_galeria_partido", entidad: "resultado", entidad_id: enlace.result_id,
+            descripcion: `Ha cambiado la portada de la galería del partido #${enlace.result_id}.`,
+            detalle: { media_id: enlace.media_id },
+          }));
+          return json({ ok: true, portada: true });
+        }
         let equipoGaleria = (body.equipo || "").toString().trim().toLowerCase();
         if (equipoGaleria !== "local" && equipoGaleria !== "visitante") equipoGaleria = null;
         await env.DB.prepare("UPDATE match_gallery SET equipo = ? WHERE id = ?").bind(equipoGaleria, id).run();
@@ -18267,6 +21593,26 @@ async function handlePrimary(request, env, ctx) {
         const puedeQuitar = esAdmin(payload) || enlace.vinculado_por_id === payload.uid;
         if (!puedeQuitar) {
           return json({ error: "Solo un administrador o quien vinculó esta imagen puede quitarla de la galería" }, 403);
+        }
+        // La portada es obligatoria: si esta foto ES la portada y quedan otras
+        // fotos públicas en la galería, primero hay que elegir otra portada. (Si
+        // es la última foto, se puede quitar: la galería desaparece.) Es una
+        // comprobación "extra": si la columna aún no existe, se deja quitar.
+        try {
+          const marca = await env.DB.prepare("SELECT es_portada FROM match_gallery WHERE id = ?").bind(id).first();
+          if (marca && Number(marca.es_portada) === 1) {
+            const { results: otras } = await consultaConAlternativas(env, [
+              `SELECT COUNT(*) AS n FROM match_gallery mg JOIN media m ON m.id = mg.media_id
+                WHERE mg.result_id = ? AND mg.id <> ? AND (m.tipo = 'foto' OR m.tipo IS NULL) AND m.visibilidad = 'publico'`,
+              `SELECT COUNT(*) AS n FROM match_gallery mg JOIN media m ON m.id = mg.media_id
+                WHERE mg.result_id = ? AND mg.id <> ? AND (m.tipo = 'foto' OR m.tipo IS NULL)`,
+            ], [enlace.result_id, id]);
+            if (Number(otras && otras[0] && otras[0].n) > 0) {
+              return json({ error: "Esta foto es la portada de la galería. Elige otra foto como portada antes de quitarla.", portada: true }, 409);
+            }
+          }
+        } catch (err) {
+          if (!esErrorColumnaFaltante(err)) console.error("No se pudo comprobar si la foto a quitar era la portada (se deja quitar):", err.message);
         }
         await env.DB.prepare("DELETE FROM match_gallery WHERE id = ?").bind(id).run();
         ctx.waitUntil(registrarActividad(env, request, payload, {
@@ -18309,7 +21655,34 @@ async function handlePrimary(request, env, ctx) {
           consultaGaleria(true, true), consultaGaleria(true, false),
           consultaGaleria(false, true), consultaGaleria(false, false),
         ], [resultado.id]);
-        const filas = filasBrutas.map((f) => ({ ...f, portada_foco: normalizarFocoOpcional(f.portada_foco) }));
+        // Portada elegida por quien hizo la galería (match_gallery.es_portada). Consulta
+        // aparte y en try/catch: si la columna aún no está migrada se usa la primera
+        // foto, como antes. Solo cuenta si sigue siendo una foto pública (filasBrutas
+        // ya viene filtrada por visibilidad).
+        let portadaMediaId = null;
+        try {
+          const filaPortada = await env.DB.prepare(
+            "SELECT media_id FROM match_gallery WHERE result_id = ? AND es_portada = 1 LIMIT 1"
+          ).bind(resultado.id).first();
+          portadaMediaId = filaPortada ? filaPortada.media_id : null;
+        } catch (err) {
+          if (!esErrorColumnaFaltante(err)) console.error("Galería pública: no se pudo leer la portada (se usa la primera foto):", err.message);
+        }
+        const esFotoFila = (f) => !f.tipo || f.tipo === "foto";
+        const filaPortadaElegida = portadaMediaId != null ? filasBrutas.find((f) => f.media_id === portadaMediaId && esFotoFila(f)) : null;
+        const filaPortadaFinal = filaPortadaElegida || filasBrutas.find(esFotoFila) || null;
+        const filas = filasBrutas.map((f) => ({
+          ...f,
+          portada_foco: normalizarFocoOpcional(f.portada_foco),
+          es_portada: !!filaPortadaFinal && f.media_id === filaPortadaFinal.media_id,
+        }));
+        const portada = filaPortadaFinal ? {
+          media_id: filaPortadaFinal.media_id,
+          url: filaPortadaFinal.cloudinary_url,
+          titulo: filaPortadaFinal.titulo || "",
+          foco: normalizarFocoOpcional(filaPortadaFinal.portada_foco),
+          elegida: !!filaPortadaElegida,
+        } : null;
         // Agrupado en servidor: "local"/"visitante" con su nombre de
         // equipo ya resuelto, y "general" para fotos sin equipo asignado
         // (p.ej. del estadio o del ambiente, no de un equipo en concreto).
@@ -18327,8 +21700,147 @@ async function handlePrimary(request, env, ctx) {
         return json({
           partido: resultado,
           totalFotos: filas.length,
+          portada,
           grupos,
         });
+      }
+
+      // ---------- GALERÍAS POR PARTIDO: portada pública (/galerias) ----------
+      // Lista los partidos que tienen fotos/vídeos PÚBLICOS en match_gallery,
+      // del más reciente al más antiguo, con hasta 4 fotos de muestra por
+      // partido para pintar la portada de cada galería. Sin autenticación.
+      // Parámetros: pagina, competicion (clave), q (texto de un equipo).
+      // En la primera página devuelve además el resumen
+      // para la cabecera: partidos y fotos por competición, total de la galería
+      // general y sus últimas fotos. Todo lo "extra" va en try/catch: si algo
+      // falla (columna sin migrar...) la lista sale igual.
+      if (path === "/api/galerias/partidos" && method === "GET") {
+        const TAM_PAGINA_PARTIDOS = 18;
+        const pagina = Math.max(1, parseInt(url.searchParams.get("pagina"), 10) || 1);
+        const offset = (pagina - 1) * TAM_PAGINA_PARTIDOS;
+        const competicion = String(url.searchParams.get("competicion") || "").trim();
+        const texto = String(url.searchParams.get("q") || "").trim().toLowerCase().replace(/[%_\\]/g, " ").replace(/\s+/g, " ").slice(0, 60);
+
+        const condiciones = ["r.slug IS NOT NULL", "r.slug <> ''"];
+        const bindsFiltro = [];
+        if (/^[a-z_]{1,40}$/.test(competicion)) { condiciones.push("r.competicion = ?"); bindsFiltro.push(competicion); }
+        if (texto) {
+          condiciones.push("(LOWER(r.equipo_local) LIKE ? OR LOWER(r.equipo_visitante) LIKE ?)");
+          bindsFiltro.push(`%${texto}%`, `%${texto}%`);
+        }
+        const dondeBase = condiciones.join(" AND ");
+
+        const consultaPartidos = (conVisibilidad) => `SELECT r.id, r.slug, r.equipo_local, r.equipo_visitante, r.escudo_local_url, r.escudo_visitante_url,
+                    r.goles_local, r.goles_visitante, r.penaltis_local, r.penaltis_visitante, r.fecha_partido, r.estado, r.competicion, r.jornada,
+                    COUNT(m.id) AS total
+             FROM match_gallery mg
+             JOIN media m ON m.id = mg.media_id
+             JOIN results r ON r.id = mg.result_id
+             WHERE ${dondeBase}${conVisibilidad ? " AND m.visibilidad = 'publico'" : ""}
+             GROUP BY r.id
+             ORDER BY r.fecha_partido DESC, r.id DESC
+             LIMIT ? OFFSET ?`;
+        const { results: filasPartidos } = await consultaConAlternativas(env, [
+          consultaPartidos(true), consultaPartidos(false),
+        ], [...bindsFiltro, TAM_PAGINA_PARTIDOS + 1, offset]);
+        const partidos = (filasPartidos || []).map((p) => ({ ...p, total: Number(p.total) || 0, fotos: [] }));
+        const hayMas = partidos.length > TAM_PAGINA_PARTIDOS;
+        if (hayMas) partidos.length = TAM_PAGINA_PARTIDOS;
+
+        // Fotos de muestra (4 por partido, solo fotos, en el orden de la galería).
+        if (partidos.length) {
+          try {
+            const consultaMuestras = (conVisibilidad, conFoco) => `SELECT x.result_id, x.cloudinary_url, x.titulo${conFoco ? ", x.portada_foco" : ""} FROM (
+                SELECT mg.result_id, m.cloudinary_url, m.titulo${conFoco ? ", m.portada_foco" : ""},
+                       ROW_NUMBER() OVER (PARTITION BY mg.result_id ORDER BY mg.orden ASC, mg.created_at ASC) AS rn
+                  FROM match_gallery mg
+                  JOIN media m ON m.id = mg.media_id
+                 WHERE mg.result_id IN (${partidos.map(() => "?").join(",")})
+                   AND (m.tipo = 'foto' OR m.tipo IS NULL)${conVisibilidad ? " AND m.visibilidad = 'publico'" : ""}
+              ) x WHERE x.rn <= 4 ORDER BY x.result_id, x.rn`;
+            const { results: filasMuestras } = await consultaConAlternativas(env, [
+              consultaMuestras(true, true), consultaMuestras(true, false),
+              consultaMuestras(false, true), consultaMuestras(false, false),
+            ], partidos.map((p) => p.id));
+            const porPartido = new Map(partidos.map((p) => [p.id, p]));
+            for (const f of filasMuestras || []) {
+              const p = porPartido.get(f.result_id);
+              if (!p || !f.cloudinary_url) continue;
+              p.fotos.push({ url: f.cloudinary_url, titulo: f.titulo || "", foco: normalizarFocoOpcional(f.portada_foco) });
+            }
+          } catch (err) {
+            console.error("Galerías por partido: no se pudieron cargar las fotos de muestra (se continúa sin ellas):", err.message);
+          }
+          // Portada elegida de cada galería: pasa a ser la PRIMERA foto de muestra (así
+          // quien ya pintaba fotos[0] —portada del sitio, /galerias— la usa sin cambios)
+          // y se expone aparte como "portada". Si la columna aún no está migrada o el
+          // partido no tiene portada, se queda la primera foto, como antes.
+          try {
+            const consultaPortadas = (conVisibilidad, conFoco) => `SELECT mg.result_id, m.cloudinary_url, m.titulo${conFoco ? ", m.portada_foco" : ""}
+                 FROM match_gallery mg
+                 JOIN media m ON m.id = mg.media_id
+                WHERE mg.result_id IN (${partidos.map(() => "?").join(",")})
+                  AND mg.es_portada = 1
+                  AND (m.tipo = 'foto' OR m.tipo IS NULL)${conVisibilidad ? " AND m.visibilidad = 'publico'" : ""}`;
+            const { results: filasPortadas } = await consultaConAlternativas(env, [
+              consultaPortadas(true, true), consultaPortadas(true, false),
+              consultaPortadas(false, true), consultaPortadas(false, false),
+            ], partidos.map((p) => p.id));
+            const porPartidoPortada = new Map(partidos.map((p) => [p.id, p]));
+            for (const f of filasPortadas || []) {
+              const p = porPartidoPortada.get(f.result_id);
+              if (!p || !f.cloudinary_url) continue;
+              const portada = { url: f.cloudinary_url, titulo: f.titulo || "", foco: normalizarFocoOpcional(f.portada_foco) };
+              p.portada = portada;
+              p.fotos = [portada, ...p.fotos.filter((x) => x.url !== portada.url)].slice(0, 4);
+            }
+          } catch (err) {
+            if (!esErrorColumnaFaltante(err)) console.error("Galerías por partido: no se pudieron cargar las portadas (se usa la primera foto):", err.message);
+          }
+          for (const p of partidos) if (!p.portada) p.portada = p.fotos[0] || null;
+        }
+
+        const respuesta = { partidos, pagina, hayMas };
+
+        if (pagina === 1) {
+          try {
+            const consultaResumen = (conVisibilidad) => `SELECT r.competicion AS competicion, COUNT(DISTINCT r.id) AS partidos, COUNT(m.id) AS fotos
+                 FROM match_gallery mg
+                 JOIN media m ON m.id = mg.media_id
+                 JOIN results r ON r.id = mg.result_id
+                WHERE r.slug IS NOT NULL AND r.slug <> ''${conVisibilidad ? " AND m.visibilidad = 'publico'" : ""}
+                GROUP BY r.competicion`;
+            const { results: filasResumen } = await consultaConAlternativas(env, [consultaResumen(true), consultaResumen(false)]);
+            respuesta.competiciones = (filasResumen || [])
+              .filter((c) => c.competicion)
+              .map((c) => ({ clave: c.competicion, partidos: Number(c.partidos) || 0, fotos: Number(c.fotos) || 0 }));
+          } catch (err) {
+            console.error("Galerías por partido: no se pudo cargar el resumen por competición:", err.message);
+          }
+          {
+            try {
+              const consultaGeneral = (conVisibilidad, conFoco) => `SELECT m.cloudinary_url, m.titulo${conFoco ? ", m.portada_foco" : ""}
+                   FROM media m
+                  WHERE ${conVisibilidad ? "m.visibilidad = 'publico'" : "1=1"} AND (m.tipo = 'foto' OR m.tipo IS NULL)
+                  ORDER BY m.created_at DESC LIMIT 5`;
+              const { results: filasRecientes } = await consultaConAlternativas(env, [
+                consultaGeneral(true, true), consultaGeneral(true, false),
+                consultaGeneral(false, true), consultaGeneral(false, false),
+              ]);
+              const consultaTotal = (conVisibilidad) => `SELECT COUNT(*) AS n FROM media m WHERE ${conVisibilidad ? "m.visibilidad = 'publico'" : "1=1"}`;
+              const { results: filaTotal } = await consultaConAlternativas(env, [consultaTotal(true), consultaTotal(false)]);
+              respuesta.general = {
+                total: Number(filaTotal && filaTotal[0] && filaTotal[0].n) || 0,
+                recientes: (filasRecientes || []).filter((f) => f.cloudinary_url)
+                  .map((f) => ({ url: f.cloudinary_url, titulo: f.titulo || "", foco: normalizarFocoOpcional(f.portada_foco) })),
+              };
+            } catch (err) {
+              console.error("Galerías por partido: no se pudo cargar el resumen de la galería general:", err.message);
+            }
+          }
+        }
+
+        return json(respuesta);
       }
 
       // ---------- GALERÍA GENERAL DEL SITIO: vista pública ----------
@@ -18447,6 +21959,46 @@ async function handlePrimary(request, env, ctx) {
       // Nivel mínimo para organizar noticias en carruseles (el panel lo oculta por debajo).
       const NIVEL_REDES_MINIMO = 4;
       // Acepta varias a la vez: { ids: [1, 2, 3], destino: "carousel_1" | "carousel_2" | "individual" | null }
+      // ===== Feedback de revisores =====
+      if (path === "/api/feedback" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const tipo = url.searchParams.get("tipo");
+        const limite = Math.min(Math.max(parseInt(url.searchParams.get("limit")) || 100, 1), 300);
+        const enviados = url.searchParams.get("enviados") === "1";
+        const columna = enviados ? "autor_feedback_id" : "destinatario_id";
+        const binds = [payload.uid];
+        let where = `${columna} = ?`;
+        if (tipo && FEEDBACK_TIPOS.includes(tipo)) { where += " AND tipo = ?"; binds.push(tipo); }
+        const { results } = await env.DB.prepare(
+          `SELECT id, article_id, article_titulo, article_slug, autor_feedback_nombre, tipo, nota, leido, created_at FROM article_feedback WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT ${limite}`
+        ).bind(...binds).all();
+        const noLeidos = await env.DB.prepare("SELECT COUNT(*) AS n FROM article_feedback WHERE destinatario_id = ? AND leido = 0").bind(payload.uid).first();
+        return json({ feedback: results || [], no_leidos: Number(noLeidos && noLeidos.n) || 0 });
+      }
+
+      if (path === "/api/feedback/resumen" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const noLeidos = await env.DB.prepare("SELECT COUNT(*) AS n FROM article_feedback WHERE destinatario_id = ? AND leido = 0").bind(payload.uid).first();
+        const ultimo = await env.DB.prepare("SELECT id, article_titulo, tipo, autor_feedback_nombre, created_at FROM article_feedback WHERE destinatario_id = ? AND leido = 0 ORDER BY created_at DESC, id DESC LIMIT 1").bind(payload.uid).first();
+        return json({ no_leidos: Number(noLeidos && noLeidos.n) || 0, ultimo: ultimo || null });
+      }
+
+      if (path === "/api/feedback/leido" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        let body = {};
+        try { body = await request.json(); } catch (_) { body = {}; }
+        const ids = Array.isArray(body.ids) ? body.ids.map((x) => parseInt(x)).filter((x) => Number.isInteger(x) && x > 0).slice(0, 200) : [];
+        if (ids.length) {
+          await env.DB.prepare(`UPDATE article_feedback SET leido = 1, updated_at = datetime('now') WHERE destinatario_id = ? AND leido = 0 AND id IN (${ids.map(() => "?").join(",")})`).bind(payload.uid, ...ids).run();
+        } else {
+          await env.DB.prepare("UPDATE article_feedback SET leido = 1, updated_at = datetime('now') WHERE destinatario_id = ? AND leido = 0").bind(payload.uid).run();
+        }
+        return json({ ok: true });
+      }
+
       if (path === "/api/articles/redes-destino" && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
@@ -18970,6 +22522,12 @@ async function handlePrimary(request, env, ctx) {
             ficha_tecnica, fuera_calendario, banner_urgente, banner_urgente_hasta,
             ${admin ? "CASE WHEN publicado = 1 AND (fecha_publicacion IS NULL OR fecha_publicacion < datetime('now', '-2 days')) THEN NULL ELSE redes_destino END" : "NULL"} AS redes_destino,
             ${admin
+              ? `CASE WHEN publicado = 1 AND redes_destino IS NULL AND fecha_publicacion >= datetime('now', '-2 days')
+                   AND EXISTS (SELECT 1 FROM users u WHERE u.id = articles.autor_id AND u.rol = 'redactor' AND u.nivel = 2)
+                   AND NOT EXISTS (SELECT 1 FROM activity_log l WHERE l.accion = 'compartir_redes' AND l.entidad = 'articulo' AND l.entidad_id = CAST(articles.id AS TEXT))
+                   THEN 1 ELSE 0 END`
+              : "0"} AS sin_revision_redes,
+            ${admin
               ? `CASE WHEN publicado = 1 AND tipo IN ('previa', 'cronica') AND resultado_id IS NOT NULL
                    THEN (SELECT COUNT(*) FROM articles b WHERE b.resultado_id = articles.resultado_id AND b.tipo = articles.tipo AND b.publicado = 1)
                    ELSE 0 END`
@@ -19224,8 +22782,9 @@ async function handlePrimary(request, env, ctx) {
           if (longitudContenido < CONTENIDO_MIN && !sinMinimoUltimaHora) {
             return json({ error: `El contenido debe tener al menos ${CONTENIDO_MIN} caracteres (tiene ${longitudContenido}).` }, 400);
           }
-          if (longitudContenido > CONTENIDO_MAX) {
-            return json({ error: `El contenido no puede superar los ${CONTENIDO_MAX} caracteres (tiene ${longitudContenido}).` }, 400);
+          const contenidoMaxTipo = contenidoMaxPorTipo(body.tipo);
+          if (longitudContenido > contenidoMaxTipo) {
+            return json({ error: `El contenido no puede superar los ${contenidoMaxTipo} caracteres (tiene ${longitudContenido}).` }, 400);
           }
         }
         const slugPartido = await slugBasePartidoArticulo(env, body.tipo, body.resultado_id);
@@ -19234,7 +22793,7 @@ async function handlePrimary(request, env, ctx) {
         // Varias fotos: se guardan como JSON (con su posición dentro del
         // texto y su foco de recorte); la marcada como portada hace además
         // de "imagen_url", que es la que usan las tarjetas y el hero.
-        const imagenes = normalizarImagenes(body.imagenes);
+        const imagenes = normalizarImagenes(separarFotosSeguidas(body.imagenes, body.imagen_url, !!body.resultado_id));
         const imagenPortada = body.imagen_url || (imagenes.find((i) => i.tipo !== "tweet") || {}).url || null;
         // Es obligatorio poner al menos una imagen de portada por noticia.
         // Un borrador "en proceso" (todavía se está escribiendo) puede no
@@ -19251,7 +22810,7 @@ async function handlePrimary(request, env, ctx) {
         // (los dos equipos y la competición del partido), no de los
         // selectores del panel (ver resolverClubArticulo). Para el resto
         // de tipos no cambia nada.
-        const { error: errorClub, club: clubFinal, categoria: categoriaAutomatica } = await resolverClubArticulo(env, body.tipo, resultadoId, body.club);
+        const { error: errorClub, club: clubFinal, categoria: categoriaAutomatica } = await resolverClubArticulo(env, body.tipo, resultadoId, body.club, body.categoria, payload.rol === "admin");
         if (errorClub) return json({ error: errorClub }, 400);
 
         // Autor de la noticia: por defecto quien la está subiendo, pero se
@@ -19317,9 +22876,8 @@ async function handlePrimary(request, env, ctx) {
         // manda ya normalizada desde el panel (ver admin.js,
         // obtenerFichaTecnicaFormulario); aquí solo se guarda tal cual como
         // JSON, o NULL si no se manda o viene vacía.
-        const fichaTecnica = (body.tipo === "cronica" && body.ficha_tecnica && Object.keys(body.ficha_tecnica).length)
-          ? JSON.stringify(body.ficha_tecnica)
-          : null;
+        const fichaLimpia = body.tipo === "cronica" ? normalizarFichaTecnica(body.ficha_tecnica) : null;
+        const fichaTecnica = fichaLimpia ? JSON.stringify(fichaLimpia) : null;
 
         // Banner urgente: solo puede activarlo (a mano, al crear la
         // noticia) un admin o un redactor de Nivel 2+ -- igual de
@@ -19334,7 +22892,14 @@ async function handlePrimary(request, env, ctx) {
         // bajo demanda antes de decidir el permiso del banner.
         if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
         const puedeActivarBanner = payload.rol === "admin" || nivelUsuario >= 2;
-        const activarBanner = puedeActivarBanner && body.banner_urgente === true;
+        // Un Nivel 1 que publica con el PIN de "Última hora" (esUltimaHora, ya
+        // validado arriba) también puede activar el banner de esa noticia.
+        // Con ese mismo PIN también puede dejarla destacada.
+        const activarBanner = (puedeActivarBanner || esUltimaHora) && body.banner_urgente === true;
+        // "Destacado" lleva la noticia a lo más visible de la portada: mismo
+        // criterio que el banner (admin o Nivel 2+). Un Nivel 1 solo lo activa si
+        // publica con el PIN de "Última hora" (esUltimaHora).
+        const destacadoFinal = (puedeActivarBanner || esUltimaHora) && body.destacado ? 1 : 0;
 
         const filaArticuloCreado = await env.DB.prepare(
           `INSERT INTO articles (slug, titulo, subtitulo, contenido, tipo, categoria, categorias_adicionales, club, imagen_url, imagenes, resultado_id, autor_id, autor_nombre, coautor_id, coautor_nombre, destacado, publicado, estado_borrador, programado_para, fecha_preferencia_desde, fecha_preferencia_hasta, slug_congelado, fecha_publicacion, updated_at,
@@ -19345,7 +22910,7 @@ async function handlePrimary(request, env, ctx) {
           body.tipo || "noticia", categoriaFinal, categoriasAdicionales.length ? JSON.stringify(categoriasAdicionales) : null, clubFinal,
           imagenPortada, imagenes.length ? JSON.stringify(imagenes) : null, resultadoId,
           autorId, autorNombre, coautorId, coautorNombre,
-          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, preferenciaFechas.desde, preferenciaFechas.hasta, slugCongelado,
+          destacadoFinal, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, preferenciaFechas.desde, preferenciaFechas.hasta, slugCongelado,
           programadoPara || body.fecha_publicacion || new Date().toISOString(),
           traducciones.titulo_eu, traducciones.subtitulo_eu, traducciones.contenido_eu,
           traducciones.titulo_ca, traducciones.subtitulo_ca, traducciones.contenido_ca,
@@ -19371,7 +22936,7 @@ async function handlePrimary(request, env, ctx) {
         }
 
         const publicado = body.publicado !== false;
-        const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista", uno_por_uno: "1x1 de jugadores" }[body.tipo] || "Artículo";
+        const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista", uno_por_uno: "1x1 de jugadores", rdp_previa: "Rueda de prensa previa", rdp_post: "Rueda de prensa posterior" }[body.tipo] || "Artículo";
         const firmaAutores = coautorNombre ? `${autorNombre} y ${coautorNombre}` : autorNombre;
         if (programadoPara) {
           // No se manda aviso por email al programarla: se mandará el
@@ -19424,7 +22989,7 @@ async function handlePrimary(request, env, ctx) {
           ctx.waitUntil(notificarStaffArticulo(env, {
             titulo: body.titulo, slug, categoria: categoriaFinal, tipo: body.tipo,
             autor_nombre: autorNombre, coautor_nombre: coautorNombre,
-          }, { excluirUid: payload.uid, borrador: !publicado }));
+          }, { excluirUid: payload.uid, borrador: !publicado, sinRevisionUid: payload.uid }));
         }
 
         if (publicado && !programadoPara) {
@@ -19879,7 +23444,7 @@ async function handlePrimary(request, env, ctx) {
         // Solo el autor (o coautor, o un admin, o alguien con una
         // solicitud de edición aprobada y vigente para esta noticia)
         // puede editarla.
-        const articuloParaPermiso = await env.DB.prepare("SELECT slug, autor_id, coautor_id, publicado, estado_borrador, fecha_publicacion, slug_congelado, resultado_id, tipo, categoria, categorias_adicionales, club, ficha_tecnica, banner_urgente, fuera_calendario FROM articles WHERE id = ?").bind(id).first();
+        const articuloParaPermiso = await env.DB.prepare("SELECT slug, autor_id, coautor_id, publicado, programado_para, estado_borrador, fecha_publicacion, slug_congelado, resultado_id, tipo, categoria, categorias_adicionales, club, ficha_tecnica, banner_urgente, fuera_calendario, destacado FROM articles WHERE id = ?").bind(id).first();
         if (!articuloParaPermiso) return json({ error: "Noticia no encontrada" }, 404);
         if (!(await puedeEditar(env, payload, "articulo", id, articuloParaPermiso.autor_id, articuloParaPermiso.coautor_id))) {
           return json({ error: "No puedes editar esta noticia porque no es tuya. Solicita permiso al autor o a un administrador." }, 403);
@@ -19893,22 +23458,41 @@ async function handlePrimary(request, env, ctx) {
           && articuloParaPermiso.autor_id !== payload.uid
           && articuloParaPermiso.coautor_id !== payload.uid
           && !(await tienePermisoTemporal(env, payload, "articulo", id));
-        // Un borrador marcado como "terminado" ya ha avisado por email a
-        // la redacción de que está listo para subir: se bloquea para que
-        // nadie (salvo un admin, o un redactor Nivel 4 revisando/
-        // corrigiendo contenido ajeno) lo siga tocando, para no publicar
-        // por error una versión distinta de la que se avisó. En cuanto un
-        // admin lo publica, "estado_borrador" se limpia (ver más abajo) y
-        // recupera el poder de edición con normalidad.
-        const nivelParaBloqueoTerminado = payload.rol === "admin"
-          ? NIVEL_MAXIMO
-          : await obtenerNivelUsuario(env, payload.uid);
-        if (nivelParaBloqueoTerminado < 4 && !articuloParaPermiso.publicado && articuloParaPermiso.estado_borrador === "terminado") {
-          return json({ error: "Esta noticia está marcada como \"terminada\" y en espera de que un administrador la publique. No se puede editar hasta entonces." }, 403);
-        }
+        // Un borrador marcado como "terminado" (en revisión) SÍ se puede seguir
+        // editando: puedeEditar() ya limita quién (autor, coautor, admin, Nivel 4
+        // o con permiso temporal aprobado). Antes se bloqueaba para todos salvo
+        // admin/Nivel 4; ahora el redactor puede corregir su noticia mientras
+        // espera revisión. Seguirá "terminado" salvo que se publique o programe.
 
         const body = await request.json();
         if (typeof body.contenido === "string") body.contenido = sanearHtmlArticulo(body.contenido);
+
+        // NUNCA se devuelve a "en revisión" (ni a borrador) una noticia que ya
+        // está publicada o programada: editarla (corregir una errata, cambiar
+        // la foto...) no cambia su estado. Si el editor manda publicado:false
+        // sin una nueva fecha de programación válida, se mantiene tal como
+        // estaba: publicada sigue publicada, y programada sigue programada
+        // para su misma hora (si esa hora ya pasó, para el próximo minuto, que
+        // es cuando la habría publicado el disparador igualmente).
+        if (body.publicado === false) {
+          const yaPublicada = !!articuloParaPermiso.publicado;
+          const progActual = articuloParaPermiso.programado_para;
+          const yaProgramada = !yaPublicada && !!progActual;
+          const inicioMinutoGuardia = Math.floor(Date.now() / 60000) * 60000;
+          const nuevaProgValida = body.programado_para
+            && !isNaN(new Date(body.programado_para).getTime())
+            && new Date(body.programado_para).getTime() >= inicioMinutoGuardia;
+          if (yaPublicada && !nuevaProgValida) {
+            body.publicado = true;
+            body.programado_para = null;
+          } else if (yaProgramada && !nuevaProgValida) {
+            let fechaActual = progActual instanceof Date
+              ? progActual
+              : new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(String(progActual)) ? String(progActual) : String(progActual).replace(" ", "T") + "Z");
+            if (isNaN(fechaActual.getTime()) || fechaActual.getTime() < inicioMinutoGuardia) fechaActual = new Date(inicioMinutoGuardia + 60000);
+            body.programado_para = fechaActual.toISOString();
+          }
+        }
 
         // Un redactor de Nivel 1 no puede publicar directamente una noticia
         // NUEVA al editarla: si no es admin y no ha llegado a Nivel 2,
@@ -19984,12 +23568,13 @@ async function handlePrimary(request, env, ctx) {
           if (longitudContenido < CONTENIDO_MIN && !sinMinimoUltimaHora) {
             return json({ error: `El contenido debe tener al menos ${CONTENIDO_MIN} caracteres (tiene ${longitudContenido}).` }, 400);
           }
-          if (longitudContenido > CONTENIDO_MAX) {
-            return json({ error: `El contenido no puede superar los ${CONTENIDO_MAX} caracteres (tiene ${longitudContenido}).` }, 400);
+          const contenidoMaxTipo = contenidoMaxPorTipo(body.tipo !== undefined ? body.tipo : articuloParaPermiso.tipo);
+          if (longitudContenido > contenidoMaxTipo) {
+            return json({ error: `El contenido no puede superar los ${contenidoMaxTipo} caracteres (tiene ${longitudContenido}).` }, 400);
           }
         }
 
-        const imagenes = normalizarImagenes(body.imagenes);
+        const imagenes = normalizarImagenes(separarFotosSeguidas(body.imagenes, body.imagen_url, !!body.resultado_id));
         const imagenPortada = body.imagen_url || (imagenes.find((i) => i.tipo !== "tweet") || {}).url || null;
         // Es obligatorio poner al menos una imagen de portada por noticia,
         // igual que al crear. Un borrador "en proceso" puede seguir sin
@@ -20027,7 +23612,9 @@ async function handlePrimary(request, env, ctx) {
         const resultadoIdFinal = body.resultado_id !== undefined ? resultadoId : articuloParaPermiso.resultado_id;
         const { error: errorClub, club: clubFinal, categoria: categoriaAutomatica } = await resolverClubArticulo(
           env, tipoFinal, resultadoIdFinal,
-          body.club !== undefined ? body.club : articuloParaPermiso.club
+          body.club !== undefined ? body.club : articuloParaPermiso.club,
+          body.categoria !== undefined ? body.categoria : articuloParaPermiso.categoria,
+          payload.rol === "admin"
         );
         if (errorClub) return json({ error: errorClub }, 400);
 
@@ -20125,9 +23712,8 @@ async function handlePrimary(request, env, ctx) {
         // vacío.
         let fichaTecnica = articuloParaPermiso.ficha_tecnica || null;
         if (Object.prototype.hasOwnProperty.call(body, "ficha_tecnica")) {
-          fichaTecnica = (tipoFinal === "cronica" && body.ficha_tecnica && Object.keys(body.ficha_tecnica).length)
-            ? JSON.stringify(body.ficha_tecnica)
-            : null;
+          const fichaLimpia = tipoFinal === "cronica" ? normalizarFichaTecnica(body.ficha_tecnica) : null;
+          fichaTecnica = fichaLimpia ? JSON.stringify(fichaLimpia) : null;
         } else if (tipoFinal !== "cronica") {
           fichaTecnica = null;
         }
@@ -20149,10 +23735,23 @@ async function handlePrimary(request, env, ctx) {
           // que se completa bajo demanda antes de decidir el permiso.
           if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
           const puedeActivarBanner = payload.rol === "admin" || nivelUsuario >= 2;
-          const activarBanner = puedeActivarBanner && body.banner_urgente === true;
-          bannerUrgenteFinal = activarBanner ? 1 : 0;
-          bannerUrgenteHastaSQL = calcularBannerUrgenteHasta(activarBanner);
+          // Con el PIN de "Última hora" válido (puedeUltimaHora, solo al publicar
+          // por primera vez) un Nivel 1 también puede activar el banner. Si no
+          // tiene permiso, el banner se queda como estaba (retocar una errata no
+          // debe apagarle a nadie el banner que activó con su PIN).
+          if (puedeActivarBanner || puedeUltimaHora) {
+            const activarBanner = body.banner_urgente === true;
+            bannerUrgenteFinal = activarBanner ? 1 : 0;
+            bannerUrgenteHastaSQL = calcularBannerUrgenteHasta(activarBanner);
+          }
         }
+
+        // "Destacado": solo lo cambia un admin o un Nivel 2+; el resto conserva
+        // el valor que ya tenía la noticia (no se le quita ni se le pone).
+        if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
+        const destacadoFinal = (payload.rol === "admin" || nivelUsuario >= 2 || puedeUltimaHora)
+          ? (body.destacado ? 1 : 0)
+          : (articuloParaPermiso.destacado ? 1 : 0);
 
         await env.DB.prepare(
           `UPDATE articles SET slug=?, titulo=?, subtitulo=?, contenido=?, tipo=?, categoria=?, categorias_adicionales=?, club=?, imagen_url=?, imagenes=?, resultado_id=?, autor_id=?, autor_nombre=?, coautor_id=?, coautor_nombre=?, destacado=?, publicado=?, estado_borrador=?, programado_para=?, fecha_preferencia_desde=?, fecha_preferencia_hasta=?, slug_congelado=?, fecha_publicacion=?, updated_at=datetime('now'),
@@ -20163,7 +23762,7 @@ async function handlePrimary(request, env, ctx) {
           categoriaFinal, categoriasAdicionales.length ? JSON.stringify(categoriasAdicionales) : null, clubFinal || null, imagenPortada,
           imagenes.length ? JSON.stringify(imagenes) : null, resultadoId,
           autorId, autorNombre, coautorId, coautorNombre,
-          body.destacado ? 1 : 0, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, preferenciaFechas.desde, preferenciaFechas.hasta, slugCongeladoFinal,
+          destacadoFinal, body.publicado === false ? 0 : 1, estadoBorrador, programadoPara, preferenciaFechas.desde, preferenciaFechas.hasta, slugCongeladoFinal,
           fechaPublicacionFinal,
           traducciones.titulo_eu, traducciones.subtitulo_eu, traducciones.contenido_eu,
           traducciones.titulo_ca, traducciones.subtitulo_ca, traducciones.contenido_ca,
@@ -20226,7 +23825,7 @@ async function handlePrimary(request, env, ctx) {
         if (body.publicado !== false && !programadoPara) ctx.waitUntil(refrescarTarjetaSocial(env, urlNoticia(categoriaFinal, slug)));
         const yaEstabaTerminado = articuloParaPermiso.estado_borrador === "terminado";
         if (body.publicado === false && estadoBorrador === "terminado" && !yaEstabaTerminado) {
-          const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista", uno_por_uno: "1x1 de jugadores" }[body.tipo] || "Artículo";
+          const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista", uno_por_uno: "1x1 de jugadores", rdp_previa: "Rueda de prensa previa", rdp_post: "Rueda de prensa posterior" }[body.tipo] || "Artículo";
           const firmaAutores = coautorNombre ? `${autorNombre} y ${coautorNombre}` : autorNombre;
           const textoPreferenciaFechas = formatearPreferenciaFechasEmail(preferenciaFechas);
           ctx.waitUntil(enviarEmailNotificacion(env, {
@@ -20246,6 +23845,20 @@ async function handlePrimary(request, env, ctx) {
           }));
         }
 
+        // Feedback al autor: solo si quien guarda no es el autor/coautor (pieza ajena).
+        try {
+          const esAjena = articuloParaPermiso.autor_id !== payload.uid && articuloParaPermiso.coautor_id !== payload.uid;
+          if (esAjena) {
+            let tipoFb = null;
+            if (body.publicado !== false && !programadoPara && !articuloParaPermiso.publicado) tipoFb = "aprobada";
+            else if (programadoPara && !articuloParaPermiso.programado_para) tipoFb = "programada";
+            // La nota solo se pide al revisor en el momento de subir o programar; en cualquier otro guardado no se genera feedback.
+            if (tipoFb) {
+              ctx.waitUntil(crearFeedbackArticulo(env, { articulo: { id, slug, titulo: body.titulo }, destinatariosIds: [articuloParaPermiso.autor_id, articuloParaPermiso.coautor_id], tipo: tipoFb, nota: limpiarNotaFeedback(body.nota_revisor), revisor: payload }));
+            }
+          }
+        } catch (errFb) { console.error("feedback (editar articulo):", errFb && errFb.message); }
+
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "editar_articulo", entidad: "articulo", entidad_id: id,
           descripcion: `Ha editado la noticia/crónica "${body.titulo}"${estadoBorrador ? ` (${estadoBorrador === "terminado" ? "borrador terminado" : "borrador en proceso"})` : ""}${esEdicionAjenaPorNivel4 ? " (revisión de contenido ajeno, Nivel 4)" : ""}`,
@@ -20255,7 +23868,7 @@ async function handlePrimary(request, env, ctx) {
           if (body.publicado === false && estadoBorrador === "terminado" && !yaEstabaTerminado) {
             ctx.waitUntil(notificarStaffArticulo(env, staffArt, { excluirUid: payload.uid, borrador: true }));
           } else if (body.publicado !== false && !programadoPara && articuloParaPermiso && !articuloParaPermiso.publicado) {
-            ctx.waitUntil(notificarStaffArticulo(env, staffArt, { excluirUid: payload.uid }));
+            ctx.waitUntil(notificarStaffArticulo(env, staffArt, { excluirUid: payload.uid, sinRevisionUid: payload.uid }));
           }
         } catch (errStaff) { console.error("push equipo (editar articulo):", errStaff && errStaff.message); }
         // Si el articulo estaba en borrador y se publica ahora, aviso push.
@@ -20533,23 +24146,32 @@ async function handlePrimary(request, env, ctx) {
         return json({ clubes });
       }
 
-      // Da de alta un club nuevo (o actualiza su escudo si ya existía en
-      // esa misma categoría). Requiere login, igual que crear un
-      // resultado o una noticia, que es desde donde se llama.
+      // Da de alta un club nuevo. Solo admin y redactores (son quienes crean
+      // resultados y noticias, que es desde donde se llama). Si el club ya
+      // existía en esa categoría, el escudo solo lo cambia un admin o quien
+      // dio de alta el club; el resto solo puede rellenarlo si estaba vacío.
       if (path === "/api/custom-clubs" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede añadir clubes" }, 403);
+        }
         const body = await request.json();
         const nombre = normalizarTexto(body.nombre);
         const categoria = normalizarTexto(body.categoria);
         if (!nombre) return json({ error: "Falta el nombre del club" }, 400);
         if (!categoria) return json({ error: "Falta la categoría del club" }, 400);
         const escudoUrl = normalizarTexto(body.escudo_url);
+        const clubExistente = await env.DB.prepare("SELECT autor_id FROM custom_clubs WHERE nombre = ? AND categoria = ?").bind(nombre, categoria).first();
+        const puedeCambiarEscudo = payload.rol === "admin" || !clubExistente || (clubExistente.autor_id && clubExistente.autor_id === payload.uid);
+        const asignacionEscudo = puedeCambiarEscudo
+          ? "COALESCE(excluded.escudo_url, custom_clubs.escudo_url)"
+          : "CASE WHEN custom_clubs.escudo_url IS NULL OR custom_clubs.escudo_url = '' THEN excluded.escudo_url ELSE custom_clubs.escudo_url END";
         await env.DB.prepare(
           `INSERT INTO custom_clubs (nombre, categoria, escudo_url, autor_id, autor_nombre)
            VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(nombre, categoria) DO UPDATE SET
-             escudo_url = COALESCE(excluded.escudo_url, custom_clubs.escudo_url)`
+             escudo_url = ${asignacionEscudo}`
         ).bind(nombre, categoria, escudoUrl, payload.uid, payload.nombre).run();
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "crear_club_personalizado", entidad: "club",
@@ -20607,6 +24229,149 @@ async function handlePrimary(request, env, ctx) {
       // aunque en la fila antigua pusiera otra cosa.
       function votintVisibilidadEfectiva(v) {
         return v.anonima === 1 ? "al_cerrar" : v.resultados_visibles;
+      }
+
+      // ---------- PODCAST: rutas públicas y de gestión (panel) ----------
+      // Público: GET /api/podcast (solo publicados). Panel (admin/redactor):
+      // GET /api/podcast/admin, POST /api/podcast, PUT|DELETE /api/podcast/<id>.
+      function podcastParsearEnlace(bruto) {
+        const t = String(bruto || "").trim();
+        if (!t) return { plataforma: null, embed_id: null };
+        let u;
+        try { u = new URL(t); } catch { return { error: "El enlace no es una URL válida" }; }
+        if (u.protocol !== "https:") return { error: "El enlace tiene que empezar por https://" };
+        const host = u.hostname.replace(/^www\./, "").toLowerCase();
+        let id = null;
+        if (host === "youtu.be") id = u.pathname.slice(1).split("/")[0];
+        else if (host === "youtube.com" || host === "m.youtube.com" || host === "music.youtube.com") {
+          id = u.searchParams.get("v") || (u.pathname.match(/^\/(?:shorts|embed|live)\/([\w-]+)/) || [])[1];
+        }
+        if (id !== null) {
+          return /^[\w-]{6,20}$/.test(id || "") ? { plataforma: "youtube", embed_id: id } : { error: "No se reconoce el vídeo de YouTube" };
+        }
+        if (host === "open.spotify.com") {
+          const m = u.pathname.match(/\/(episode|show)\/(\w+)/);
+          return m ? { plataforma: "spotify", embed_id: m[1] + "/" + m[2] } : { error: "Enlace de Spotify no válido (episodio o programa)" };
+        }
+        if (host === "ivoox.com") {
+          const m = u.pathname.match(/_rf_(\d+)_/);
+          return m ? { plataforma: "ivoox", embed_id: m[1] } : { error: "Enlace de iVoox no válido" };
+        }
+        if (/\.(mp3|m4a|ogg|wav)$/i.test(u.pathname)) return { plataforma: "audio", embed_id: u.toString() };
+        return { error: "Enlace no admitido: usa YouTube, Spotify, iVoox o un .mp3 directo" };
+      }
+
+      function podcastFila(f) {
+        const em = f.plataforma ? (f.plataforma === "audio" ? { plataforma: "audio", url: f.embed_id } : { plataforma: f.plataforma, id: f.embed_id }) : null;
+        let portada = f.portada || "";
+        if (!portada && f.plataforma === "youtube") portada = "https://i.ytimg.com/vi/" + f.embed_id + "/hqdefault.jpg";
+        return {
+          id: f.id, tipo: f.tipo, titulo: f.titulo, descripcion: f.descripcion || "", fecha: f.fecha || "",
+          duracion: f.duracion || "", invitado: f.invitado || "", temporada: f.temporada || null, numero: f.numero || null,
+          portada, destacado: f.destacado === 1, publicado: f.publicado === 1, embed: em,
+        };
+      }
+
+      async function requirePodcastEditor(request, env) {
+        const payload = await requireAuthTienda(request, env);
+        if (!payload) return { error: json({ error: "No autorizado" }, 401) };
+        if (!esAdmin(payload) && !esRedactor(payload)) return { error: json({ error: "Solo administradores y redactores" }, 403) };
+        return { payload };
+      }
+
+      function podcastValidar(body) {
+        if (!body || typeof body !== "object") return { error: "Petición no válida" };
+        const titulo = normalizarTexto(body.titulo);
+        if (!titulo) return { error: "Falta el título" };
+        if (titulo.length > 150) return { error: "El título es demasiado largo (máximo 150 caracteres)" };
+        const descripcion = normalizarTexto(body.descripcion) || "";
+        if (descripcion.length > 2000) return { error: "La descripción es demasiado larga (máximo 2000 caracteres)" };
+        const tipo = ["episodio", "entrevista", "clip"].includes(body.tipo) ? body.tipo : "episodio";
+        const fecha = /^\d{4}-\d{2}-\d{2}$/.test(String(body.fecha || "")) ? body.fecha : new Date().toISOString().slice(0, 10);
+        const duracion = String(body.duracion || "").trim().slice(0, 12);
+        const invitado = (normalizarTexto(body.invitado) || "").slice(0, 100);
+        const num = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) && n > 0 && n < 100000 ? n : null; };
+        const enlace = podcastParsearEnlace(body.enlace);
+        if (enlace.error) return { error: enlace.error };
+        const portada = String(body.portada || "").trim();
+        if (portada && !/^https:\/\/\S+$/.test(portada)) return { error: "La portada tiene que ser una URL https://" };
+        return {
+          v: {
+            titulo, descripcion, tipo, fecha, duracion, invitado, temporada: num(body.temporada), numero: num(body.numero),
+            plataforma: enlace.plataforma, embed_id: enlace.embed_id, portada: portada || null,
+            destacado: body.destacado ? 1 : 0, publicado: body.publicado === false ? 0 : 1,
+          },
+        };
+      }
+
+      if (path === "/api/podcast" && method === "GET") {
+        try {
+          await asegurarTablaPodcast(env);
+          const { results } = await env.DB.prepare(
+            "SELECT * FROM podcast_items WHERE publicado = 1 ORDER BY fecha DESC, created_at DESC"
+          ).all();
+          return json({ items: (results || []).map(podcastFila) });
+        } catch (e) {
+          return json({ items: [] });
+        }
+      }
+
+      if (path === "/api/podcast/admin" && method === "GET") {
+        const auth = await requirePodcastEditor(request, env);
+        if (auth.error) return auth.error;
+        await asegurarTablaPodcast(env);
+        const { results } = await env.DB.prepare("SELECT * FROM podcast_items ORDER BY fecha DESC, created_at DESC").all();
+        return json({ items: (results || []).map(podcastFila) });
+      }
+
+      if (path === "/api/podcast" && method === "POST") {
+        const auth = await requirePodcastEditor(request, env);
+        if (auth.error) return auth.error;
+        const r = podcastValidar(await request.json().catch(() => null));
+        if (r.error) return json({ error: r.error }, 400);
+        await asegurarTablaPodcast(env);
+        const v = r.v;
+        const id = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+        if (v.destacado) await env.DB.prepare("UPDATE podcast_items SET destacado = 0").run();
+        await env.DB.prepare(
+          `INSERT INTO podcast_items (id, tipo, titulo, descripcion, fecha, duracion, invitado, temporada, numero, plataforma, embed_id, portada, destacado, publicado, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(id, v.tipo, v.titulo, v.descripcion, v.fecha, v.duracion, v.invitado, v.temporada, v.numero, v.plataforma, v.embed_id, v.portada, v.destacado, v.publicado, new Date().toISOString()).run();
+        ctx.waitUntil(registrarActividad(env, request, auth.payload, {
+          accion: "crear_podcast", entidad: "podcast", descripcion: `${auth.payload.nombre} ha publicado en el podcast "${v.titulo}"`,
+        }));
+        return json({ ok: true, id });
+      }
+
+      {
+        const mPod = path.match(/^\/api\/podcast\/([\w-]+)$/);
+        if (mPod && mPod[1] !== "admin" && (method === "PUT" || method === "DELETE")) {
+          const auth = await requirePodcastEditor(request, env);
+          if (auth.error) return auth.error;
+          await asegurarTablaPodcast(env);
+          const id = mPod[1];
+          const actual = await env.DB.prepare("SELECT id, titulo FROM podcast_items WHERE id = ?").bind(id).first();
+          if (!actual) return json({ error: "No existe" }, 404);
+          if (method === "DELETE") {
+            await env.DB.prepare("DELETE FROM podcast_items WHERE id = ?").bind(id).run();
+            ctx.waitUntil(registrarActividad(env, request, auth.payload, {
+              accion: "borrar_podcast", entidad: "podcast", descripcion: `${auth.payload.nombre} ha borrado del podcast "${actual.titulo}"`,
+            }));
+            return json({ ok: true });
+          }
+          const r = podcastValidar(await request.json().catch(() => null));
+          if (r.error) return json({ error: r.error }, 400);
+          const v = r.v;
+          if (v.destacado) await env.DB.prepare("UPDATE podcast_items SET destacado = 0 WHERE id <> ?").bind(id).run();
+          await env.DB.prepare(
+            `UPDATE podcast_items SET tipo = ?, titulo = ?, descripcion = ?, fecha = ?, duracion = ?, invitado = ?, temporada = ?, numero = ?,
+               plataforma = ?, embed_id = ?, portada = ?, destacado = ?, publicado = ? WHERE id = ?`
+          ).bind(v.tipo, v.titulo, v.descripcion, v.fecha, v.duracion, v.invitado, v.temporada, v.numero, v.plataforma, v.embed_id, v.portada, v.destacado, v.publicado, id).run();
+          ctx.waitUntil(registrarActividad(env, request, auth.payload, {
+            accion: "editar_podcast", entidad: "podcast", descripcion: `${auth.payload.nombre} ha editado del podcast "${v.titulo}"`,
+          }));
+          return json({ ok: true });
+        }
       }
 
       // Lista completa para el panel: cada votación con sus opciones, mi
@@ -21625,9 +25390,29 @@ async function handlePrimary(request, env, ctx) {
       // por orden_portada.
       if (path === "/api/polls/portada" && method === "GET") {
         await cerrarEncuestasCaducadas(env);
-        const { results: encuestas } = await env.DB.prepare(
+        const { results: encuestasTodas } = await env.DB.prepare(
           `SELECT * FROM polls WHERE en_portada = 1 ORDER BY orden_portada ASC, id DESC`
         ).all();
+        // Una encuesta cerrada sigue en portada solo unas horas (para ver el resultado final)
+        // y luego desaparece sola. Hora de cierre: la de cierre automático (cierra_en) si se
+        // cerró por tiempo, o la última modificación (updated_at) si se cerró a mano antes.
+        // Se calcula aquí y no en SQL para que valga igual en D1 y en PostgreSQL.
+        const HORAS_ENCUESTA_CERRADA_EN_PORTADA = 3;
+        const ahoraMs = Date.now();
+        const aMs = (v) => {
+          if (!v) return NaN;
+          if (v instanceof Date) return v.getTime();
+          const t = String(v).trim().replace(" ", "T");
+          return new Date(/Z$|[+-]\d\d:?\d\d$/.test(t) ? t : t + "Z").getTime();
+        };
+        const encuestas = encuestasTodas.filter((p) => {
+          if (p.estado === "abierta") return true;
+          const cierreAuto = aMs(p.cierra_en);
+          const modificada = aMs(p.updated_at);
+          const cierre = !isNaN(cierreAuto) && (isNaN(modificada) || cierreAuto < modificada) ? cierreAuto : modificada;
+          if (isNaN(cierre)) return true;
+          return ahoraMs < cierre + HORAS_ENCUESTA_CERRADA_EN_PORTADA * 3600 * 1000;
+        });
 
         const readerId = await lectorOpcionalEncuestas(request, env);
         const conResultados = await Promise.all(
@@ -21726,6 +25511,18 @@ async function handlePrimary(request, env, ctx) {
         });
       }
 
+      // Público: una noticia rápida por id (la usa el sitio para pintar la tarjeta
+      // al compartir el enlace con foto y titular en redes).
+      const nrPublicaMatch = path.match(/^\/api\/noticias-rapidas\/(\d+)$/);
+      if (nrPublicaMatch && method === "GET") {
+        const idNr = parseInt(nrPublicaMatch[1], 10);
+        const fila = await env.DB.prepare(
+          "SELECT id, titulo, subtitulo, imagen_url, imagen_foco, created_at FROM noticias_rapidas WHERE id = ?"
+        ).bind(idNr).first();
+        if (!fila) return json({ error: "No encontrada" }, 404);
+        return json({ ...fila, imagen_foco: normalizarFoco(fila.imagen_foco) });
+      }
+
       // Panel: listado completo (cualquier redactor/admin ve todas, pero
       // solo puede editar/borrar las suyas; el admin, todas).
       if (path === "/api/admin/noticias-rapidas" && method === "GET") {
@@ -21820,6 +25617,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/admin/polls" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede gestionar encuestas" }, 403);
+        }
         await cerrarEncuestasCaducadas(env);
 
         const { results: encuestas } = await env.DB.prepare(
@@ -21878,6 +25678,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/admin/polls" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede crear encuestas" }, 403);
+        }
 
         const body = await request.json();
         const pregunta = normalizarTexto(body.pregunta);
@@ -22530,6 +26333,9 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/club-info" && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede editar ni proponer fichas de club" }, 403);
+        }
 
         const body = await request.json();
         const club = normalizarTexto(body.club);
@@ -22548,6 +26354,27 @@ async function handlePrimary(request, env, ctx) {
         // directo, igual que un admin.
         const nivelUsuario = payload.rol === "admin" ? NIVEL_MAXIMO : await obtenerNivelUsuario(env, payload.uid);
         if (payload.rol !== "admin" && nivelUsuario < 2) {
+          // Anti-duplicados: no se admite una propuesta con EXACTAMENTE los mismos datos que otra
+          // ya pendiente del mismo club (de cualquier redactor) ni que la ficha ya publicada.
+          // Se comparan sin distinguir mayúsculas ni espacios de más.
+          const huellaClub = (e, s, f, c) => [e, s, f, c]
+            .map((v) => String(v ?? "").trim().replace(/\s+/g, " ").toLowerCase()).join("|");
+          const huellaNueva = huellaClub(entrenador, estadio, fundacion, ciudad);
+          const fichaActual = await env.DB.prepare(
+            "SELECT entrenador, estadio, fundacion, ciudad FROM club_info WHERE club = ?"
+          ).bind(club).first();
+          if (!fichaActual && huellaNueva === "|||") {
+            return json({ error: "Rellena al menos un dato de la ficha antes de enviarla." }, 400);
+          }
+          if (fichaActual && huellaClub(fichaActual.entrenador, fichaActual.estadio, fichaActual.fundacion, fichaActual.ciudad) === huellaNueva) {
+            return json({ error: `Estos datos ya son los de la ficha actual del ${club}: no hay nada que proponer.`, duplicada: true }, 409);
+          }
+          const { results: pendientesClub } = await env.DB.prepare(
+            "SELECT entrenador, estadio, fundacion, ciudad FROM club_info_solicitudes WHERE club = ? AND estado = 'pendiente'"
+          ).bind(club).all();
+          if ((pendientesClub || []).some((p) => huellaClub(p.entrenador, p.estadio, p.fundacion, p.ciudad) === huellaNueva)) {
+            return json({ error: `Ya hay una propuesta pendiente del ${club} con exactamente estos datos. Cambia algún dato o espera a que se revise.`, duplicada: true }, 409);
+          }
           await env.DB.prepare(
             `INSERT INTO club_info_solicitudes (club, entrenador, estadio, fundacion, ciudad, solicitante_id, solicitante_nombre)
              VALUES (?, ?, ?, ?, ?, ?, ?)`
@@ -23241,8 +27068,49 @@ async function handlePrimary(request, env, ctx) {
             const existentes = Number(filaConteo?.total || 0);
             if (existentes >= limiteJornada) {
               const donde = conGrupos && grupoJornada ? ` del ${grupoJornada}` : "";
+              // Antes de decir "jornada llena": si el partido que se intenta crear YA existe
+              // en esa jornada (p. ej. lo rellenó el calendario automático, a veces con otro
+              // nombre de equipo), lo normal es que haya que usar ese, no crear otro. Se
+              // devuelve para que el panel pueda vincularlo en vez de dar un callejón sin salida.
+              let coincidencias = [];
+              try {
+                const { results: filasJornada } = conGrupos
+                  ? await env.DB.prepare(
+                      `SELECT id, competicion, grupo, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido, estado
+                       FROM results WHERE competicion = ? AND jornada = ? AND (grupo IS ? OR grupo = ?)`
+                    ).bind(body.competicion, jornadaNum, grupoJornada, grupoJornada).all()
+                  : await env.DB.prepare(
+                      `SELECT id, competicion, grupo, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido, estado
+                       FROM results WHERE competicion = ? AND jornada = ?`
+                    ).bind(body.competicion, jornadaNum).all();
+                const ln = normalizarEquipoDuplicado(body.equipo_local);
+                const vn = normalizarEquipoDuplicado(body.equipo_visitante);
+                coincidencias = (filasJornada || []).filter((c) => {
+                  const cl = normalizarEquipoDuplicado(c.equipo_local);
+                  const cv = normalizarEquipoDuplicado(c.equipo_visitante);
+                  return cl === ln || cl === vn || cv === ln || cv === vn;
+                });
+              } catch (e) { /* si falla la búsqueda, se da el aviso normal de jornada llena */ }
+              const mismoPartido = coincidencias.find((c) => {
+                const cl = normalizarEquipoDuplicado(c.equipo_local);
+                const cv = normalizarEquipoDuplicado(c.equipo_visitante);
+                const ln = normalizarEquipoDuplicado(body.equipo_local);
+                const vn = normalizarEquipoDuplicado(body.equipo_visitante);
+                return (cl === ln && cv === vn) || (cl === vn && cv === ln);
+              });
+              const descCoinc = (c) => `${c.equipo_local} vs ${c.equipo_visitante} (#${c.id})`;
+              if (mismoPartido) {
+                const msg = `Este partido ya existe en la jornada ${jornadaNum}${donde}: ${descCoinc(mismoPartido)}. No hace falta crearlo: usa el existente.`;
+                return json({
+                  error: msg, mensaje: msg, posible_duplicado: false, duplicado_bloqueante: true,
+                  motivo: "duplicado_jornada", partido_existente: mismoPartido, limite_jornada: true,
+                  jornada: jornadaNum, grupo: grupoJornada, maximo: limiteJornada, existentes,
+                }, 409);
+              }
               return json({
-                error: `La jornada ${jornadaNum}${donde} ya tiene el máximo de ${limiteJornada} partidos. Para crear otro hay que borrar antes uno de los existentes.`,
+                error: `La jornada ${jornadaNum}${donde} ya tiene el máximo de ${limiteJornada} partidos. Para crear otro hay que borrar antes uno de los existentes.`
+                  + (coincidencias.length ? ` Si el partido que buscas ya está entre estos (quizá con otro nombre de equipo), vincula ese en vez de crear uno nuevo: ${coincidencias.map(descCoinc).join("; ")}.` : ""),
+                coincidencias,
                 limite_jornada: true,
                 jornada: jornadaNum,
                 grupo: grupoJornada,
@@ -23295,6 +27163,13 @@ async function handlePrimary(request, env, ctx) {
           payload.uid, payload.nombre, origenWriteId
         ).run();
         const nuevoId = insertResult.meta.last_row_id;
+        if (body.estado === "retrasado") {
+          try {
+            await env.DB.prepare("UPDATE results SET horario_manual = 1 WHERE id = ?").bind(nuevoId).run();
+          } catch (err) {
+            if (!esErrorColumnaFaltante(err, "horario_manual")) console.error("[horario_manual] no se pudo marcar el partido", nuevoId, err.message);
+          }
+        }
         // Si se crea directamente en estado "en_juego" a mano, se arranca
         // el cronómetro igual que si lo hubiera arrancado el cron a su
         // hora (mismo camino único, ver iniciarCronometroPartido): se
@@ -23433,6 +27308,15 @@ async function handlePrimary(request, env, ctx) {
           body.ubicacion || null, flashscoreUrl,
           body.escudo_local_url || null, body.escudo_visitante_url || null, fechaRetrasado, id
         ).run();
+        // Aplazado/retrasado (o que lo estaba y se acaba de reprogramar a mano): se marca para que
+        // el relleno automático (TheSportsDB) no vuelva a tocar su horario ni nada más.
+        if (body.estado === "retrasado" || ["retrasado", "cancelado", "anulado"].includes(estadoAnterior?.estado)) {
+          try {
+            await env.DB.prepare("UPDATE results SET horario_manual = 1 WHERE id = ?").bind(id).run();
+          } catch (err) {
+            if (!esErrorColumnaFaltante(err, "horario_manual")) console.error("[horario_manual] no se pudo marcar el partido", id, err.message);
+          }
+        }
         // Mismo camino único que la creación y que el cron: si el estado
         // pasa A "en_juego" (viniendo de cualquier otro estado) y el
         // cronómetro no estaba ya corriendo, se arranca ahora mismo,
@@ -23455,13 +27339,13 @@ async function handlePrimary(request, env, ctx) {
           // ANTES aquí NO se tocaba el cronómetro en sí, solo se limpiaba
           // aviso_desatendido_mitad -- pero inicio_cronometro_at se
           // quedaba con el valor VIEJO de esa vida anterior. Si ese
-          // partido llevaba ya más de MINUTO_FIN_PARTIDO_AUTOMATICO (150)
+          // partido llevaba ya más de MINUTO_FIN_PARTIDO_AUTOMATICO (105)
           // minutos corriendo desde entonces (típicamente porque fue el
           // propio cron quien lo cerró automáticamente, ver
           // crearFinPartidoAutomaticoAlMinuto90, que NUNCA toca
           // inicio_cronometro_at/cronometro_pausado_en al cerrar), el
           // resultado quedaba "en_juego" con un cronómetro que YA marcaba
-          // más de 150' desde el primer segundo: en la siguiente pasada
+          // más de 105' desde el primer segundo: en la siguiente pasada
           // del cron (como mucho 1 minuto después) crearFinPartido-
           // AutomaticoAlMinuto90 lo volvía a cerrar solo, marcando de
           // nuevo finalizado_no_cubierto = 1 -- deshaciendo justo lo que
@@ -23477,7 +27361,7 @@ async function handlePrimary(request, env, ctx) {
           // programada -- ese cálculo es para partidos que arrancan por
           // primera vez, no para reaperturas), para que el partido quede
           // con un cronómetro fresco y no vuelva a activar el cierre
-          // automático hasta pasados otros 150 minutos de verdad.
+          // automático hasta pasados otros 105 minutos de verdad.
           await iniciarCronometroPartido(env, id, 0);
         }
         ctx.waitUntil(registrarActividad(env, request, payload, {
@@ -23497,7 +27381,7 @@ async function handlePrimary(request, env, ctx) {
         const id = parseInt(resultMatch[1]);
         const resultadoBorrado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(id).first();
         if (!resultadoBorrado) return json({ error: "Resultado no encontrado" }, 404);
-        if (!(await puedeEditar(env, payload, "resultado", id, resultadoBorrado.autor_id))) {
+        if (!(await puedeBorrarResultado(env, payload, id, resultadoBorrado.autor_id))) {
           return json({ error: "No puedes eliminar este resultado porque no es tuyo. Solicita permiso al autor o a un administrador." }, 403);
         }
         try {
@@ -23703,6 +27587,31 @@ async function handlePrimary(request, env, ctx) {
         return ahora >= desde && ahora <= hasta;
       }
 
+      // Interruptor de notificaciones push de un partido (panel de Minuto a Minuto).
+      // Mismos permisos que el cronómetro. activos=false silencia los avisos del partido.
+      const avisosPushMatch = path.match(/^\/api\/results\/(\d+)\/avisos-push$/);
+      if (avisosPushMatch && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede cambiar las notificaciones del minuto a minuto" }, 403);
+        }
+        const resultadoId = parseInt(avisosPushMatch[1]);
+        const resultado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(resultadoId).first();
+        if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
+        if (!(await puedeEditar(env, payload, "resultado", resultadoId, resultado.autor_id))) {
+          return json({ error: "No puedes gestionar el minuto a minuto de este partido porque no es tuyo. Solicita permiso al autor o a un administrador." }, 403);
+        }
+        const cuerpoAvisos = await request.json().catch(() => ({}));
+        const activos = cuerpoAvisos && cuerpoAvisos.activos === false ? 0 : 1;
+        try {
+          await env.DB.prepare("UPDATE results SET avisos_push = ? WHERE id = ?").bind(activos, resultadoId).run();
+        } catch (err) {
+          return json({ error: "No se pudo guardar (¿falta aplicar migracion_avisos_push.sql?): " + err.message }, 500);
+        }
+        return json({ ok: true, avisos_push: activos });
+      }
+
       const cronometroMatch = path.match(/^\/api\/results\/(\d+)\/cronometro$/);
       if (cronometroMatch && method === "POST") {
         const payload = await requireAuth(request, env);
@@ -23857,6 +27766,8 @@ async function handlePrimary(request, env, ctx) {
           }
           await env.DB.prepare("UPDATE results SET anadido_minutos = ?, anadido_parte = ? WHERE id = ?")
             .bind(minutosAnadido > 0 ? minutosAnadido : null, minutosAnadido > 0 ? parteAnadido : null, resultadoId).run();
+          // Un anuncio nuevo (o quitarlo) anula el "Seguir jugando" anterior.
+          await limpiarAnadidoSeguir(env, resultadoId);
           ctx.waitUntil(invalidarCacheArticuloPartido(env, resultadoId));
           // Push a quien sigue el partido, solo cuando el anuncio cambia
           // (reenviar el mismo +3 al guardar otra vez no vuelve a avisar).
@@ -23879,11 +27790,45 @@ async function handlePrimary(request, env, ctx) {
             "SELECT id, estado, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos, anadido_minutos, anadido_parte FROM results WHERE id = ?"
           ).bind(resultadoId).first();
           if (filaCierre && filaCierre.estado === "en_juego" && (filaCierre.cronometro_pausado_en === null || filaCierre.cronometro_pausado_en === undefined)) {
-            if (anadidoAnunciado(filaCierre, 1) > 0) await crearDescansoAutomaticoAlMinuto45(env, [filaCierre]);
-            if (anadidoAnunciado(filaCierre, 2) > 0) await cerrarPartidoAlTerminarAnadido(env, ctx, [filaCierre]);
+            // forzar: el redactor ha pulsado "Pitar ya" en el aviso de fin de
+            // añadido, sin esperar el margen. Sigue exigiendo que el reloj REAL
+            // haya llegado al final del añadido.
+            const opcionesCierre = { sinGracia: body.forzar === true };
+            if (anadidoAnunciado(filaCierre, 1) > 0) await crearDescansoAutomaticoAlMinuto45(env, [filaCierre], opcionesCierre);
+            if (anadidoAnunciado(filaCierre, 2) > 0) await cerrarPartidoAlTerminarAnadido(env, ctx, [filaCierre], opcionesCierre);
           }
+        } else if (body.accion === "prolongar_anadido") {
+          // "Seguir jugando" en el aviso de fin de añadido: el árbitro ha dado
+          // algo más y el redactor no quiere que se pare el reloj. NO se toca el
+          // añadido anunciado (sigue en +N): solo se marca anadido_seguir = 1 para
+          // que el reloj siga corriendo (45+N+1, 45+N+2...) sin tope ni cierre
+          // automático; el descanso / el final los pita el redactor a mano. Solo
+          // vale dentro del margen: pasado ese minuto el cron ya lo habrá cerrado
+          // (o lo cerrará en breve) y no se reabre desde aquí.
+          const filaPro = await env.DB.prepare(
+            "SELECT id, estado, inicio_cronometro_at, cronometro_pausado_en, ajuste_cronometro_minutos, anadido_minutos, anadido_parte FROM results WHERE id = ?"
+          ).bind(resultadoId).first();
+          if (!filaPro || filaPro.estado !== "en_juego" || !filaPro.inicio_cronometro_at
+              || (filaPro.cronometro_pausado_en !== null && filaPro.cronometro_pausado_en !== undefined)) {
+            return json({ error: "El reloj ya no corre: el añadido ya se ha cerrado." }, 409);
+          }
+          const partePro = Number(filaPro.anadido_parte);
+          const actualPro = anadidoAnunciado(filaPro, partePro);
+          if (!actualPro) {
+            return json({ error: "No hay un añadido anunciado que prolongar." }, 400);
+          }
+          const basePro = partePro === 1 ? 45 : 90;
+          if (minutoEnVivoServidor(filaPro) >= basePro + actualPro + MINUTOS_GRACIA_FIN_ANADIDO) {
+            return json({ error: "Ha pasado el margen de 1 minuto: el añadido se cierra solo." }, 409);
+          }
+          try {
+            await env.DB.prepare("UPDATE results SET anadido_seguir = 1 WHERE id = ?").bind(resultadoId).run();
+          } catch (err) {
+            return json({ error: "Falta aplicar la migración migracion_anadido_seguir.sql (columna anadido_seguir)." }, 500);
+          }
+          ctx.waitUntil(invalidarCacheArticuloPartido(env, resultadoId));
         } else {
-          return json({ error: "Acción no válida (usa 'iniciar', 'pausar', 'ajustar_minuto', 'anadido' o 'cerrar_anadido')" }, 400);
+          return json({ error: "Acción no válida (usa 'iniciar', 'pausar', 'ajustar_minuto', 'anadido', 'cerrar_anadido' o 'prolongar_anadido')" }, 400);
         }
         // Nota: antes aquí se limpiaba un flag "aviso_desatendido_enviado"
         // con cada acción del cronómetro para permitir un nuevo aviso más
@@ -23926,6 +27871,10 @@ async function handlePrimary(request, env, ctx) {
       async function resolverPorrasPendientes(env, porrasConPartido) {
         const pendientesDeResolver = porrasConPartido.filter(
           (p) => p.resultado_acierto === "pendiente" && p.estado === "finalizado" &&
+                 // Un partido cerrado por el cron sin que nadie lo cubriera tiene un
+                 // marcador no fiable: la porra se queda pendiente (y se resuelve sola
+                 // cuando alguien lo cubre y finalizado_no_cubierto vuelve a 0).
+                 Number(p.finalizado_no_cubierto) !== 1 &&
                  p.goles_local !== null && p.goles_local !== undefined &&
                  p.goles_visitante !== null && p.goles_visitante !== undefined
         );
@@ -23968,6 +27917,7 @@ async function handlePrimary(request, env, ctx) {
           FROM porras po
           JOIN results r ON r.id = po.resultado_id
           WHERE po.resultado_acierto = 'pendiente' AND r.estado = 'finalizado'
+            AND r.finalizado_no_cubierto = 0
             AND r.jornada = ?`;
         const binds = [jornada];
         if (competicion) { query += " AND r.competicion = ?"; binds.push(competicion); }
@@ -23993,7 +27943,7 @@ async function handlePrimary(request, env, ctx) {
         let query = `
           SELECT po.id, po.resultado_id, po.goles_local_predicho, po.goles_visitante_predicho,
                  po.puntos_obtenidos, po.resultado_acierto, po.updated_at,
-                 r.estado, r.goles_local, r.goles_visitante
+                 r.estado, r.goles_local, r.goles_visitante, r.finalizado_no_cubierto
           FROM porras po
           JOIN results r ON r.id = po.resultado_id
           WHERE po.reader_id = ? AND r.competicion = ? AND r.jornada = ?`;
@@ -24149,16 +28099,19 @@ async function handlePrimary(request, env, ctx) {
         // provisional. Nunca se exponen los marcadores predichos de
         // nadie, solo nombres y contadores, así que ver quién ha jugado
         // antes de tiempo no da ninguna ventaja.
-        let queryPartidosJornada = "SELECT estado FROM results WHERE jornada = ?";
+        let queryPartidosJornada = "SELECT estado, finalizado_no_cubierto FROM results WHERE jornada = ?";
         const bindsPartidosJornada = [jornadaParam];
         if (competicion) { queryPartidosJornada += " AND competicion = ?"; bindsPartidosJornada.push(competicion); }
         if (grupo) { queryPartidosJornada += " AND grupo = ?"; bindsPartidosJornada.push(grupo); }
         const { results: partidosDeJornada } = await env.DB.prepare(queryPartidosJornada).bind(...bindsPartidosJornada).all();
+        // Un "finalizado" cerrado por el cron sin cubrir (finalizado_no_cubierto = 1)
+        // no puntúa todavía: sus porras siguen pendientes hasta que se cubra.
+        const partidoYaPuntua = (p) => (p.estado === "finalizado" && Number(p.finalizado_no_cubierto) !== 1) || p.estado === "anulado";
         const jornadaTerminada = partidosDeJornada.length > 0
-          && partidosDeJornada.every((p) => p.estado === "finalizado" || p.estado === "anulado");
+          && partidosDeJornada.every(partidoYaPuntua);
         // Partidos de la jornada que ya cuentan puntos, para que el
         // frontend pueda decir "van 3 de 10 partidos resueltos".
-        const partidosResueltos = partidosDeJornada.filter((p) => p.estado === "finalizado" || p.estado === "anulado").length;
+        const partidosResueltos = partidosDeJornada.filter(partidoYaPuntua).length;
 
         // Antes de agregar: resolver las porras de esa jornada que
         // siguiesen "pendiente" por no haberlas abierto su autor. Sin
@@ -24276,6 +28229,10 @@ async function handlePrimary(request, env, ctx) {
       // y con las etiquetas públicas de config.js.
       const VAR_MOTIVOS_VALIDOS = ["gol", "penalti", "roja", "amarilla", "falta", "fuera_juego", "mano", "otra"];
       const VAR_DECISIONES_VALIDAS = ["revisando", "mantiene", "cambia"];
+      // Motivo de una tarjeta (texto libre corto: "Falta", "Protestas"...). Solo
+      // se guarda en tarjetas; en cualquier otro tipo de evento queda a NULL.
+      const normalizarMotivoTarjeta = (body) => ["amarilla", "doble_amarilla", "roja"].includes(body.tipo)
+        ? (String(body.motivo_tarjeta || "").trim().slice(0, 80) || null) : null;
       const normalizarDatosVar = (body) => {
         if (body.tipo !== "var") return { motivo: null, decision: null };
         const motivo = body.var_motivo || null;
@@ -24356,7 +28313,7 @@ async function handlePrimary(request, env, ctx) {
       if (eventosMatch && method === "GET") {
         const resultadoId = parseInt(eventosMatch[1]);
         const { results: eventos } = await env.DB.prepare(
-          `SELECT id, tipo, equipo, jugador, jugador_sale, jugador_asistencia, minuto, minuto_extra, orden, bajar_gol, var_motivo, var_decision
+          `SELECT id, tipo, equipo, jugador, jugador_sale, jugador_asistencia, minuto, minuto_extra, orden, bajar_gol, var_motivo, var_decision, es_penalti, motivo_tarjeta
            FROM match_events WHERE resultado_id = ?
            ORDER BY minuto ASC, CASE WHEN tipo = 'fin_descanso' THEN 1 ELSE 0 END ASC, COALESCE(minuto_extra, 0) ASC, orden ASC, id ASC`
         ).bind(resultadoId).all();
@@ -24407,16 +28364,21 @@ async function handlePrimary(request, env, ctx) {
           if (existente) return json({ ok: true, id: existente.id, ya_existia: true });
         }
         const { meta } = await env.DB.prepare(
-          `INSERT INTO match_events (resultado_id, tipo, equipo, jugador, jugador_sale, jugador_asistencia, minuto, minuto_extra, orden, bajar_gol, var_motivo, var_decision)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO match_events (resultado_id, tipo, equipo, jugador, jugador_sale, jugador_asistencia, minuto, minuto_extra, orden, bajar_gol, var_motivo, var_decision, es_penalti, motivo_tarjeta)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           resultadoId, body.tipo, equipoRequerido ? body.equipo : "ninguno",
           body.jugador || null, body.jugador_sale || null,
-          body.tipo === "gol" ? (body.jugador_asistencia || null) : null,
+          // Un gol de penalti no lleva asistencia.
+          body.tipo === "gol" && !body.es_penalti ? (body.jugador_asistencia || null) : null,
           parseInt(body.minuto, 10), body.minuto_extra ? parseInt(body.minuto_extra, 10) : null,
           body.orden ? parseInt(body.orden, 10) : 0,
           body.tipo === "gol_var" && body.bajar_gol ? 1 : 0,
-          datosVar.motivo, datosVar.decision
+          datosVar.motivo, datosVar.decision,
+          // Solo tiene sentido en "gol": 1 = el gol fue de penalti (no es la
+          // tanda: esa va con "penalti_marcado").
+          body.tipo === "gol" && body.es_penalti ? 1 : 0,
+          normalizarMotivoTarjeta(body)
         ).run();
         // Nota: antes aquí se limpiaba un flag "aviso_desatendido_enviado"
         // con cada evento nuevo para permitir otro aviso más adelante.
@@ -24435,6 +28397,8 @@ async function handlePrimary(request, env, ctx) {
         let recalcPost = null;
         if (body.tipo === "gol" || body.tipo === "gol_var" || body.tipo === "gol_pp") recalcPost = await recalcularMarcadorDesdeEventos(env, resultadoId);
         if (body.tipo === "gol" || body.tipo === "gol_pp") ctx.waitUntil(notificarPushPartido(env, resultadoId, body.tipo, body));
+        // Descanso pitado a mano por el redactor: partido cubierto, se avisa.
+        if (body.tipo === "descanso") ctx.waitUntil(notificarPushPartido(env, resultadoId, "descanso", { ...body, automatico: false }));
         // Gol anulado por VAR que resta del marcador: aviso dentro del grupo de goles.
         if (body.tipo === "gol_var" && body.bajar_gol && recalcPost && recalcPost.cambio) {
           ctx.waitUntil(notificarPushPartido(env, resultadoId, "gol_var", { ...body, antes: recalcPost.antes }));
@@ -24502,16 +28466,24 @@ async function handlePrimary(request, env, ctx) {
         }
         const datosVar = normalizarDatosVar(body);
         if (datosVar.error) return json({ error: datosVar.error }, 400);
+        // es_penalti: si el cliente no lo manda (editores antiguos), se
+        // conserva el valor que ya tenía el evento en vez de ponerlo a 0.
+        let esPenalti = body.es_penalti ? 1 : 0;
+        if (body.es_penalti === undefined) {
+          const previo = await env.DB.prepare("SELECT es_penalti FROM match_events WHERE id=? AND resultado_id=?").bind(eventoId, resultadoId).first();
+          esPenalti = previo && previo.es_penalti ? 1 : 0;
+        }
+        if (body.tipo !== "gol") esPenalti = 0;
         await env.DB.prepare(
-          `UPDATE match_events SET tipo=?, equipo=?, jugador=?, jugador_sale=?, jugador_asistencia=?, minuto=?, minuto_extra=?, orden=?, bajar_gol=?, var_motivo=?, var_decision=?
+          `UPDATE match_events SET tipo=?, equipo=?, jugador=?, jugador_sale=?, jugador_asistencia=?, minuto=?, minuto_extra=?, orden=?, bajar_gol=?, var_motivo=?, var_decision=?, es_penalti=?, motivo_tarjeta=?
            WHERE id=? AND resultado_id=?`
         ).bind(
           body.tipo, equipoRequerido ? body.equipo : "ninguno", body.jugador || null, body.jugador_sale || null,
-          body.tipo === "gol" ? (body.jugador_asistencia || null) : null,
+          body.tipo === "gol" && !esPenalti ? (body.jugador_asistencia || null) : null,
           parseInt(body.minuto, 10), body.minuto_extra ? parseInt(body.minuto_extra, 10) : null,
           body.orden ? parseInt(body.orden, 10) : 0,
           body.tipo === "gol_var" && body.bajar_gol ? 1 : 0,
-          datosVar.motivo, datosVar.decision,
+          datosVar.motivo, datosVar.decision, esPenalti, normalizarMotivoTarjeta(body),
           eventoId, resultadoId
         ).run();
         const recalcCorr = await recalcularMarcadorDesdeEventos(env, resultadoId);
@@ -24544,6 +28516,7 @@ async function handlePrimary(request, env, ctx) {
           // Quitar el evento "Tiempo añadido" quita también el añadido del reloj.
           await env.DB.prepare("UPDATE results SET anadido_minutos = NULL, anadido_parte = NULL WHERE id = ? AND anadido_parte = ?")
             .bind(resultadoId, eventoABorrar.minuto === 45 ? 1 : 2).run();
+          await limpiarAnadidoSeguir(env, resultadoId);
         }
         const recalcCorr = await recalcularMarcadorDesdeEventos(env, resultadoId);
         await recalcularPenaltisDesdeEventos(env, resultadoId);

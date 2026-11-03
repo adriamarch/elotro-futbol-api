@@ -38,13 +38,20 @@ const mkDB = () => ({
 const ctx = vm.createContext({
   console, Intl, Date: class extends Date { constructor(...x) { super(...(x.length ? x : [ahoraFalso])); } static now() { return ahoraFalso; } },
   AbortSignal, URL, Request, Response, encodeURIComponent, Math, JSON, Promise, Number, String, Set, Map, Object, Array, parseInt, RegExp, Error,
-  json: () => null, requireAuth: async () => null,
+  json: () => null, requireAuth: async () => null, registrarActividad: async () => {},
   fetch: async (url) => {
     fetchLog.push(url);
     const r = /[?&]r=(\d+)/.exec(url)?.[1];
     return { ok: true, status: 200, json: async () => ({ events: r ? [{ idEvent: "e" + r + "_" + fetchLog.length, strHomeTeam: "A" + r, strAwayTeam: "B" + r, dateEvent: "2030-01-01", strTime: "20:00:00", intRound: r }] : [] }) };
   },
 });
+// consultaConAlternativas / esErrorColumnaFaltante viven fuera del tramo SYNC_* del
+// Worker; sin ellas la pasada fallaba en silencio ("consultaConAlternativas is not defined")
+// y el test solo lo registraba en ultima_pasada.errores.
+const iniAlt = src.indexOf("function esErrorColumnaFaltante");
+const finAlt = src.indexOf("// ---------- Notificaciones por correo");
+if (iniAlt < 0 || finAlt < iniAlt) throw new Error("No se encontró consultaConAlternativas en " + file);
+vm.runInContext(src.slice(iniAlt, finAlt), ctx);
 vm.runInContext(code + "\nthis.syncEjecutarPasada = syncEjecutarPasada; this.syncCalcularOmitidas = syncCalcularOmitidas; this.syncPartesMadrid = syncPartesMadrid;", ctx);
 
 let ok = 0, fail = 0;
@@ -83,6 +90,7 @@ est = JSON.parse(store.estado);
 t("2.o ciclo es incremental", est.ciclo_completo === false);
 t("2.o ciclo pide 8..11", JSON.stringify(fetchLog.map((u) => +/r=(\d+)/.exec(u)[1])) === "[8,9,10,11]", fetchLog.length + " peticiones");
 t("ultima_pasada registra peticiones_api y rondas_omitidas", est.ultima_pasada.peticiones_api === 4 && est.ultima_pasada.rondas_omitidas > 0, JSON.stringify(est.ultima_pasada));
+t("la pasada termina sin errores internos (funciones no definidas, etc.)", !(est.ultima_pasada.errores || []).length, JSON.stringify(est.ultima_pasada.errores));
 
 // manual = completo
 est.ciclo_en_curso = false; store.estado = JSON.stringify(est); fetchLog.length = 0;

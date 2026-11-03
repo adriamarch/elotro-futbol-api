@@ -5,7 +5,7 @@ const mam = fs.readFileSync(root + "public/admin/js/minuto-a-minuto.js", "utf8")
 const fn = mam.slice(mam.indexOf("function mamEnSegundaParte"), mam.indexOf("// Minuto del reloj en texto"));
 const adm = fs.readFileSync(root + "public/admin/js/admin.js", "utf8");
 const div = adm.slice(adm.indexOf("function dividirMinutoConAñadido"), adm.indexOf("// Calcula el minuto en vivo de un resultado cualquiera"));
-const c = vm.createContext({ MAM_EVENTOS: [], MAM_RESULTADO: null, parseInt, Number });
+const c = vm.createContext({ MAM_EVENTOS: [], MAM_RESULTADO: null, mamAnadidoAnunciado: () => 0, parseInt, Number });
 vm.runInContext(fn + div + "\nthis.seg=mamEnSegundaParte; this.div=dividirMinutoConAñadido;", c);
 let ok = 0, fail = 0; const t = (n, x) => { x ? ok++ : fail++; console.log(x ? "OK   " : "FALLO", n); };
 const texto = (m) => { const d = c.div(m, null, c.seg()); return d.minutoExtra ? `${d.minuto}+${d.minutoExtra}` : `${d.minuto}`; };

@@ -22,7 +22,9 @@ CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, 
   activo INTEGER NOT NULL DEFAULT 1, nivel INTEGER NOT NULL DEFAULT 1, email TEXT, puede_gestionar_tienda INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE activity_log (id INTEGER PRIMARY KEY AUTOINCREMENT, usuario_id INTEGER, usuario_nombre TEXT, usuario_rol TEXT, accion TEXT, entidad TEXT, entidad_id TEXT, descripcion TEXT, detalle TEXT, ip TEXT, created_at TEXT DEFAULT (datetime('now')));
 CREATE TABLE articles (id INTEGER PRIMARY KEY AUTOINCREMENT, publicado INTEGER DEFAULT 1);
-CREATE TABLE comments (id INTEGER PRIMARY KEY AUTOINCREMENT, article_id INTEGER, nombre TEXT, email TEXT, texto TEXT, ip TEXT, reader_id INTEGER, parent_id INTEGER, responde_a_id INTEGER);
+CREATE TABLE comments (id INTEGER PRIMARY KEY AUTOINCREMENT, article_id INTEGER, nombre TEXT, email TEXT, texto TEXT, ip TEXT, reader_id INTEGER, parent_id INTEGER, responde_a_id INTEGER,
+  estado TEXT NOT NULL DEFAULT 'pendiente', oculto_por_denuncia INTEGER NOT NULL DEFAULT 0,
+  aviso_aprobado INTEGER NOT NULL DEFAULT 0, respuesta_avisada INTEGER NOT NULL DEFAULT 0);
 `);
 // La migración real, tal cual: así se prueba también el SQL que se despliega.
 sqlite.exec(fs.readFileSync(new URL("../migracion_staff_push.sql", import.meta.url), "utf8"));
@@ -106,7 +108,7 @@ test("solo admin y Nivel 4 pueden usar la campanita; el resto recibe 403 y sin s
   const b = await api("/api/staff-push/estado", { token: U.tN4 });
   assert.equal(b.status, 200);
   assert.deepEqual(b.data.categorias.map((c) => c.id), [
-    "contenido", "acreditaciones", "incorporaciones", "noticias", "fichas", "tienda", "ediciones", "comentarios", "anuncios",
+    "contenido", "acreditaciones", "incorporaciones", "noticias", "fichas", "tienda", "ediciones", "comentarios", "anuncios", "reuniones",
   ]);
   assert.deepEqual(b.data.activas, []);
   assert.equal(b.data.dispositivo_suscrito, false);

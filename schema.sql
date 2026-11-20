@@ -77,6 +77,15 @@ CREATE TABLE articles (
   -- texto (p. ej. '["amistoso","general"]'), máximo 4 valores, sin
   -- repetir la principal. NULL o '[]' si no tiene ninguna adicional.
   categorias_adicionales TEXT,
+  -- Etiquetas (tags) reales de la noticia, aparte de las categorías: temas
+  -- libres como "Ascenso 2026" o "Fichajes" que dan páginas propias en
+  -- /etiqueta/{slug}. "etiquetas" es un array JSON de nombres tal como los
+  -- escribió el redactor ('["Ascenso 2026","Fichajes"]', máx. 8) y
+  -- "etiquetas_slugs" los mismos normalizados y entre comas
+  -- (',ascenso-2026,fichajes,'), que es lo que filtra GET /api/articles?etiqueta=.
+  -- NULL si no tiene ninguna. Ver src/etiquetas.js.
+  etiquetas TEXT,
+  etiquetas_slugs TEXT,
   club TEXT,
   imagen_url TEXT,
   -- Fotos adicionales de la noticia/crónica, guardadas como un array JSON
@@ -184,6 +193,9 @@ CREATE TABLE results (
   -- fecha/hora en los partidos que todavía no se han disputado ("Por
   -- jugar"), tanto en la portada como en Resultados.
   ubicacion TEXT,
+  -- Datos del encuentro (árbitro, asistencia, TV, clima) y estadísticas (posesión, tiros...)
+  -- como JSON editado a mano desde el panel. Ver migracion_datos_partido.sql.
+  datos_partido TEXT,
   -- Enlace a la ficha del partido en Flashscore. Solo tiene sentido (y
   -- solo se muestra en el frontend) para partidos ya finalizados de
   -- Primera Federación, Segunda Federación y LaLiga Hypermotion/LaLiga2.
@@ -1276,3 +1288,69 @@ CREATE TABLE IF NOT EXISTS article_feedback (
 );
 CREATE INDEX IF NOT EXISTS idx_article_feedback_dest ON article_feedback(destinatario_id, leido, created_at);
 CREATE INDEX IF NOT EXISTS idx_article_feedback_updated ON article_feedback(updated_at);
+
+
+-- Papelera: borrado recuperable de noticias y archivos (ver migracion_papelera.sql).
+CREATE TABLE IF NOT EXISTS papelera (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tipo TEXT NOT NULL,
+  subtipo TEXT,
+  entidad_id INTEGER NOT NULL,
+  titulo TEXT NOT NULL DEFAULT '',
+  miniatura TEXT,
+  datos TEXT NOT NULL,
+  relacionados TEXT,
+  cloudinary_public_id TEXT,
+  cloudinary_resource_type TEXT,
+  cloud_name TEXT,
+  eliminado_por_id INTEGER,
+  eliminado_por_nombre TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  purgar_despues TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_papelera_creada ON papelera(created_at);
+CREATE INDEX IF NOT EXISTS idx_papelera_purga ON papelera(purgar_despues);
+CREATE INDEX IF NOT EXISTS idx_papelera_usuario ON papelera(eliminado_por_id);
+
+-- Reacciones de los lectores a una noticia ("Útil" y "Me gusta").
+--
+-- Misma idea que comment_votes: cualquier visitante puede reaccionar a una
+-- noticia publicada; se guarda un registro por "votante" (id anónimo generado
+-- en el navegador, el mismo de los votos de comentarios) y por tipo, para que
+-- no se pueda reaccionar dos veces desde el mismo navegador y para poder quitar
+-- la reacción. Una persona puede marcar a la vez "Útil" y "Me gusta".
+-- Solo-inserción/borrado (nunca se actualiza una fila): el sincronizador D1 -> PG
+-- la trata como "immutable" por created_at.
+CREATE TABLE IF NOT EXISTS article_reactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+  votante_id TEXT NOT NULL,
+  tipo TEXT NOT NULL CHECK (tipo IN ('util', 'me_gusta')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (article_id, votante_id, tipo)
+);
+CREATE INDEX IF NOT EXISTS idx_article_reactions_article ON article_reactions(article_id, tipo);
+
+-- Historial de versiones de noticias (ver migracion_versiones_noticia.sql).
+-- Una copia por guardado (titular, subtítulo, texto y datos básicos), con quién y cuándo.
+CREATE TABLE IF NOT EXISTS article_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  article_id INTEGER NOT NULL,
+  numero INTEGER NOT NULL,
+  titulo TEXT NOT NULL DEFAULT '',
+  subtitulo TEXT,
+  contenido TEXT NOT NULL DEFAULT '',
+  datos TEXT,
+  hash TEXT,
+  editor_id INTEGER,
+  editor_nombre TEXT NOT NULL DEFAULT '',
+  motivo TEXT NOT NULL DEFAULT 'edicion',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_article_versions_art ON article_versions(article_id, id);
+CREATE INDEX IF NOT EXISTS idx_article_versions_creada ON article_versions(created_at);
+
+-- migracion_perfil_autores_v2.sql
+ALTER TABLE users ADD COLUMN cargo TEXT;
+ALTER TABLE users ADD COLUMN ciudad TEXT;
+ALTER TABLE users ADD COLUMN articulo_destacado_id INTEGER;

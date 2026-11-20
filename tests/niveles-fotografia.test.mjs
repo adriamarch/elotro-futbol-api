@@ -5,7 +5,7 @@
 //
 // Qué protege:
 //   1. Un admin puede poner a un fotógrafo en F1 o F2 (nunca 3 ni 4); un redactor sigue en N1–N4.
-//   2. "Mi progreso" de un fotógrafo devuelve su escala (2 niveles, 7 criterios, sin cifras mínimas).
+//   2. "Mi progreso" de un fotógrafo devuelve su escala (2 niveles, 7 criterios, cifras bajas solo para F2).
 //   3. Un fotógrafo arrastrando un nivel de redacción alto se muestra recortado a F2.
 //   4. Pasar de redactor a fotógrafo (o al revés) reinicia el nivel: un N2 no se convierte en F2 ni
 //      un F2 en N2 (que daría publicación directa sin revisión).
@@ -131,7 +131,7 @@ test("1. un redactor sigue pudiendo llegar a N4 y no pasa de ahí", async () => 
   await api(`/api/users/${U.red}/nivel`, { method: "PUT", token: U.sAdmin.token, body: { nivel: 1 } });
 });
 
-test("2. /api/me/nivel de un fotógrafo: 2 niveles, 7 criterios, sin cifras mínimas", async () => {
+test("2. /api/me/nivel de un fotógrafo: 2 niveles, 7 criterios, F1 sin requisitos y F2 con partidos y fotos", async () => {
   const gal = sqlite.prepare("INSERT INTO match_gallery (result_id, media_id, vinculado_por_id) VALUES (?,?,?)");
   gal.run(10, 1, U.foto); gal.run(10, 2, U.foto); gal.run(11, 3, U.foto); gal.run(12, 4, U.red);
   const r = await api("/api/me/nivel", { token: U.sFoto.token });
@@ -140,10 +140,36 @@ test("2. /api/me/nivel de un fotógrafo: 2 niveles, 7 criterios, sin cifras mín
   assert.equal(r.data.nivel_actual, 1);
   assert.equal(r.data.niveles.length, 2);
   assert.deepEqual(r.data.niveles.map((n) => n.etiqueta), ["F1", "F2"]);
-  assert.ok(r.data.niveles.every((n) => n.requisitos === null && n.funciones.length > 0));
+  assert.ok(r.data.niveles.every((n) => n.funciones.length > 0));
+  assert.equal(r.data.niveles[0].requisitos, null, "F1 no pide nada");
+  assert.deepEqual(Object.keys(r.data.niveles[1].requisitos).sort(), ["fotos", "partidos"], "F2 pide partidos con galería y fotos");
   assert.equal(r.data.criterios.length, 7);
   assert.equal(r.data.progreso, null, "no hay barras de progreso numéricas");
   assert.deepEqual(r.data.actividad, { partidos: 2, fotos: 3 });
+});
+
+test("2b. /api/me/nivel enseña LOS DOS pases a cualquiera (fotógrafo, redactor y admin), sin datos personales", async () => {
+  for (const [nombre, token] of [["fotógrafo", U.sFoto.token], ["redactor", U.sRed.token], ["admin", U.sAdmin.token]]) {
+    const r = await api("/api/me/nivel", { token });
+    assert.equal(r.status, 200, nombre);
+    const p = r.data.pases;
+    assert.ok(p, `${nombre}: falta pases`);
+    assert.deepEqual(p.redaccion.map((n) => n.nivel), [1, 2, 3, 4], `${nombre}: pase de redacción`);
+    assert.equal(p.redaccion[0].requisitos, null, "el nivel inicial no pide nada");
+    assert.ok(p.redaccion.slice(1).every((n) => n.requisitos && Object.keys(n.requisitos).length > 0), "N2–N4 llevan requisitos");
+    assert.deepEqual(p.fotografia.map((n) => n.etiqueta), ["F1", "F2"], `${nombre}: pase de fotografía`);
+    assert.ok(p.fotografia.every((n) => n.funciones.length > 0));
+    assert.equal(p.fotografia[0].requisitos, null, "F1 no pide nada");
+    assert.deepEqual(Object.keys(p.fotografia[1].requisitos).sort(), ["fotos", "partidos"], "F2 pide partidos con galería y fotos");
+    assert.equal(p.criterios_fotografia.length, 7);
+  }
+  // El pase propio sigue siendo el de su rol: un fotógrafo conserva sus 2 niveles y un redactor sus 4.
+  const foto = await api("/api/me/nivel", { token: U.sFoto.token });
+  assert.equal(foto.data.es_fotografo, true);
+  assert.equal(foto.data.niveles.length, 2);
+  const red = await api("/api/me/nivel", { token: U.sRed.token });
+  assert.notEqual(red.data.es_fotografo, true);
+  assert.equal(red.data.niveles.length, 4);
 });
 
 test("3. un fotógrafo con nivel de redacción alto en la base se muestra como F2, no como N3", async () => {

@@ -47,6 +47,8 @@ CREATE TABLE club_info_solicitudes (id INTEGER PRIMARY KEY AUTOINCREMENT, club T
 
 // Encuestas: la migración real, tal cual (más un "articles" mínimo para el JOIN del listado).
 sqlite.exec("CREATE TABLE articles (id INTEGER PRIMARY KEY AUTOINCREMENT, titulo TEXT, slug TEXT, publicado INTEGER DEFAULT 1);");
+sqlite.exec("CREATE TABLE article_feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, article_id INTEGER, article_titulo TEXT, article_slug TEXT, destinatario_id INTEGER, autor_feedback_id INTEGER, autor_feedback_nombre TEXT, tipo TEXT, nota TEXT, leido INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT);");
+sqlite.exec("CREATE TABLE readers (id INTEGER PRIMARY KEY AUTOINCREMENT);"); // poll_votes.reader_id la referencia: sin ella no se puede borrar una encuesta
 sqlite.exec(fs.readFileSync(new URL("../migracion_encuestas.sql", import.meta.url), "utf8"));
 
 const limpiar = (a) => a.map((v) => (v === undefined ? null : v));
@@ -250,6 +252,50 @@ test("3. encuestas del panel: un fotógrafo no las lista ni las crea; admin y re
   assert.equal((await api("/api/admin/polls", { token: U.sAdmin.token })).status, 200);
 });
 
+// ---------------------------------------------------------------- 3b. Encuestas ajenas
+test("3b. encuestas: un redactor no puede editar, cerrar, reabrir ni borrar las de otro redactor; solo su autor (o un admin)", async () => {
+  const crear = await api("/api/admin/polls", { method: "POST", token: U.sRed.token, body: { pregunta: "¿Quién ganará la liga?", opciones: ["A", "B"] } });
+  assert.equal(crear.status, 200, JSON.stringify(crear.data));
+  const id = crear.data.encuesta.id;
+  const lista = async (token) => (await api("/api/admin/polls", { token })).data.encuestas.find((p) => p.id === id);
+
+  // El listado marca qué encuestas puede tocar cada uno
+  assert.equal((await lista(U.sRed.token)).editable, true);
+  assert.equal((await lista(U.sRed2.token)).editable, false);
+  assert.equal((await lista(U.sAdmin.token)).editable, true);
+
+  // Otro redactor: todo 403 y la encuesta queda intacta
+  assert.equal((await api(`/api/admin/polls/${id}`, { method: "PUT", token: U.sRed2.token, body: { pregunta: "Cambiada" } })).status, 403);
+  assert.equal((await api(`/api/admin/polls/${id}/cerrar`, { method: "POST", token: U.sRed2.token })).status, 403);
+  assert.equal((await api(`/api/admin/polls/${id}/reabrir`, { method: "POST", token: U.sRed2.token })).status, 403);
+  assert.equal((await api(`/api/admin/polls/${id}`, { method: "DELETE", token: U.sRed2.token })).status, 403);
+  assert.equal((await lista(U.sRed.token)).pregunta, "¿Quién ganará la liga?");
+
+  // Su autor sí puede, y también un admin
+  assert.equal((await api(`/api/admin/polls/${id}`, { method: "PUT", token: U.sRed.token, body: { pregunta: "¿Quién ganará la liga este año?" } })).status, 200);
+  assert.equal((await api(`/api/admin/polls/${id}/cerrar`, { method: "POST", token: U.sAdmin.token })).status, 200);
+  assert.equal((await api(`/api/admin/polls/${id}`, { method: "DELETE", token: U.sRed.token })).status, 200);
+});
+
+// ---------------------------------------------------------------- 3c. Feedback enviado
+test("3c. feedback: «enviados» solo lo ven los Responsables y los redactores de Nivel 4; los recibidos, su destinatario", async () => {
+  const rev4 = usuario("revisor4", "redactor", 4);
+  const sRev4 = await sesion(rev4, "redactor");
+  const nota = (autor, destinatario) => sqlite.prepare(
+    "INSERT INTO article_feedback (article_id, article_titulo, destinatario_id, autor_feedback_id, autor_feedback_nombre, tipo, nota) VALUES (1, 'Pieza', ?, ?, 'X', 'aprobada', 'Buen trabajo')"
+  ).run(destinatario, autor);
+  nota(rev4, U.red);   // el revisor de Nivel 4 aprueba una pieza de «redactor»
+  nota(U.red2, U.red); // una nota con autoría de un redactor de Nivel 1 (no debería poder existir, pero no se le enseña)
+
+  const enviadosDe = async (token) => (await api("/api/feedback?enviados=1", { token })).data.feedback;
+  assert.equal((await enviadosDe(sRev4.token)).length, 1, "el Nivel 4 ve lo que ha enviado");
+  assert.equal((await enviadosDe(U.sAdmin.token)).length, 0, "un admin ve lo suyo (no ha enviado nada)");
+  assert.deepEqual(await enviadosDe(U.sRed2.token), [], "un redactor de Nivel 1 no ve «enviados»");
+
+  // Lo recibido sigue siendo de su destinatario, sea del nivel que sea
+  assert.equal((await api("/api/feedback", { token: U.sRed.token })).data.feedback.length, 2);
+});
+
 // ---------------------------------------------------------------- 4. Clubes personalizados
 test("4. clubes personalizados: un fotógrafo no puede crearlos", async () => {
   const r = await api("/api/custom-clubs", { method: "POST", token: U.sFoto.token, body: { nombre: "CD Nuevo", categoria: "hypermotion", escudo_url: "https://x/a.png" } });
@@ -320,9 +366,53 @@ test("5b. propuestas de ficha: no se puede reenviar la misma, ni la de otro reda
 
   // Si la ficha publicada ya tiene esos datos, proponerlos no tiene sentido
   assert.equal((await api("/api/club-info", { method: "PUT", token: U.sAdmin.token, body: { ...datos, club: "Club Publicado" } })).status, 200);
-  const igualALaFicha = await api("/api/club-info", { method: "PUT", token: U.sRed.token, body: { ...datos, club: "Club Publicado" } });
-  assert.equal(igualALaFicha.status, 409);
+  // ...y como la ficha publicada es de otra persona, un redactor ya ni puede proponer cambios
+  const sobreFichaAjena = await api("/api/club-info", { method: "PUT", token: U.sRed.token, body: { ...datos, club: "Club Publicado" } });
+  assert.equal(sobreFichaAjena.status, 403);
   assert.equal(pendientesDe("Club Publicado"), 0);
+});
+
+// ---------------------------------------------------------------- 5c. Solo el creador edita la ficha
+test("5c. fichas de club: solo las edita quien las creó (y un Responsable); los redactores no ven propuestas", async () => {
+  const creador = usuario("redactor3", "redactor", 2);
+  const sCreador = await sesion(creador, "redactor");
+  const datos = { club: "Club del Creador", entrenador: "Marta Gil", estadio: "Campo Dos", fundacion: 1960, ciudad: "Lugo" };
+
+  // Nivel 2 aplica directo y queda como creador
+  const alta = await api("/api/club-info", { method: "PUT", token: sCreador.token, body: datos });
+  assert.equal(alta.status, 200);
+  assert.equal(alta.data.pendiente, false);
+  const autor = () => sqlite.prepare("SELECT autor_id FROM club_info WHERE club = ?").get(datos.club).autor_id;
+  assert.equal(autor(), creador);
+
+  // Otro redactor, aunque sea de nivel 1: 403 y no se crea ninguna propuesta
+  const ajeno = await api("/api/club-info", { method: "PUT", token: U.sRed.token, body: { ...datos, ciudad: "Ourense" } });
+  assert.equal(ajeno.status, 403);
+  assert.equal(pendientesDe(datos.club), 0);
+  assert.equal(sqlite.prepare("SELECT ciudad FROM club_info WHERE club = ?").get(datos.club).ciudad, "Lugo");
+
+  // El creador sí puede editarla
+  assert.equal((await api("/api/club-info", { method: "PUT", token: sCreador.token, body: { ...datos, ciudad: "Monforte" } })).status, 200);
+  assert.equal(sqlite.prepare("SELECT ciudad FROM club_info WHERE club = ?").get(datos.club).ciudad, "Monforte");
+
+  // Un Responsable puede, pero el creador original se conserva
+  assert.equal((await api("/api/club-info", { method: "PUT", token: U.sAdmin.token, body: { ...datos, ciudad: "Sarria" } })).status, 200);
+  assert.equal(autor(), creador);
+
+  // El listado indica qué fichas puede editar cada uno
+  const dePropia = (await api("/api/admin/club-info", { token: sCreador.token })).data.fichas.find((f) => f.club === datos.club);
+  const deAjena = (await api("/api/admin/club-info", { token: U.sRed.token })).data.fichas.find((f) => f.club === datos.club);
+  assert.equal(dePropia.editable, true);
+  assert.equal(deAjena.editable, false);
+
+  // Un redactor de Nivel 1 con una propuesta pendiente suya ya no la ve en su bandeja
+  await api("/api/club-info", { method: "PUT", token: U.sRed2.token, body: { club: "Club Sin Ficha", entrenador: "Pau" } });
+  const bandeja = await api("/api/admin/club-info/solicitudes", { token: U.sRed2.token });
+  assert.equal(bandeja.data.puede_resolver, false);
+  assert.deepEqual(bandeja.data.solicitudes, []);
+  // ...mientras que un Responsable sí la ve
+  const ver = await api("/api/admin/club-info/solicitudes", { token: U.sAdmin.token });
+  assert.ok(ver.data.solicitudes.some((x) => x.club === "Club Sin Ficha"));
 });
 
 test("5b. propuestas de ficha: una propuesta vacía de un club sin ficha se rechaza", async () => {

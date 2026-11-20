@@ -101,17 +101,16 @@ const ultimoComentario = () => Number(sqlite.prepare("SELECT MAX(id) AS id FROM 
 const fila = (id) => sqlite.prepare("SELECT * FROM comments WHERE id = ?").get(id);
 const publicos = async (art) => (await api(`/api/articles/${art}/comments`)).data.comentarios;
 
-test("aprobar el comentario de una lectora le manda un correo (y solo uno)", async () => {
+test("al comentar se publica solo y la lectora recibe un correo (solo uno)", async () => {
   correos = [];
   const art = articulo("a1");
   const ana = lector("Ana", "ana@correo.es");
   const r = await comentar(art, await tokenLector(ana, "Ana"), "Gran crónica");
   assert.equal(r.status, 200, JSON.stringify(r.data));
   const id = ultimoComentario();
-  assert.equal(correos.length, 0, "al enviarlo todavía no se avisa");
-
-  assert.equal((await moderar(id, "aprobado")).status, 200);
-  assert.equal(correos.length, 1);
+  assert.equal(fila(id).estado, "aprobado", "se publica automáticamente");
+  assert.equal((await publicos(art)).length, 1);
+  assert.equal(correos.length, 1, "se avisa al publicarse");
   assert.deepEqual(correos[0].to, ["ana@correo.es"]);
   assert.match(correos[0].subject, /ya está publicado/);
   assert.match(correos[0].html, /#comentario-\d+/);
@@ -122,26 +121,23 @@ test("aprobar el comentario de una lectora le manda un correo (y solo uno)", asy
   assert.equal(correos.length, 1, "aprobar otra vez no duplica el aviso");
 });
 
-test("respuestas: se moderan, cuelgan del comentario y avisan a quien contestan", async () => {
+test("respuestas: se publican solas, cuelgan del comentario y avisan a quien contestan", async () => {
   correos = [];
   const art = articulo("a2");
   const ana = lector("Ana2", "ana2@correo.es");
   const luis = lector("Luis2", "luis2@correo.es");
   await comentar(art, await tokenLector(ana, "Ana2"), "Yo creo que ganará el Depor");
   const raiz = ultimoComentario();
-  await moderar(raiz, "aprobado");
   correos = [];
 
   const r = await comentar(art, await tokenLector(luis, "Luis2"), "No sé, lo veo difícil", raiz);
   assert.equal(r.status, 200, JSON.stringify(r.data));
-  assert.match(r.data.mensaje, /Respuesta enviada/);
+  assert.match(r.data.mensaje, /Respuesta publicada/);
   const resp = ultimoComentario();
   assert.equal(fila(resp).parent_id, raiz);
   assert.equal(fila(resp).responde_a_id, raiz);
-  assert.equal((await publicos(art)).length, 1, "la respuesta pendiente no se ve");
-  assert.equal(correos.length, 0);
+  assert.equal((await publicos(art)).length, 2, "la respuesta se ve de inmediato");
 
-  await moderar(resp, "aprobado");
   const para = (c) => c.to[0];
   assert.equal(correos.length, 2);
   const aAna = correos.find((c) => para(c) === "ana2@correo.es");
@@ -181,6 +177,7 @@ test("no se puede responder a un comentario no visible, de otra noticia o invál
   const t = await tokenLector(ana, "Ana4");
   await comentar(art, t, "pendiente aún");
   const pend = ultimoComentario();
+  await moderar(pend, "pendiente"); // la redacción lo devuelve a pendiente: ya no es visible
   assert.equal((await comentar(art, t, "hola", pend)).status, 404);
 
   await moderar(pend, "aprobado");
@@ -249,7 +246,7 @@ test("el panel de admin ve a quién responde cada comentario", async () => {
   const t = await tokenLector(a, "A8");
   await comentar(art, t, "raíz"); const raiz = ultimoComentario(); await moderar(raiz, "aprobado");
   await comentar(art, t, "respuesta", raiz);
-  const { data } = await api("/api/admin/comments?estado=pendiente", { token: tokenAdmin });
+  const { data } = await api("/api/admin/comments?estado=aprobado", { token: tokenAdmin });
   const r = data.comentarios.find((c) => c.texto === "respuesta");
   assert.equal(r.responde_a_nombre, "A8");
 });
@@ -274,4 +271,126 @@ test("baja de los avisos: desde el enlace del correo y desde Mi cuenta", async (
 
   const perfil = await api("/api/readers/me/perfil", { token: t });
   assert.equal(perfil.data.reader.avisos_comentarios, true);
+});
+
+// ---------- Filtro automático de enlaces e insultos ----------
+test("el filtro bloquea enlaces e insultos antes de guardar nada (lector con sesión)", async () => {
+  const art = articulo("filtro1");
+  const ana = lector("Ana Filtro", "ana.filtro@correo.es");
+  const token = await tokenLector(ana, "Ana Filtro");
+  const antes = sqlite.prepare("SELECT COUNT(*) AS n FROM comments").get().n;
+
+  const enlace = await comentar(art, token, "Mira mi canal https://spam.example/promo");
+  assert.equal(enlace.status, 400);
+  assert.equal(enlace.data.motivo, "enlace");
+
+  const insulto = await comentar(art, token, "El árbitro es un hijo de puta");
+  assert.equal(insulto.status, 400);
+  assert.equal(insulto.data.motivo, "insulto");
+  assert.ok(!/puta/i.test(insulto.data.error), "el mensaje no debe repetir la palabra");
+
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM comments").get().n, antes, "no se guarda nada");
+});
+
+test("el filtro también se aplica a visitantes sin cuenta (nombre y texto)", async () => {
+  const art = articulo("filtro2");
+  const base = { email: "visitante@correo.es" };
+  const post = (extra) => api(`/api/articles/${art}/comments`, { method: "POST", body: { ...base, ...extra } });
+
+  assert.equal((await post({ nombre: "Pepe", texto: "Apuestas en www.casino-ya.com" })).data.motivo, "enlace");
+  assert.equal((await post({ nombre: "Ofertas bit.ly/xyz", texto: "Buen partido" })).data.motivo, "enlace");
+  assert.equal((await post({ nombre: "Pepe", texto: "Sois unos subnormales" })).data.motivo, "insulto");
+});
+
+test("un comentario normal, aunque sea duro con el equipo, se publica automáticamente", async () => {
+  const art = articulo("filtro3");
+  const r = await comentar(art, await tokenLector(lector("Berta", "berta.filtro@correo.es"), "Berta"),
+    "Este equipo de mierda no gana nunca, pero qué puto amo el portero. Final 2-1 min.90");
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(fila(ultimoComentario()).estado, "aprobado");
+  assert.equal(r.data.publicado, true);
+  assert.equal((await publicos(art)).length, 1, "se ve de inmediato");
+});
+
+// ---------- Editar y borrar el propio comentario ----------
+const editar = (id, token, texto) => api(`/api/comments/${id}`, { method: "PUT", token, body: { texto } });
+const borrar = (id, token) => api(`/api/comments/${id}`, { method: "DELETE", token });
+
+async function comentarioAprobado(art, lectorId, nombre, texto) {
+  const token = await tokenLector(lectorId, nombre);
+  assert.equal((await comentar(art, token, texto)).status, 200);
+  const id = ultimoComentario();
+  assert.equal((await moderar(id, "aprobado")).status, 200);
+  return { id, token };
+}
+
+test("editar el propio comentario: sigue publicado con el texto nuevo (si pasa el filtro)", async () => {
+  const art = articulo("propio1");
+  const ana = lector("Ana Propia", "ana.propia@correo.es");
+  const { id, token } = await comentarioAprobado(art, ana, "Ana Propia", "Texto original");
+  assert.equal((await publicos(art)).length, 1);
+
+  const r = await editar(id, token, "Texto corregido");
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(fila(id).texto, "Texto corregido");
+  assert.equal(fila(id).estado, "aprobado");
+  assert.equal((await publicos(art))[0].texto, "Texto corregido");
+
+  // Si la redacción lo devolvió a pendiente, editarlo no lo publica por su cuenta.
+  await moderar(id, "pendiente");
+  assert.equal((await editar(id, token, "Otra corrección")).status, 200);
+  assert.equal(fila(id).estado, "pendiente");
+  assert.equal((await publicos(art)).length, 0);
+});
+
+test("editar pasa por el filtro y no se puede vaciar ni rechazar-evadir", async () => {
+  const art = articulo("propio2");
+  const { id, token } = await comentarioAprobado(art, lector("Berta P", "berta.propia@correo.es"), "Berta P", "Comentario limpio");
+
+  const conEnlace = await editar(id, token, "Ahora con https://spam.example");
+  assert.equal(conEnlace.status, 400);
+  assert.equal(conEnlace.data.motivo, "enlace");
+  assert.equal((await editar(id, token, "   ")).status, 400);
+  assert.equal((await editar(id, token, "x".repeat(2001))).status, 400);
+  assert.equal(fila(id).texto, "Comentario limpio");
+  assert.equal(fila(id).estado, "aprobado", "un intento fallido no lo saca de la web");
+
+  const igual = await editar(id, token, "Comentario limpio");
+  assert.equal(igual.status, 200);
+  assert.equal(fila(id).estado, "aprobado", "sin cambios no se vuelve a moderar");
+
+  await moderar(id, "rechazado");
+  assert.equal((await editar(id, token, "Otro intento")).status, 403);
+});
+
+test("solo el dueño puede tocar su comentario (404 al resto) y hace falta sesión", async () => {
+  const art = articulo("propio3");
+  const { id } = await comentarioAprobado(art, lector("Carla P", "carla.propia@correo.es"), "Carla P", "Mío");
+  const otro = await tokenLector(lector("Dani P", "dani.propio@correo.es"), "Dani P");
+
+  assert.equal((await editar(id, otro, "Robado")).status, 404);
+  assert.equal((await borrar(id, otro)).status, 404);
+  assert.equal((await editar(id, undefined, "Anónimo")).status, 401);
+  assert.equal((await borrar(id, undefined)).status, 401);
+  assert.equal(fila(id).texto, "Mío");
+
+  // Un comentario de visitante anónimo (sin reader_id) no es de nadie.
+  sqlite.prepare("INSERT INTO comments (article_id, nombre, email, texto, estado) VALUES (?,?,?,?, 'aprobado')").run(art, "Anon", "a@a.es", "Anónimo");
+  assert.equal((await borrar(ultimoComentario(), otro)).status, 404);
+});
+
+test("borrar el propio comentario: sí sin respuestas, no con respuestas", async () => {
+  const art = articulo("propio4");
+  const { id, token } = await comentarioAprobado(art, lector("Eva P", "eva.propia@correo.es"), "Eva P", "Borrable");
+  assert.equal((await borrar(id, token)).status, 200);
+  assert.equal(fila(id), undefined);
+
+  const raiz = await comentarioAprobado(art, lector("Fran P", "fran.propio@correo.es"), "Fran P", "Con hilo");
+  const gema = await tokenLector(lector("Gema P", "gema.propia@correo.es"), "Gema P");
+  assert.equal((await comentar(art, gema, "Una respuesta", raiz.id)).status, 200);
+
+  const r = await borrar(raiz.id, raiz.token);
+  assert.equal(r.status, 409);
+  assert.ok(fila(raiz.id), "el raíz sigue ahí");
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM comments WHERE parent_id = ?").get(raiz.id).n, 1, "la respuesta de otra persona sigue ahí");
 });

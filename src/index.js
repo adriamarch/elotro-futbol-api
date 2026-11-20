@@ -4,7 +4,13 @@ import {
   extractosBusqueda, facetasBusqueda, indexarArticuloBusqueda, eliminarArticuloBusqueda,
   reconciliarIndiceBusqueda, reiniciarIndiceBusqueda,
 } from "./busqueda.js";
-// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/porras, /api/porras/resumen, /api/porras/ranking, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/comments/:id/vote, /api/comments/:id/report, /api/admin/comments, /api/admin/comments/reported, /api/club-info, /api/admin/club-info, /api/track/view, /api/track/reading, /api/track/result-view, /api/admin/analiticas/* (resumen, mensual, mas-leidas, fuentes, autores, tiempo-lectura, idiomas, partidos-seguidos, gsc), /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml
+import {
+  slugEtiqueta, parsearEtiquetas, validarEtiquetas, guardarEtiquetasArticulo, quitarColumnaSlugs,
+  agregarEtiquetas, clubesDeColumna, MIN_NOTICIAS_ETIQUETA_INDEXABLE,
+} from "./etiquetas.js";
+import { analizarComentario } from "./moderacion.js";
+// Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/porras, /api/porras/resumen, /api/porras/ranking, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/comments/:id/vote, /api/comments/:id/report, /api/admin/comments, /api/admin/comments/reported, /api/club-info, /api/admin/club-info, /api/track/view, /api/track/reading, /api/track/result-view, /api/admin/analiticas/* (resumen, mensual, mas-leidas, fuentes, autores, tiempo-lectura, idiomas, partidos-seguidos, gsc), /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml, /api/etiquetas, /sitemap-etiquetas.xml,
+// /rss/categoria|club|autor|etiqueta/{x}.xml
 
 // Escapa los caracteres especiales de XML para que un título o slug con
 // "&", "<", ">", comillas, etc. no rompa el XML del sitemap.
@@ -121,16 +127,51 @@ function fechaHoraParaSitemap(valor) {
   return fecha.toISOString();
 }
 
+// Foco de la portada para los recortes de Cloudinary. Mismo cálculo que
+// seoFocoCloudinary / seoFocoCentroCloudinary / seoImagenSocialWorker de
+// public/src-worker.js (hay un test que exige que den la MISMA URL): con foco
+// elegido distinto del centro el recorte se centra en él; sin foco, cara (g_face:auto) o foto entera si es vertical.
+function focoCloudinarySimple(foco) {
+  const par = focoComoPar(foco);
+  if (!par || (par[0] === 50 && par[1] === 50)) return null;
+  const f = (n) => { const v = Math.round(n * 10) / 1000; return Number.isInteger(v) ? v.toFixed(1) : String(v); };
+  return { x: f(par[0]), y: f(par[1]) };
+}
+function focoCloudinaryCentro(foco, dims, ancho, alto) {
+  const par = focoComoPar(foco);
+  if (!par || !dims || !(dims.w > 0) || !(dims.h > 0) || !(ancho > 0) || !(alto > 0)) return null;
+  const fx = par[0] / 100, fy = par[1] / 100;
+  if (fx === 0.5 && fy === 0.5) return null;
+  const T = ancho / alto, A = dims.w / dims.h;
+  let cx = 0.5, cy = 0.5;
+  if (A > T) { const cw = dims.h * T; cx = (cw / 2 + (dims.w - cw) * fx) / dims.w; }
+  else if (A < T) { const ch = dims.w / T; cy = (ch / 2 + (dims.h - ch) * fy) / dims.h; }
+  const f = (n) => { const v = Math.round(Math.min(1, Math.max(0, n)) * 10000) / 10000; return Number.isInteger(v) ? v.toFixed(1) : String(v); };
+  return { x: f(cx), y: f(cy) };
+}
+// Sin foco: foto vertical/cuadrada conocida -> entera sobre fondo difuminado; resto -> recorte
+// centrado en la cara (g_face:auto, vuelve a g_auto si no hay cara). IDÉNTICO a
+// seoTransformacionSocial de public/src-worker.js (un test exige la misma URL).
+function transformacionSocialCloudinary(foco, ancho, alto, dims) {
+  const pf = focoCloudinaryCentro(foco, dims, ancho, alto) || focoCloudinarySimple(foco);
+  if (pf) return `f_jpg,q_auto:good,c_fill,g_xy_center,x_${pf.x},y_${pf.y},w_${ancho},h_${alto}`;
+  if (dims && dims.w > 0 && dims.h > 0 && dims.w / dims.h < 1.15) {
+    return `f_jpg,q_auto:good,c_pad,b_blurred:400:15,w_${ancho},h_${alto}`;
+  }
+  return `f_jpg,q_auto:good,c_fill,g_face:auto,w_${ancho},h_${alto}`;
+}
+
 // Imagen de portada recortada 16:9 para feeds RSS y sitemaps (agregadores y
 // Google Discover prefieren 1200 px de ancho). Solo toca URLs de Cloudinary,
 // igual que seoImagenSocialWorker en public/src-worker.js; el resto se
 // devuelve tal cual. Siempre JPG: algunos lectores RSS no entienden webp/avif.
-function imagenParaFeed(url) {
+// "foco" es el de la portada (focoDePortada): el recorte respeta lo que eligió el redactor.
+function imagenParaFeed(url, foco) {
   if (!url || typeof url !== "string") return "";
   const marca = "/upload/";
   const i = url.indexOf(marca);
   if (i === -1 || !/res\.cloudinary\.com/.test(url)) return url;
-  return url.slice(0, i + marca.length) + "f_jpg,q_auto:good,c_fill,g_auto,w_1200,h_675/" + url.slice(i + marca.length);
+  return url.slice(0, i + marca.length) + transformacionSocialCloudinary(foco, 1200, 675, null) + "/" + url.slice(i + marca.length);
 }
 
 // Quita etiquetas HTML y colapsa espacios para obtener un extracto de
@@ -145,6 +186,138 @@ function extractoTexto(html, limite = 300) {
     .trim();
   if (texto.length <= limite) return texto;
   return texto.slice(0, texto.lastIndexOf(" ", limite)) + "…";
+}
+
+// ---------- Feeds RSS ----------
+// <item> de un feed RSS 2.0 por cada fila de "articles". Lo comparten el feed
+// global (/rss.xml) y los de categoría, club, autor y etiqueta (/rss/...).
+function itemsRss(filas) {
+  return filas.map((articulo) => {
+    const link = urlNoticia(articulo.categoria, articulo.slug);
+    const pubDate = fechaParaRss(articulo.fecha_publicacion);
+    const descripcion = articulo.subtitulo?.trim() || extractoTexto(articulo.contenido);
+    const imagenItem = imagenParaFeed(articulo.imagen_url, focoDePortada(articulo));
+    return [
+      "  <item>",
+      `    <title>${escaparXml(articulo.titulo)}</title>`,
+      `    <link>${link}</link>`,
+      `    <guid isPermaLink="true">${link}</guid>`,
+      descripcion ? `    <description>${escaparXml(descripcion)}</description>` : null,
+      // Nombre legible ("Primera Federación"), no el identificador interno.
+      articulo.categoria ? `    <category>${escaparXml(categoriaLabelEmail(articulo.categoria))}</category>` : null,
+      // <author> en RSS 2.0 exige un correo ("a@b.com (Nombre)"); un nombre
+      // suelto lo invalida en los validadores. dc:creator es la forma estándar.
+      articulo.autor_nombre ? `    <dc:creator>${escaparXml(articulo.autor_nombre)}</dc:creator>` : null,
+      pubDate ? `    <pubDate>${pubDate}</pubDate>` : null,
+      imagenItem ? `    <media:content url="${escaparXml(imagenItem)}" medium="image" type="image/jpeg" width="1200" height="675"/>` : null,
+      imagenItem ? `    <media:thumbnail url="${escaparXml(imagenItem)}" width="1200" height="675"/>` : null,
+      "  </item>",
+    ].filter(Boolean).join("\n");
+  }).join("\n");
+}
+
+const CANAL_RSS_GLOBAL = {
+  titulo: "ELOTROFÚTBOLTV",
+  descripcion: "Últimas noticias de fútbol modesto: Primera Federación, Segunda Federación y más.",
+  enlace: "https://elotrofutbol.media/",
+  selfUrl: "https://elotrofutbol.media/rss.xml",
+};
+
+// Documento RSS 2.0 completo. "titulo", "descripcion", "enlace" (la página que
+// el canal representa) y "selfUrl" (la URL del propio feed) cambian de un feed
+// a otro; el logo y el copyright son siempre los del sitio.
+function envolverRss({ titulo, descripcion, enlace, selfUrl, ultimaActualizacion, items }) {
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:media="http://search.yahoo.com/mrss/">\n<channel>\n  <title>${escaparXml(titulo)}</title>\n  <link>${escaparXml(enlace)}</link>\n  <description>${escaparXml(descripcion)}</description>\n  <language>es</language>\n  <copyright>ELOTROFÚTBOLTV</copyright>\n  <ttl>15</ttl>\n  <lastBuildDate>${ultimaActualizacion}</lastBuildDate>\n  <image>\n    <url>https://elotrofutbol.media/img/logo.png</url>\n    <title>ELOTROFÚTBOLTV</title>\n    <link>https://elotrofutbol.media/</link>\n    <width>144</width>\n    <height>132</height>\n  </image>\n  <atom:link href="${escaparXml(selfUrl)}" rel="self" type="application/rss+xml" />\n${items}\n</channel>\n</rss>\n`;
+}
+
+// Qué noticias y qué cabecera lleva cada feed filtrado de /rss/{tipo}/{x}.xml.
+// Devuelve null si ese filtro no existe (categoría mal escrita, club o etiqueta
+// desconocidos...), que responde 404. "nombre" null = se saca de las propias
+// noticias (autor y etiqueta). Los segmentos de la URL son los de siempre:
+// categoría con guion (primera-federacion; también vale con "_"), club y
+// etiqueta por slug (real-oviedo, ascenso-2026) y autor por su id.
+async function resolverCanalRss(env, tipo, segmento) {
+  if (tipo === "categoria") {
+    const cat = segmento.trim().toLowerCase().replace(/-/g, "_");
+    if (!/^[a-z0-9_]{1,40}$/.test(cat)) return null;
+    return {
+      tipo, nombre: categoriaLabelEmail(cat), where: " AND categoria = ?", binds: [cat],
+      enlace: `${SITIO_URL}/categoria?cat=${encodeURIComponent(cat)}`,
+      selfUrl: `${SITIO_URL}/rss/categoria/${cat.replace(/_/g, "-")}.xml`,
+    };
+  }
+  if (tipo === "autor") {
+    if (!/^\d{1,9}$/.test(segmento)) return null;
+    const id = parseInt(segmento, 10);
+    return {
+      tipo, nombre: null, where: " AND autor_id = ?", binds: [id],
+      enlace: `${SITIO_URL}/autor?id=${id}`,
+      selfUrl: `${SITIO_URL}/rss/autor/${id}.xml`,
+    };
+  }
+  if (tipo === "etiqueta") {
+    const slug = slugEtiqueta(segmento);
+    if (!slug) return null;
+    return {
+      tipo, slug, nombre: null, columnasExtra: ", etiquetas",
+      where: " AND etiquetas_slugs IS NOT NULL AND etiquetas_slugs LIKE ?", binds: [`%,${slug},%`],
+      enlace: `${SITIO_URL}/etiqueta/${slug}`,
+      selfUrl: `${SITIO_URL}/rss/etiqueta/${slug}.xml`,
+    };
+  }
+  const club = await resolverClubPorSlug(env, slugEtiqueta(segmento));
+  if (!club) return null;
+  return {
+    tipo, nombre: club.nombre, where: " AND (club = ? OR club LIKE ?)", binds: [club.nombre, `%"${club.nombre}"%`],
+    enlace: `${SITIO_URL}/categoria?cat=${encodeURIComponent(club.categoria)}&club=${encodeURIComponent(club.nombre)}`,
+    selfUrl: `${SITIO_URL}/rss/club/${slugEtiqueta(club.nombre)}.xml`,
+  };
+}
+
+// El club de una noticia es texto libre (no hay tabla de clubes), así que
+// /rss/club/real-oviedo.xml se resuelve buscando entre los clubes con noticias
+// publicados el que tiene ese slug. Devuelve { nombre, categoria } (la
+// competición de liga si juega en varias; es la que lleva la ficha del club)
+// o null. Una previa/crónica con dos clubes cuenta para ambos.
+async function resolverClubPorSlug(env, slug) {
+  if (!slug) return null;
+  const { results } = await env.DB.prepare(
+    `SELECT categoria, club FROM articles
+     WHERE publicado = 1 AND club IS NOT NULL AND club <> ''
+     GROUP BY categoria, club
+     LIMIT 5000`
+  ).all();
+  const LIGAS = ["hypermotion", "primera_federacion", "segunda_federacion", "tercera_federacion"];
+  let mejor = null;
+  for (const fila of results) {
+    const nombre = clubesDeColumna(fila.club).find((c) => slugEtiqueta(c) === slug);
+    if (!nombre) continue;
+    if (!mejor) mejor = { nombre, categoria: fila.categoria };
+    if (LIGAS.includes(fila.categoria)) return { nombre, categoria: fila.categoria };
+  }
+  return mejor;
+}
+
+// ---------- Etiquetas (tags) reales ----------
+// Una única lectura recorre las noticias con etiquetas (índice parcial
+// idx_articles_con_etiquetas) y alimenta el listado de etiquetas, la ficha de
+// cada una y el sitemap. Se guarda 5 minutos en memoria del isolate para no
+// repetir la lectura en cada visita (ahorra lecturas de D1); al guardar las
+// etiquetas de una noticia se descarta enseguida.
+const CACHE_ETIQUETAS_MS = 5 * 60 * 1000;
+let cacheEtiquetas = null; // { t, lista }
+function olvidarCacheEtiquetas() { cacheEtiquetas = null; }
+async function listarEtiquetas(env) {
+  if (cacheEtiquetas && Date.now() - cacheEtiquetas.t < CACHE_ETIQUETAS_MS) return cacheEtiquetas.lista;
+  const { results } = await env.DB.prepare(
+    `SELECT etiquetas, fecha_publicacion FROM articles
+     WHERE publicado = 1${SQL_OCULTAR_SEGUNDO_DE_FUSION} AND etiquetas_slugs IS NOT NULL
+     ORDER BY fecha_publicacion DESC
+     LIMIT 5000`
+  ).all();
+  const lista = agregarEtiquetas(results);
+  cacheEtiquetas = { t: Date.now(), lista };
+  return lista;
 }
 
 // "fecha_partido" se guarda tal cual la escribe el redactor en el
@@ -232,6 +405,14 @@ function cors(resp, origin) {
   }
   resp.headers.set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   resp.headers.set("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  // SEGURIDAD: cabeceras defensivas en TODA respuesta de la API (antes solo
+  // las llevaba el sitio estático vía _headers). "nosniff" impide que el
+  // navegador reinterprete una respuesta JSON/archivo como HTML o script;
+  // Referrer-Policy evita filtrar rutas completas de la API a terceros.
+  // Se respetan las que una ruta concreta ya hubiera fijado. No se añade
+  // X-Frame-Options aquí a propósito: /widgets/* se incrusta en webs ajenas.
+  if (!resp.headers.has("X-Content-Type-Options")) resp.headers.set("X-Content-Type-Options", "nosniff");
+  if (!resp.headers.has("Referrer-Policy")) resp.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
   // Sin esto, el JavaScript del navegador no puede leer estas cabeceras
   // aunque viajen en la respuesta: por defecto, fetch() en un origen
   // cruzado solo expone al código de la página un pequeño conjunto de
@@ -410,13 +591,16 @@ function conIdiomasDisponibles(article) {
     }
   }
   return {
-    ...article,
+    ...quitarColumnaSlugs(article),
     idiomas_disponibles,
     imagen_foco: focoDePortada(article),
     // Se expone ya como array (en vez del JSON en texto guardado en la
     // columna) para que el panel y la web no tengan que parsearlo cada
     // vez; ver parsearCategoriasAdicionales.
     categorias_adicionales: parsearCategoriasAdicionales(article.categorias_adicionales),
+    // Etiquetas (tags) reales, como array. Solo si la consulta trajo la columna (SELECT *),
+    // para no añadir un "etiquetas": [] a cada tarjeta de los listados.
+    ...(article.etiquetas !== undefined ? { etiquetas: parsearEtiquetas(article.etiquetas) } : {}),
   };
 }
 
@@ -468,7 +652,7 @@ function focoDePortada(article) {
   // 3) Si sigue sin encontrarse, se usa la primera foto (no tweet) del
   // array, que es la portada por defecto según el diseño original de la
   // tabla.
-  if (!portada) portada = imagenes.find((img) => img && img.tipo !== "tweet");
+  if (!portada) portada = imagenes.find((img) => img && !esItemNoFoto(img));
 
   return normalizarFoco(portada && portada.foco);
 }
@@ -554,6 +738,9 @@ function normalizarFocoOpcional(valor) {
 // true si el error es por una columna que aún no existe en esta BD (migración
 // manual sin ejecutar). Cubre SQLite/D1 ("no such column", "has no column
 // named") y PostgreSQL (código 42703 / "column ... does not exist").
+// Redes que puede enseñar una persona en su perfil de autor (la web propia cuenta como una más).
+const REDES_PERFIL_PERMITIDAS = ["twitter", "instagram", "tiktok", "youtube", "linkedin", "threads", "facebook", "web"];
+
 function esErrorColumnaFaltante(err, columna) {
   const msg = (err && err.message) || "";
   const esColumna = (err && err.code === "42703") || /no such column|no column named|column .* does not exist/i.test(msg);
@@ -730,10 +917,13 @@ const NOMBRE_COMPETICION_WIDGET = {
   hypermotion: "LaLiga Hypermotion",
   primera_federacion: "Primera Federación",
   segunda_federacion: "Segunda Federación",
+  tercera_federacion: "Tercera Federación",
+  copa_del_rey: "Copa del Rey",
+  copa_federacion: "Copa Federación",
 };
 
 function nombreCompeticionWidget(comp) {
-  return NOMBRE_COMPETICION_WIDGET[comp] || comp;
+  return NOMBRE_COMPETICION_WIDGET[comp] || String(comp || "").replace(/[_-]+/g, " ");
 }
 
 // Cabecera/pie común a los 4 widgets: fuente del sistema (nada de Google
@@ -916,7 +1106,7 @@ async function widgetsRouter(path, url, env) {
     const esCalendario = path === "/widgets/calendario";
     const competicion = url.searchParams.get("competicion");
     const club = url.searchParams.get("club");
-    let query = "SELECT equipo_local, equipo_visitante, goles_local, goles_visitante, estado, fecha_partido, escudo_local_url, escudo_visitante_url, finalizado_no_cubierto FROM results WHERE 1=1 AND finalizado_no_cubierto = 0";
+    let query = "SELECT equipo_local, equipo_visitante, goles_local, goles_visitante, estado, fecha_partido, escudo_local_url, escudo_visitante_url, finalizado_no_cubierto FROM results WHERE 1=1";
     const binds = [];
     if (competicion) { query += " AND competicion = ?"; binds.push(competicion); }
     if (club) { query += " AND (equipo_local = ? OR equipo_visitante = ?)"; binds.push(club, club); }
@@ -1150,9 +1340,10 @@ const TONOS_EMAIL = {
   exito: { color: "#1b7f3b", suave: "#e8f6ed", icono: "✔ " },
   error: { color: "#c62828", suave: "#fdecec", icono: "✖ " },
   aviso: { color: "#b45309", suave: "#fff4e0", icono: "⚠ " },
+  luto: { color: "#111111", suave: "#ececec", icono: "" },
 };
 
-function plantillaEmail({ etiqueta, titulo, filas = [], parrafo, boton, bloqueHtml, tono = "marca", preheader, pieHtml }) {
+function plantillaEmail({ etiqueta, titulo, filas = [], parrafo, boton, bloqueHtml, tono = "marca", preheader, pieHtml, lazoLuto = false }) {
   const t = TONOS_EMAIL[tono] || TONOS_EMAIL.marca;
   const SERIF = "Georgia,'Times New Roman',serif";
   const SANS = "'Helvetica Neue',Helvetica,Arial,sans-serif";
@@ -1219,7 +1410,9 @@ function plantillaEmail({ etiqueta, titulo, filas = [], parrafo, boton, bloqueHt
         <table role="presentation" class="eof-tarjeta" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 8px 28px rgba(12,27,46,.14);">
           <tr>
             <td style="background:#0c1b2e;padding:26px 36px;">
-              <img src="${SITIO_URL}/img/logo.png" alt="ELOTROFÚTBOLTV" height="36" style="display:block;border:0;height:36px;width:auto;">
+              ${lazoLuto
+                ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="vertical-align:middle;"><img src="${SITIO_URL}/img/logo.png" alt="ELOTROFÚTBOLTV" height="36" style="display:block;border:0;height:36px;width:auto;"></td><td align="right" style="vertical-align:middle;"><img src="${SITIO_URL}/img/lazo-luto.png" alt="Lazo negro" width="40" height="40" style="display:block;border:0;width:40px;height:40px;margin-left:auto;"></td></tr></table>`
+                : `<img src="${SITIO_URL}/img/logo.png" alt="ELOTROFÚTBOLTV" height="36" style="display:block;border:0;height:36px;width:auto;">`}
             </td>
           </tr>
           <tr><td style="height:5px;background:${t.color};line-height:5px;font-size:0;">&nbsp;</td></tr>
@@ -1288,8 +1481,9 @@ function competicionLabelEmail(comp) {
     hypermotion: "LaLiga Hypermotion",
     primera_federacion: "Primera Federación (RFEF)",
     segunda_federacion: "Segunda Federación (RFEF)",
+    tercera_federacion: "Tercera Federación (RFEF)",
   };
-  return NOMBRES[comp] || comp;
+  return NOMBRES[comp] || String(comp || "").replace(/[_-]+/g, " ");
 }
 
 // Tabla de clasificación en HTML compatible con clientes de correo
@@ -2105,14 +2299,20 @@ function emailAnuncioValido(email) {
 // Una lista concreta solo FILTRA filas que ya existen en la base de datos:
 // nunca se puede enviar a un correo que no pertenezca a ese grupo.
 const ANUNCIO_MAX_PERSONAS_SELECCION = 5000;
+// Grupos de trabajo como destinatarios: la clave es "grupo:<id del grupo>" y funciona igual que
+// cualquier otra audiencia ("todos" el grupo entero, o una lista de correos dentro del grupo).
+// Se resuelve al enviar, así que quien entre o salga del grupo después se tiene en cuenta.
+const ANUNCIO_PREFIJO_GRUPO = "grupo:";
+function esClaveGrupoAnuncio(k) { return typeof k === "string" && /^grupo:[a-z0-9_-]{1,24}$/i.test(k); }
 function normalizarSeleccionAnuncio(raw) {
   const sel = {};
   if (Array.isArray(raw)) {
-    for (const a of raw) if (ANUNCIO_AUDIENCIAS.includes(a)) sel[a] = "todos";
+    for (const a of raw) if (ANUNCIO_AUDIENCIAS.includes(a) || esClaveGrupoAnuncio(a)) sel[a] = "todos";
     return sel;
   }
   if (raw && typeof raw === "object") {
-    for (const a of ANUNCIO_AUDIENCIAS) {
+    const claves = [...ANUNCIO_AUDIENCIAS, ...Object.keys(raw).filter(esClaveGrupoAnuncio).slice(0, GRUPOS_TRABAJO_MAX)];
+    for (const a of claves) {
       const v = raw[a];
       if (v === "todos") sel[a] = "todos";
       else if (Array.isArray(v)) {
@@ -2155,6 +2355,17 @@ async function resolverDestinatariosAnuncio(env, seleccionRaw) {
       if (aud) anadirDe(aud, u.email, u.nombre, null);
     }
   }
+  const clavesGrupo = Object.keys(sel).filter(esClaveGrupoAnuncio);
+  if (clavesGrupo.length) {
+    const datosGrupos = await leerGruposTrabajo(env);
+    const { results } = await env.DB.prepare(
+      "SELECT id, nombre, email FROM users WHERE activo = 1 AND rol IN ('admin', 'redactor') AND email IS NOT NULL AND TRIM(email) <> ''"
+    ).all();
+    for (const u of results || []) {
+      const gid = datosGrupos.asignaciones[String(u.id)];
+      if (gid && sel[ANUNCIO_PREFIJO_GRUPO + gid]) anadirDe(ANUNCIO_PREFIJO_GRUPO + gid, u.email, u.nombre, null);
+    }
+  }
   if (sel.lectores) {
     const { results } = await env.DB.prepare(
       "SELECT nombre, email FROM readers WHERE activo = 1 AND email_verificado = 1"
@@ -2171,8 +2382,12 @@ async function resolverDestinatariosAnuncio(env, seleccionRaw) {
 }
 
 // Resumen legible de la selección para el historial de actividad.
-function describirSeleccionAnuncio(sel) {
-  return Object.entries(sel).map(([a, v]) => v === "todos" ? a : `${a}: ${v.length} elegidos`).join(", ");
+function describirSeleccionAnuncio(sel, grupos) {
+  const nombres = new Map((grupos || []).map((g) => [ANUNCIO_PREFIJO_GRUPO + g.id, `grupo «${g.nombre}»`]));
+  return Object.entries(sel).map(([a, v]) => {
+    const etiqueta = nombres.get(a) || (esClaveGrupoAnuncio(a) ? "grupo de trabajo (eliminado)" : a);
+    return v === "todos" ? etiqueta : `${etiqueta}: ${v.length} elegidos`;
+  }).join(", ");
 }
 
 // Texto del admin -> párrafos HTML (todo escapado; saltos de línea respetados).
@@ -2211,6 +2426,1140 @@ function dormirMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
 // fallido). Así un envío cortado (pestaña cerrada, error de red) se reanuda sin repetir a quien ya lo
 // recibió, los fallidos se reintentan solo al reanudar y dos llamadas a la vez no mandan el mismo correo
 // (cada correo se "reclama" en la BD antes de enviarse).
+// ============================================================
+// REUNIONES (calendario para reuniones de cualquier motivo con los periodistas participantes)
+// El Responsable marca cuándo puede (y cuándo NO) en franjas de 30 min; cada periodista que entra
+// en /reuniones marca cuándo le viene bien y todos ven quién más ha marcado cada franja, para juntar
+// reuniones conjuntas. Horas = hora de Madrid, tal cual (sin zonas).
+//
+// ACCESO: la página y sus datos NO son públicos. Solo se entra con una sesión iniciada de una cuenta
+// del equipo (colaborador, redactor, Responsable...), igual que el modo "login" del formulario de
+// acreditación. No hay PIN ni código de acceso. La sesión se comprueba SIEMPRE en el servidor.
+//
+// Tablas creadas en caliente con DDL portable (D1 y PostgreSQL), igual que el podcast.
+//   reunions_franges  : una fila por franja marcada por el Responsable (clau = "YYYY-MM-DDTHH:MM")
+//                       estat = disponible | no_puc | confirmada (confirmada lleva grup, nota y enllac)
+//   reunions_persones : quien ha entrado en el calendario (pid público, secret privado para editarse)
+//   reunions_vots     : franjas marcadas por cada persona
+// (Los nombres de tablas/campos se mantienen para no romper los datos ya guardados.)
+// ============================================================
+let REUNIONS_TABLAS_LISTAS = false;
+async function asegurarTablasReunions(env) {
+  if (REUNIONS_TABLAS_LISTAS) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS reunions_franges (
+       clau TEXT PRIMARY KEY, estat TEXT NOT NULL, grup TEXT, enllac TEXT, nota TEXT, updated_at TEXT NOT NULL)`
+  ).run();
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS reunions_persones (
+       pid TEXT PRIMARY KEY, nom TEXT NOT NULL, secret TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`
+  ).run();
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS reunions_vots (
+       pid TEXT NOT NULL, clau TEXT NOT NULL, PRIMARY KEY (pid, clau))`
+  ).run();
+  // Cuenta del equipo a la que pertenece cada participante (para avisarle por push). Tablas ya
+  // existentes: se añade la columna en caliente; si ya está, el error se ignora.
+  try { await env.DB.prepare("ALTER TABLE reunions_persones ADD COLUMN user_id INTEGER").run(); } catch { /* ya existe */ }
+  REUNIONS_TABLAS_LISTAS = true;
+}
+
+const REUNIONS_CONFIG_DEFECTE = {
+  titol: "Reuniones",
+  descripcio: "Indique las franjas horarias en las que tiene disponibilidad. El Responsable convocará la reunión que corresponda, sea cual sea el motivo. Cuando coincidan varios participantes, la reunión se celebrará en grupo.",
+  obert: true,
+};
+// Textos que antes se guardaron en catalán: se sustituyen por los españoles (si el Responsable ya los
+// personalizó, se respetan tal cual).
+const REUNIONS_TEXTOS_ANTIGUOS = [
+  // Textos por defecto cuando las reuniones eran solo de acogida: pasan al texto general.
+  "Reuniones de acogida",
+  "Indique las franjas horarias en las que tiene disponibilidad. El Responsable convocará la reunión de acogida, en la que se explicará el funcionamiento del medio y se resolverán las dudas. Cuando coincidan varios participantes, la reunión se celebrará en grupo.",
+  "Marca los momentos que te vienen bien y te confirmaré una reunión para explicarte cómo funciona todo y resolver tus dudas. Si coincidimos varios periodistas, la haremos en grupo.",
+  "Reunions d'acollida",
+  "Marca els moments que et van bé i et confirmaré una reunió per explicar-te com funciona tot i resoldre dubtes. Si coincidiu diverses persones, ho farem en grup.",
+];
+// Ajustes que el Responsable cambia desde el panel (Funcionalidades > Reuniones).
+const REUNIONS_AJUSTES_DEFECTO = {
+  avisos: true,                 // enviar avisos push de las reuniones
+  avisosMinutos: [30, 10, 0],   // minutos antes del inicio (0 = al empezar)
+  unaPorPersona: true,          // regla "una reunión por persona"
+  correos: true,                // enviar correo a los convocados al convocar, cambiar o cancelar una reunión
+};
+const REUNIONS_AVISOS_MAX = 4;
+const REUNIONS_AVISO_MIN_MAX = 180;
+// Lista de minutos válida: enteros 0..180, sin repetir, de mayor a menor, como mucho 4.
+function reunionsMinutosAvisoLimpios(v) {
+  const l = Array.isArray(v) ? v : REUNIONS_AJUSTES_DEFECTO.avisosMinutos;
+  const out = [...new Set(l.map((x) => Math.round(Number(x))).filter((x) => Number.isFinite(x) && x >= 0 && x <= REUNIONS_AVISO_MIN_MAX))]
+    .sort((a, b) => b - a).slice(0, REUNIONS_AVISOS_MAX);
+  return out;
+}
+const REUNIONS_MAX_FRANGES_PER_PERSONA = 400;
+const REUNIONS_MAX_CANVIS = 700;
+
+// Lee la configuración (título, texto y si el calendario está abierto).
+async function reunionsLlegirConfig(env) {
+  let c = {};
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'reunions_config'").first();
+    c = row && row.value ? JSON.parse(row.value) : {};
+  } catch { c = {}; }
+  const titol = c.titol && !REUNIONS_TEXTOS_ANTIGUOS.includes(c.titol) ? c.titol : REUNIONS_CONFIG_DEFECTE.titol;
+  const descripcio = c.descripcio === undefined || REUNIONS_TEXTOS_ANTIGUOS.includes(c.descripcio)
+    ? REUNIONS_CONFIG_DEFECTE.descripcio : c.descripcio;
+  const cfg = {
+    titol: String(titol).slice(0, 80),
+    descripcio: String(descripcio).slice(0, 600),
+    obert: c.obert === undefined ? true : !!c.obert,
+    avisos: c.avisos === undefined ? REUNIONS_AJUSTES_DEFECTO.avisos : !!c.avisos,
+    avisosMinutos: c.avisosMinutos === undefined
+      ? [...REUNIONS_AJUSTES_DEFECTO.avisosMinutos] : reunionsMinutosAvisoLimpios(c.avisosMinutos),
+    unaPorPersona: c.unaPorPersona === undefined ? REUNIONS_AJUSTES_DEFECTO.unaPorPersona : !!c.unaPorPersona,
+    correos: c.correos === undefined ? REUNIONS_AJUSTES_DEFECTO.correos : !!c.correos,
+  };
+  return { cfg };
+}
+
+// Fecha/hora actual de Madrid como "YYYY-MM-DDTHH:MM" (para ocultar lo ya pasado).
+function reunionsAraMadrid() {
+  const p = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(new Date()).reduce((a, x) => { a[x.type] = x.value; return a; }, {});
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
+}
+
+const REUNIONS_RE_CLAU = /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):(00|30)$/;
+function reunionsClauValida(c) {
+  if (typeof c !== "string") return false;
+  const m = REUNIONS_RE_CLAU.exec(c);
+  if (!m) return false;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+  if (d.getUTCFullYear() !== +m[1] || d.getUTCMonth() !== +m[2] - 1 || d.getUTCDate() !== +m[3]) return false;
+  const dies = (d.getTime() - Date.now()) / 86400000;
+  return dies > -3 && dies < 400;
+}
+function reunionsClauSeguent(c) {
+  const m = REUNIONS_RE_CLAU.exec(c);
+  let min = +m[4] * 60 + +m[5] + 30;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+  if (min >= 1440) { min -= 1440; d.setUTCDate(d.getUTCDate() + 1); }
+  const hh = String(Math.floor(min / 60)).padStart(2, "0"), mm = String(min % 60).padStart(2, "0");
+  return `${d.toISOString().slice(0, 10)}T${hh}:${mm}`;
+}
+function reunionsTextNet(v, max) {
+  return String(v === null || v === undefined ? "" : v).replace(/\s+/g, " ").trim().slice(0, max);
+}
+function reunionsNouId() {
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+}
+function reunionsIgualSegur(a, b) {
+  a = String(a || ""); b = String(b || "");
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+async function reunionsBatch(env, sentencies) {
+  for (let i = 0; i < sentencies.length; i += 80) await env.DB.batch(sentencies.slice(i, i + 80));
+}
+
+// ---- Control de acceso (código o sesión del panel) ----
+// Devuelve { ok:true, staff:true, admin:boolean } o { ok:false, resp } con la respuesta de error ya construida.
+// Solo vale una sesión válida de una cuenta del equipo (mismo criterio que el modo "login" de acreditaciones).
+async function reunionsComprobarAcceso(request, env) {
+  let payload = null;
+  if ((request.headers.get("Authorization") || "").startsWith("Bearer ")) {
+    try { payload = await requireAuth(request, env); } catch { payload = null; }
+  }
+  if (!payload) {
+    return { ok: false, resp: json({ error: "Inicie sesión con su cuenta de colaborador para acceder a las reuniones.", requiereSesion: true }, 401) };
+  }
+  return { ok: true, staff: true, admin: esAdmin(payload), usuario: { nombre: payload.nombre || payload.username || "", uid: payload.uid || null } };
+}
+
+// Revisión barata del estado: cambia cuando cambia cualquier franja, participante, respuesta o ajuste.
+// El calendario la consulta cada pocos segundos para mostrarse "en vivo" sin descargar todo cada vez.
+async function reunionsRevision(env) {
+  const r = await env.DB.prepare(
+    `SELECT (SELECT COUNT(*) FROM reunions_franges) AS a,
+            (SELECT COALESCE(MAX(updated_at), '') FROM reunions_franges) AS b,
+            (SELECT COUNT(*) FROM reunions_persones) AS c,
+            (SELECT COALESCE(MAX(updated_at), '') FROM reunions_persones) AS d,
+            (SELECT COUNT(*) FROM reunions_vots) AS e`
+  ).first();
+  let cfg = "";
+  try {
+    const s = await env.DB.prepare("SELECT updated_at FROM settings WHERE key = 'reunions_config'").first();
+    cfg = (s && s.updated_at) || "";
+  } catch { cfg = ""; }
+  return [r && r.a, r && r.b, r && r.c, r && r.d, r && r.e, cfg].join("|");
+}
+
+// Regla "una reunión por persona": si una persona ya tiene una reunión programada, las demás reuniones
+// en las que figura quedan EN PAUSA (no se borra nada). Vale la que se programó primero (por fecha de
+// confirmación). Si esa se cancela, la siguiente vuelve a activarse sola, porque todo se calcula al leer.
+// Las reuniones ya celebradas no cuentan. Asistente = quien tiene marcada la primera franja de la reunión.
+function reunionsCalcularOcupacion(filas, vots, ara, unaPorPersona = true) {
+  if (!unaPorPersona) return { ocupats: [], suspesos: [] };
+  const grups = new Map();
+  for (const f of filas) {
+    if (f.estat !== "confirmada" || !f.grup) continue;
+    const g = grups.get(f.grup) || { grup: f.grup, ini: f.clau, fin: f.clau, ts: f.updated_at || "" };
+    if (f.clau < g.ini) g.ini = f.clau;
+    if (f.clau > g.fin) g.fin = f.clau;
+    if ((f.updated_at || "") < g.ts) g.ts = f.updated_at || "";
+    grups.set(f.grup, g);
+  }
+  const votsPer = new Map();
+  for (const v of vots) { if (!votsPer.has(v.clau)) votsPer.set(v.clau, []); votsPer.get(v.clau).push(v.pid); }
+  const perPersona = new Map();
+  for (const g of grups.values()) {
+    if (reunionsClauSeguent(g.fin) <= ara) continue; // ya celebrada
+    for (const pid of votsPer.get(g.ini) || []) {
+      if (!perPersona.has(pid)) perPersona.set(pid, []);
+      perPersona.get(pid).push(g);
+    }
+  }
+  const ocupats = [], suspesos = [];
+  for (const [pid, llista] of perPersona) {
+    llista.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : a.ini < b.ini ? -1 : 1));
+    ocupats.push({ pid, grup: llista[0].grup });
+    for (const g of llista.slice(1)) suspesos.push({ pid, grup: g.grup });
+  }
+  return { ocupats, suspesos };
+}
+
+// Estado completo que ve el calendario. admin = true añade lo privado (franjas "no puc", enlaces,
+// código). persona = la persona ya identificada (pid+secret válidos): ve el enlace de videollamada de
+// las reuniones confirmadas en las que está apuntada (y activa: no en pausa).
+async function reunionsEstat(env, admin, persona) {
+  await asegurarTablasReunions(env);
+  const ara = reunionsAraMadrid();
+  const limit = admin ? ara.slice(0, 10) + "T00:00" : ara;
+  const rev = await reunionsRevision(env); // antes de leer los datos: si cambian justo después, la siguiente consulta lo detecta
+  const [conf, fr, pe, vo] = await Promise.all([
+    reunionsLlegirConfig(env, admin),
+    env.DB.prepare("SELECT clau, estat, grup, enllac, nota, updated_at FROM reunions_franges WHERE clau >= ? ORDER BY clau").bind(limit).all(),
+    env.DB.prepare("SELECT pid, nom FROM reunions_persones ORDER BY nom").all(),
+    env.DB.prepare("SELECT pid, clau FROM reunions_vots WHERE clau >= ?").bind(limit).all(),
+  ]);
+  const vots = vo.results || [];
+  const filas = fr.results || [];
+  const { ocupats, suspesos } = reunionsCalcularOcupacion(filas, vots, ara, conf.cfg.unaPorPersona !== false);
+  const susp = new Set(suspesos.map((x) => x.pid + "|" + x.grup));
+  const mias = new Set(persona ? vots.filter((v) => v.pid === persona.pid).map((v) => v.clau) : []);
+  const franges = filas
+    .filter((f) => admin || (f.estat !== "no_puc" && f.estat !== "finalizada"))
+    .map((f) => ({
+      clau: f.clau, estat: f.estat, grup: f.grup || null, nota: f.nota || "",
+      ...(admin || (persona && f.estat === "confirmada" && mias.has(f.clau) && !susp.has(persona.pid + "|" + f.grup)) ? { enllac: f.enllac || "" } : {}),
+    }));
+  return { config: conf.cfg, franges, persones: pe.results || [], vots, ara, rev, ocupats, suspesos };
+}
+
+// Apunta a una persona a una reunión YA confirmada (grup): le marca todas las franjas de esa reunión.
+// Es lo mismo que haberla marcado antes de confirmarla (asistente = quien tiene la primera franja).
+// Una reunión ya celebrada no admite a nadie. Si la persona ya tiene otra reunión, esta queda en pausa
+// sola (regla de una reunión por persona, que se calcula al leer).
+async function reunionsUnirAGrupo(env, grup, pid) {
+  if (!/^[a-f0-9]{8,32}$/.test(String(grup || ""))) return { error: "Reunión no válida", status: 400 };
+  const { results } = await env.DB.prepare(
+    "SELECT clau FROM reunions_franges WHERE grup = ? AND estat = 'confirmada' ORDER BY clau"
+  ).bind(String(grup)).all();
+  const claus = (results || []).map((r) => r.clau);
+  if (!claus.length) return { error: "Esa reunión ya no está confirmada.", status: 404 };
+  if (reunionsClauSeguent(claus[claus.length - 1]) <= reunionsAraMadrid()) return { error: "Esa reunión ya ha terminado.", status: 409 };
+  const ara = new Date().toISOString();
+  const sentencies = [env.DB.prepare("UPDATE reunions_persones SET updated_at = ? WHERE pid = ?").bind(ara, pid)];
+  for (const c of claus) {
+    sentencies.push(env.DB.prepare("INSERT INTO reunions_vots (pid, clau) VALUES (?, ?) ON CONFLICT (pid, clau) DO NOTHING").bind(pid, c));
+  }
+  await reunionsBatch(env, sentencies);
+  return { ok: true, franjas: claus.length };
+}
+
+async function reunionsPersonaValida(env, pid, secret) {
+  if (!pid || !secret) return null;
+  const p = await env.DB.prepare("SELECT pid, nom, secret FROM reunions_persones WHERE pid = ?").bind(String(pid)).first();
+  return p && reunionsIgualSegur(p.secret, secret) ? p : null;
+}
+
+// ============================================================
+// AVISOS PUSH DE REUNIONES: 30 min antes, 10 min antes y al empezar.
+// Lo llama el cron de cada minuto (scheduled). Va por la campanita del equipo (categoría "reuniones"):
+// solo llega a admins / Nivel 4 que la tengan activada. Cada aviso se envía UNA sola vez por reunión
+// (tabla reunions_avisos). Una reunión en pausa (todos sus convocados tienen ya otra) no avisa;
+// si se reactiva antes de empezar, avisa entonces.
+// ============================================================
+let REUNIONS_AVISOS_LISTOS = false;
+async function reunionsAvisosAsegurar(env) {
+  if (REUNIONS_AVISOS_LISTOS) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS reunions_avisos (
+       grup TEXT NOT NULL, tipo TEXT NOT NULL, enviado_at TEXT NOT NULL, PRIMARY KEY (grup, tipo))`
+  ).run();
+  REUNIONS_AVISOS_LISTOS = true;
+}
+// Minutos que hay de la clave a a la clave b ("YYYY-MM-DDTHH:MM", hora de Madrid tal cual).
+function reunionsMinutosEntre(a, b) {
+  const t = (k) => Date.UTC(+k.slice(0, 4), +k.slice(5, 7) - 1, +k.slice(8, 10), +k.slice(11, 13), +k.slice(14, 16)) / 60000;
+  return t(b) - t(a);
+}
+// Qué aviso toca para una reunión que empieza dentro de m minutos. minutos = lista configurada
+// (p. ej. [30, 10, 0]). Cada aviso tiene su ventana: desde su minuto hasta el siguiente más pequeño
+// (el 0, "al empezar", admite 5 min de margen por si el cron se retrasa). Devuelve el minuto o null.
+function reunionsTipoAviso(m, minutos) {
+  const ks = reunionsMinutosAvisoLimpios(minutos);
+  for (let i = 0; i < ks.length; i++) {
+    const k = ks[i];
+    const inf = i + 1 < ks.length ? ks[i + 1] : (k === 0 ? -5 : 0);
+    if (m <= k && m > inf) return String(k);
+  }
+  return null;
+}
+
+async function reunionsAvisarProximas(env) {
+  try {
+    const { cfg } = await reunionsLlegirConfig(env);
+    if (!cfg.avisos || !cfg.avisosMinutos.length) return; // avisos desactivados desde el panel
+    const ara = reunionsAraMadrid();
+    const desde = ara.slice(0, 10) + "T00:00";
+    const manana = new Date(Date.UTC(+ara.slice(0, 4), +ara.slice(5, 7) - 1, +ara.slice(8, 10) + 1)).toISOString().slice(0, 10);
+    let res;
+    try {
+      res = await env.DB.prepare(
+        "SELECT clau, grup, nota FROM reunions_franges WHERE estat = 'confirmada' AND grup IS NOT NULL AND clau >= ? AND clau <= ? ORDER BY clau"
+      ).bind(desde, manana + "T04:00").all();
+    } catch { return; } // la tabla aún no existe: no hay reuniones
+    const filas = (res && res.results) || [];
+    if (!filas.length) return;
+    const grups = new Map();
+    for (const f of filas) {
+      const g = grups.get(f.grup) || { grup: f.grup, ini: f.clau, fin: f.clau, nota: f.nota || "" };
+      if (f.clau < g.ini) g.ini = f.clau;
+      if (f.clau > g.fin) g.fin = f.clau;
+      grups.set(f.grup, g);
+    }
+    // Qué aviso toca ahora según los minutos configurados en el panel (por defecto 30, 10 y al empezar).
+    const dues = [];
+    for (const g of grups.values()) {
+      const m = reunionsMinutosEntre(ara, g.ini);
+      const tipo = reunionsTipoAviso(m, cfg.avisosMinutos);
+      if (tipo !== null) dues.push({ ...g, m, tipo });
+    }
+    if (!dues.length) return;
+
+    await reunionsAvisosAsegurar(env);
+    const ya = await env.DB.prepare(
+      `SELECT grup, tipo FROM reunions_avisos WHERE grup IN (${dues.map(() => "?").join(",")})`
+    ).bind(...dues.map((d) => d.grup)).all();
+    const enviados = new Set(((ya && ya.results) || []).map((r) => r.grup + "|" + r.tipo));
+    const pendientes = dues.filter((d) => !enviados.has(d.grup + "|" + d.tipo));
+    if (!pendientes.length) return;
+
+    // Asistentes y pausas (regla de una reunión por persona).
+    await asegurarTablasReunions(env); // garantiza la columna user_id
+    const [fr, vo, pe] = await Promise.all([
+      env.DB.prepare("SELECT clau, estat, grup, enllac, nota, updated_at FROM reunions_franges WHERE clau >= ?").bind(desde).all(),
+      env.DB.prepare("SELECT pid, clau FROM reunions_vots WHERE clau >= ?").bind(desde).all(),
+      env.DB.prepare("SELECT pid, nom, user_id FROM reunions_persones").all(),
+    ]);
+    const vots = (vo && vo.results) || [];
+    const { suspesos } = reunionsCalcularOcupacion((fr && fr.results) || [], vots, ara, cfg.unaPorPersona);
+    const susp = new Set(suspesos.map((x) => x.pid + "|" + x.grup));
+    const nombres = new Map(((pe && pe.results) || []).map((p) => [p.pid, p.nom]));
+    // Cuenta de cada participante: la enlazada al guardar sus respuestas o, si es antiguo y aún no la
+    // tiene, la única cuenta activa con ese mismo nombre (si hay dudas, no se adivina).
+    const personas = new Map(((pe && pe.results) || []).map((p) => [p.pid, p]));
+    const { results: cuentasRaw } = await env.DB.prepare("SELECT id, nombre, rol FROM users WHERE activo = 1").all();
+    const cuentas = cuentasRaw || [];
+    const adminIds = cuentas.filter((c) => c.rol === "admin").map((c) => Number(c.id));
+    const cuentasPorNombre = new Map();
+    for (const c of cuentas) {
+      const k = String(c.nombre || "").trim().toLowerCase();
+      if (!k) continue;
+      cuentasPorNombre.set(k, [...(cuentasPorNombre.get(k) || []), Number(c.id)]);
+    }
+    const cuentaDe = (pid) => {
+      const p = personas.get(pid);
+      if (!p) return null;
+      if (p.user_id) return Number(p.user_id);
+      const l = cuentasPorNombre.get(String(p.nom || "").trim().toLowerCase());
+      return l && l.length === 1 ? l[0] : null;
+    };
+
+    for (const d of pendientes) {
+      const convocados = vots.filter((v) => v.clau === d.ini).map((v) => v.pid);
+      const activos = convocados.filter((p) => !susp.has(p + "|" + d.grup));
+      if (convocados.length && !activos.length) continue; // en pausa: no avisa
+      // Se "reclama" el aviso antes de enviarlo para que dos crons a la vez (D1 y Railway) no lo dupliquen.
+      const reclamo = await env.DB.prepare(
+        "INSERT INTO reunions_avisos (grup, tipo, enviado_at) VALUES (?, ?, ?) ON CONFLICT (grup, tipo) DO NOTHING"
+      ).bind(d.grup, d.tipo, new Date().toISOString()).run();
+      if (reclamo && reclamo.meta && reclamo.meta.changes === 0) continue; // otro cron lo reclamó justo antes
+      const quien = activos.map((p) => nombres.get(p)).filter(Boolean);
+      const hora = `${d.ini.slice(11, 16)}–${reunionsClauSeguent(d.fin).slice(11, 16)}`;
+      // Solo a los Responsables (admin) y a las personas convocadas a ESTA reunión.
+      const destinatarios = new Set(adminIds);
+      for (const p of activos) { const u = cuentaDe(p); if (u) destinatarios.add(u); }
+      const envio = await staffPushEnviar(env, "reuniones", {
+        titulo: d.tipo === "0" ? "Reunión: empieza ahora" : `Reunión en ${Math.max(1, Math.round(d.m))} min`,
+        cuerpo: `${d.nota || "Reunión"} · ${hora}${quien.length ? " · " + quien.join(", ") : ""}`,
+        url: `${SITIO_URL}/reuniones`,
+        tag: `reunion-${d.grup}-${d.tipo}`,
+      }, { ttl: 15 * 60, soloUids: [...destinatarios], cualquierCuenta: true });
+      // Si había a quién avisar y no ha llegado a nadie (servicio push caído, claves sin cargar, error),
+      // se suelta el reclamo: el siguiente minuto lo reintenta mientras siga dentro de su ventana.
+      // Antes el aviso quedaba como "enviado" aunque no hubiera salido y se perdía.
+      const fallo = !envio || envio.desactivado || envio.error || ((envio.destinatarios || 0) > 0 && !envio.enviados);
+      if (fallo) {
+        try { await env.DB.prepare("DELETE FROM reunions_avisos WHERE grup = ? AND tipo = ?").bind(d.grup, d.tipo).run(); } catch {}
+      }
+    }
+  } catch (err) {
+    console.error("[reunions] avisos push:", err && err.message);
+  }
+}
+
+// ============================================================
+// CORREOS DE REUNIONES: convocatoria, cambios y cancelación.
+// Al confirmar una reunión (y al reenviarla a mano desde la Agenda del panel) cada persona convocada recibe
+// un correo con fecha, horario, asunto, enlace de la videollamada y quién más está convocado. También
+// llega un correo si cambian el enlace o el asunto, y otro si se cancela. Los destinatarios son los
+// mismos a los que llegan los avisos push (quien marcó la primera franja y no está en pausa por la regla
+// de "una reunión por persona"), con el correo de su cuenta de colaborador activa. Quien no tiene cuenta
+// enlazada o no tiene correo entregable no puede recibirlo: se devuelve su nombre para que el Responsable
+// se lo comunique por otra vía. Se puede desactivar en Funcionalidades > Reuniones > Ajustes (correos).
+// ============================================================
+const REUNIONS_CORREO_TANDA = 4;           // correos en paralelo (Resend limita el ritmo por segundo)
+const REUNIONS_CORREO_PAUSA_MS = 400;
+const reunionsDormir = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function reunionsFechaLarga(clau) {
+  const d = new Date(Date.UTC(+clau.slice(0, 4), +clau.slice(5, 7) - 1, +clau.slice(8, 10), 12));
+  const t = new Intl.DateTimeFormat("es-ES", { timeZone: "UTC", weekday: "long", day: "numeric", month: "long", year: "numeric" }).format(d);
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+function reunionsFechaCorta(clau) {
+  const d = new Date(Date.UTC(+clau.slice(0, 4), +clau.slice(5, 7) - 1, +clau.slice(8, 10), 12));
+  return new Intl.DateTimeFormat("es-ES", { timeZone: "UTC", weekday: "long", day: "numeric", month: "long" }).format(d).replace(",", "");
+}
+
+// Datos de una reunión confirmada (todas sus franjas comparten enlace y nota).
+async function reunionsGrupoLeer(env, grup) {
+  const r = await env.DB.prepare(
+    "SELECT clau, nota, enllac FROM reunions_franges WHERE grup = ? AND estat = 'confirmada' ORDER BY clau"
+  ).bind(String(grup)).all();
+  const f = (r && r.results) || [];
+  if (!f.length) return null;
+  return { grup: String(grup), ini: f[0].clau, fin: f[f.length - 1].clau, nota: f[0].nota || "", enllac: f[0].enllac || "" };
+}
+
+// Reuniones en pausa ahora mismo ("pid|grup"), con la regla de una reunión por persona.
+async function reunionsSuspendidos(env, cfg) {
+  if (cfg.unaPorPersona === false) return new Set();
+  const ara = reunionsAraMadrid();
+  const desde = ara.slice(0, 10) + "T00:00";
+  const [fr, vo] = await Promise.all([
+    env.DB.prepare("SELECT clau, estat, grup, enllac, nota, updated_at FROM reunions_franges WHERE clau >= ?").bind(desde).all(),
+    env.DB.prepare("SELECT pid, clau FROM reunions_vots WHERE clau >= ?").bind(desde).all(),
+  ]);
+  const { suspesos } = reunionsCalcularOcupacion((fr && fr.results) || [], (vo && vo.results) || [], ara, true);
+  return new Set(suspesos.map((x) => x.pid + "|" + x.grup));
+}
+
+// Quien ya HA HECHO una reunión no vuelve a quedar convocado a otra salvo que lo vuelva a pedir: al
+// terminar (o al finalizarla a mano) se borran sus respuestas posteriores a esa reunión. Se conservan las
+// de la propia reunión (el registro de "Participaron"). Los que estaban en pausa NO la hicieron: no se tocan.
+function reunionsAsistentesDe(g, filas, vots, cfg) {
+  const { suspesos } = reunionsCalcularOcupacion(filas, vots, g.ini, cfg.unaPorPersona !== false);
+  const susp = new Set(suspesos.map((x) => x.pid + "|" + x.grup));
+  return [...new Set(vots.filter((v) => v.clau === g.ini).map((v) => v.pid))].filter((p) => !susp.has(p + "|" + g.grup));
+}
+async function reunionsBorrarVotosTrasReunion(env, pids, fin) {
+  if (!pids.length) return;
+  await reunionsBatch(env, pids.map((p) => env.DB.prepare("DELETE FROM reunions_vots WHERE pid = ? AND clau > ?").bind(p, fin)));
+}
+// Franjas y respuestas desde ayer (para poder reconstruir quién iba a una reunión que acaba de terminar).
+async function reunionsLeerDesdeAyer(env) {
+  const ara = reunionsAraMadrid();
+  const ayer = new Date(Date.UTC(+ara.slice(0, 4), +ara.slice(5, 7) - 1, +ara.slice(8, 10) - 1)).toISOString().slice(0, 10) + "T00:00";
+  const [fr, vo] = await Promise.all([
+    env.DB.prepare("SELECT clau, estat, grup, enllac, nota, updated_at FROM reunions_franges WHERE clau >= ?").bind(ayer).all(),
+    env.DB.prepare("SELECT pid, clau FROM reunions_vots WHERE clau >= ?").bind(ayer).all(),
+  ]);
+  return { ara, filas: (fr && fr.results) || [], vots: (vo && vo.results) || [] };
+}
+// Lo llama el cron de cada minuto: las reuniones confirmadas que ya han terminado (de ayer o de hoy)
+// consumen, una sola vez, las respuestas de quienes asistieron.
+async function reunionsConsumirVotos(env) {
+  try {
+    const { cfg } = await reunionsLlegirConfig(env);
+    let datos;
+    try { datos = await reunionsLeerDesdeAyer(env); } catch { return; } // la tabla aún no existe
+    let { ara, filas, vots } = datos;
+    const grups = new Map();
+    for (const f of filas) {
+      if (f.estat !== "confirmada" || !f.grup) continue;
+      const g = grups.get(f.grup) || { grup: f.grup, ini: f.clau, fin: f.clau };
+      if (f.clau < g.ini) g.ini = f.clau;
+      if (f.clau > g.fin) g.fin = f.clau;
+      grups.set(f.grup, g);
+    }
+    const pasadas = [...grups.values()].filter((g) => reunionsClauSeguent(g.fin) <= ara).sort((a, b) => (a.ini < b.ini ? -1 : 1));
+    if (!pasadas.length) return;
+    await reunionsAvisosAsegurar(env);
+    for (const g of pasadas) {
+      const reclamo = await env.DB.prepare(
+        "INSERT INTO reunions_avisos (grup, tipo, enviado_at) VALUES (?, 'consumida', ?) ON CONFLICT (grup, tipo) DO NOTHING"
+      ).bind(g.grup, new Date().toISOString()).run();
+      if (reclamo && reclamo.meta && reclamo.meta.changes === 0) continue; // ya consumida
+      const asistentes = reunionsAsistentesDe(g, filas, vots, cfg);
+      await reunionsBorrarVotosTrasReunion(env, asistentes, g.fin);
+      const set = new Set(asistentes);
+      vots = vots.filter((v) => !(set.has(v.pid) && v.clau > g.fin));
+    }
+  } catch (err) {
+    console.error("[reunions] consumir respuestas:", err && err.message);
+  }
+}
+
+// Prepara el envío: datos de la reunión y a quién le llega. null si no existe o ya se celebró.
+// soloPids (opcional) limita los destinatarios a esas personas (p. ej. quienes salen de pausa).
+async function reunionsPrepararCorreo(env, grup, cfg, soloPids = null) {
+  const d = await reunionsGrupoLeer(env, grup);
+  if (!d) return null;
+  const ara = reunionsAraMadrid();
+  if (reunionsClauSeguent(d.fin) <= ara) return null; // ya celebrada: no se avisa de nada
+  const [vo, pe, us, susp] = await Promise.all([
+    env.DB.prepare("SELECT pid, clau FROM reunions_vots WHERE clau = ?").bind(d.ini).all(),
+    env.DB.prepare("SELECT pid, nom, user_id FROM reunions_persones").all(),
+    env.DB.prepare("SELECT id, nombre, email FROM users WHERE activo = 1").all(),
+    reunionsSuspendidos(env, cfg),
+  ]);
+  const personas = new Map(((pe && pe.results) || []).map((p) => [p.pid, p]));
+  const cuentas = (us && us.results) || [];
+  const porId = new Map(cuentas.map((c) => [Number(c.id), c]));
+  const porNombre = new Map();
+  for (const c of cuentas) {
+    const k = String(c.nombre || "").trim().toLowerCase();
+    if (k) porNombre.set(k, [...(porNombre.get(k) || []), c]);
+  }
+  // Cuenta de cada participante: la enlazada al guardar sus respuestas o, si es antigua, la única cuenta
+  // activa con ese mismo nombre (con dudas no se adivina).
+  const cuentaDe = (p) => {
+    if (p.user_id && porId.has(Number(p.user_id))) return porId.get(Number(p.user_id));
+    const l = porNombre.get(String(p.nom || "").trim().toLowerCase());
+    return l && l.length === 1 ? l[0] : null;
+  };
+  const convocados = [...new Set(((vo && vo.results) || []).map((v) => v.pid))].filter((p) => personas.has(p));
+  const activos = convocados.filter((p) => !susp.has(p + "|" + grup));
+  const enPausa = convocados.filter((p) => susp.has(p + "|" + grup)).map((p) => personas.get(p).nom);
+  const destinos = [], sinCorreo = [], vistos = new Set();
+  for (const pid of activos) {
+    if (soloPids && !soloPids.includes(pid)) continue;
+    const p = personas.get(pid);
+    const c = cuentaDe(p);
+    const email = c ? String(c.email || "").trim() : "";
+    if (!c || !emailLectorEntregable(email)) { sinCorreo.push(p.nom); continue; }
+    if (vistos.has(email.toLowerCase())) continue; // dos participantes con la misma cuenta: un solo correo
+    vistos.add(email.toLowerCase());
+    destinos.push({ pid, nombre: String(p.nom || c.nombre || "").trim(), email });
+  }
+  return { d, destinos, sinCorreo, enPausa, nombresConvocados: activos.map((p) => personas.get(p).nom).filter(Boolean) };
+}
+
+// Asunto, texto y HTML del correo. tipo: convocatoria | actualizada | cancelada.
+function reunionsCorreoContenido(tipo, d, nombre, convocados) {
+  const hora = `${d.ini.slice(11, 16)}–${reunionsClauSeguent(d.fin).slice(11, 16)}`;
+  const fecha = reunionsFechaLarga(d.ini.slice(0, 10));
+  const primer = String(nombre || "").trim().split(/\s+/)[0];
+  const saludo = primer ? `Hola ${primer},` : "Hola,";
+  const antesTxt = d.antes
+    ? `${reunionsFechaLarga(d.antes.ini.slice(0, 10))}, ${d.antes.ini.slice(11, 16)}–${reunionsClauSeguent(d.antes.fin).slice(11, 16)}`
+    : "";
+  const T = {
+    aplazada: {
+      etiqueta: "Reunión aplazada", titulo: "Reunión aplazada", tono: "aviso",
+      asunto: `Reunión aplazada · nueva fecha: ${reunionsFechaCorta(d.ini.slice(0, 10))}, ${hora}`,
+      intro: `${saludo} hemos aplazado la reunión de ElOtroFútbol a la que estás convocado/a. Esta es la nueva fecha:`,
+      cierre: "Si la nueva fecha no te viene bien, responde a este correo y buscamos otra.",
+    },
+    convocatoria: {
+      etiqueta: "Convocatoria", titulo: "Reunión de ElOtroFútbol", tono: "marca",
+      asunto: `Convocatoria · Reunión de ElOtroFútbol · ${reunionsFechaCorta(d.ini.slice(0, 10))}, ${hora}`,
+      intro: `${saludo} te convocamos a una reunión de ElOtroFútbol. Estos son los datos:`,
+      cierre: "Se ruega puntualidad. Si no puedes asistir, avísanos con antelación respondiendo a este correo.",
+    },
+    actualizada: {
+      etiqueta: "Reunión actualizada", titulo: "Hemos actualizado la reunión", tono: "aviso",
+      asunto: `Reunión actualizada · ${reunionsFechaCorta(d.ini.slice(0, 10))}, ${hora}`,
+      intro: `${saludo} hemos cambiado el enlace o el asunto de la reunión a la que estás convocado/a. La fecha y el horario no cambian. Estos son los datos vigentes:`,
+      cierre: "Si algo no te cuadra, responde a este correo y lo vemos.",
+    },
+    cancelada: {
+      etiqueta: "Reunión cancelada", titulo: "Reunión cancelada", tono: "aviso",
+      asunto: `Reunión cancelada · ${reunionsFechaCorta(d.ini.slice(0, 10))}, ${hora}`,
+      intro: `${saludo} lamentamos informarte de que se ha cancelado la siguiente reunión de ElOtroFútbol:`,
+      cierre: "Si hace falta, te convocaremos de nuevo. Puedes volver a marcar tu disponibilidad en el calendario de reuniones.",
+    },
+  }[tipo];
+  const cancelada = tipo === "cancelada";
+  const enlaceSeguro = d.enllac && /^https:\/\//i.test(d.enllac) ? d.enllac.replace(/["'<>\s]/g, (c) => encodeURIComponent(c)) : "";
+  const filas = [
+    { etiqueta: "Fecha", valor: fecha },
+    { etiqueta: "Horario", valor: `${hora} (hora de Madrid)` },
+    ...(tipo === "aplazada" && antesTxt ? [{ etiqueta: "Antes estaba prevista", valor: antesTxt }] : []),
+    { etiqueta: "Asunto", valor: d.nota },
+    ...(!cancelada && d.enllac ? [{ etiqueta: "Videollamada", valor: d.enllac }] : []),
+    ...(!cancelada && convocados && convocados.length ? [{ etiqueta: "Convocados", valor: convocados.join(", ") }] : []),
+  ];
+  const calendario = `${SITIO_URL}/reuniones`;
+  const boton = !cancelada && enlaceSeguro
+    ? { texto: "Unirme a la videollamada", url: enlaceSeguro }
+    : { texto: "Ver el calendario de reuniones", url: calendario };
+  const texto = [
+    T.intro, "",
+    ...filas.filter((f) => f.valor).map((f) => `${f.etiqueta}: ${f.valor}`),
+    "", T.cierre, "",
+    ...(!cancelada && !d.enllac ? [`Calendario de reuniones: ${calendario}`, ""] : []),
+    "Equipo de ElOtroFútbol", SITIO_URL,
+  ].join("\n");
+  const html = plantillaEmail({
+    etiqueta: T.etiqueta, titulo: T.titulo, tono: T.tono, preheader: T.intro, parrafo: T.intro, filas, boton,
+    bloqueHtml: `<p style="margin:4px 0 0;font-size:14px;line-height:1.6;color:#5a6270;">${escapeHtmlEmail(T.cierre)}</p>`,
+    pieHtml: "Recibes este correo porque estás convocado/a a una reunión de ElOtroFútbol. Puedes responder a este mensaje si tienes cualquier duda.",
+  });
+  return { asunto: T.asunto, texto, html };
+}
+
+// Envía a cada destinatario (en tandas pequeñas y con un reintento si Resend limita el ritmo).
+async function reunionsEnviarCorreo(env, tipo, prep) {
+  const resumen = {
+    activado: true, configurado: cuentasResend(env).length > 0, total: prep.destinos.length, enviados: 0,
+    fallidos: [], sinCorreo: prep.sinCorreo, enPausa: prep.enPausa,
+  };
+  if (!resumen.configurado || !prep.destinos.length) return resumen;
+  for (let i = 0; i < prep.destinos.length; i += REUNIONS_CORREO_TANDA) {
+    await Promise.all(prep.destinos.slice(i, i + REUNIONS_CORREO_TANDA).map(async (x) => {
+      const c = reunionsCorreoContenido(tipo, prep.d, x.nombre, prep.nombresConvocados);
+      let ok = false;
+      for (let intento = 0; intento < 2 && !ok; intento++) {
+        try {
+          const resp = await enviarConResend(env, { to: [x.email], subject: c.asunto, text: c.texto, html: c.html, reply_to: EMAIL_NOTIFICACIONES });
+          ok = !!(resp && resp.ok);
+          if (ok) break;
+          console.log("[reunions] correo no enviado a", x.email, resp && resp.status);
+          if (!resp || !(resp.status === 429 || resp.status >= 500)) break;
+        } catch (err) { console.log("[reunions] error enviando correo:", err && err.message); }
+        if (intento === 0) await reunionsDormir(1200);
+      }
+      if (ok) resumen.enviados++; else resumen.fallidos.push(x.nombre);
+    }));
+    if (i + REUNIONS_CORREO_TANDA < prep.destinos.length) await reunionsDormir(REUNIONS_CORREO_PAUSA_MS);
+  }
+  return resumen;
+}
+
+// Tras dejar de contar una reunión (finalizada), quien estaba en pausa por ella y queda libre recibe la
+// convocatoria de su siguiente reunión. antes = reunionsSuspendidos() previo al cambio. Devuelve cuántos correos.
+async function reunionsEnviarLiberados(env, cfg, antes, grupExcluido) {
+  const despues = await reunionsSuspendidos(env, cfg);
+  const liberados = new Map();
+  for (const k of antes) {
+    if (despues.has(k)) continue;
+    const [pid, gr] = k.split("|");
+    if (gr === grupExcluido) continue;
+    liberados.set(gr, [...(liberados.get(gr) || []), pid]);
+  }
+  let n = 0;
+  for (const [gr, pids] of liberados) {
+    const p = await reunionsPrepararCorreo(env, gr, cfg, pids);
+    if (p && p.destinos.length) { const r = await reunionsEnviarCorreo(env, "convocatoria", p); n += r.enviados; }
+  }
+  return n;
+}
+
+// Prepara y envía en un solo paso; nunca lanza (un fallo de correo no debe romper confirmar/editar/cancelar).
+async function reunionsCorreoDeReunion(env, tipo, grup, cfg) {
+  try {
+    const prep = await reunionsPrepararCorreo(env, grup, cfg);
+    return prep ? await reunionsEnviarCorreo(env, tipo, prep) : null;
+  } catch (err) {
+    console.error("[reunions] correo:", err && err.message);
+    return { activado: true, error: true, configurado: true, total: 0, enviados: 0, fallidos: [], sinCorreo: [], enPausa: [] };
+  }
+}
+
+// Convocatoria por correo SOLO a la persona que acaba de unirse a una reunión ya confirmada (si los correos
+// están activados, tiene cuenta con correo entregable y su reunión no está en pausa). Nunca lanza.
+async function reunionsCorreoUnido(env, grup, pid) {
+  try {
+    const { cfg } = await reunionsLlegirConfig(env);
+    if (!cfg.correos) return { activado: false, enviados: 0 };
+    const prep = await reunionsPrepararCorreo(env, grup, cfg, [pid]);
+    return prep && prep.destinos.length ? await reunionsEnviarCorreo(env, "convocatoria", prep) : { activado: true, enviados: 0 };
+  } catch (err) {
+    console.error("[reunions] correo al unirse:", err && err.message);
+    return { activado: true, enviados: 0, error: true };
+  }
+}
+
+// Devuelve una Response si la ruta es de reuniones; null si no lo es.
+async function manejarReunions(request, env, ctx, path, method) {
+  if (!path.startsWith("/api/reunions")) return null;
+  try {
+    // ---------- PARTICIPANTES (sesión de cuenta del equipo) ----------
+    if (path.startsWith("/api/reunions/public")) {
+      if (method !== "POST") return json({ error: "Método no permitido" }, 405);
+      const body = await request.json().catch(() => null);
+      if (!body || typeof body !== "object") return json({ error: "Petición no válida" }, 400);
+
+      if (path === "/api/reunions/public/baixa") {
+        // Darse de baja solo necesita la identidad de la persona (pid + secreto), no el código.
+        if (await limiteExcedido(request, env, "reunions-baixa", 20, 3600)) return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        await asegurarTablasReunions(env);
+        const persona = await reunionsPersonaValida(env, body.pid, body.secret);
+        if (!persona) return json({ error: "No se ha podido verificar su identidad." }, 403);
+        await reunionsBatch(env, [
+          env.DB.prepare("DELETE FROM reunions_vots WHERE pid = ?").bind(persona.pid),
+          env.DB.prepare("DELETE FROM reunions_persones WHERE pid = ?").bind(persona.pid),
+        ]);
+        return json({ ok: true });
+      }
+
+      const acceso = await reunionsComprobarAcceso(request, env);
+      if (!acceso.ok) return acceso.resp;
+
+      // Comprobación de la sesión (pantalla de entrada).
+      if (path === "/api/reunions/public/acceso") return json({ ok: true, usuario: acceso.usuario || null });
+
+      // Pulso del modo "en vivo": revisión del estado + hora de Madrid. Muy barato; el cliente lo pide cada pocos segundos.
+      if (path === "/api/reunions/public/pulso") {
+        await asegurarTablasReunions(env);
+        return json({ rev: await reunionsRevision(env), ara: reunionsAraMadrid() });
+      }
+
+      if (path === "/api/reunions/public/estado") {
+        await asegurarTablasReunions(env);
+        const persona = await reunionsPersonaValida(env, body.pid, body.secret);
+        const e = await reunionsEstat(env, !!acceso.admin, persona);
+        if (!e.config.obert && !acceso.admin) return json({ config: e.config, franges: [], persones: [], vots: [], ara: e.ara });
+        return json(e);
+      }
+
+      if (path === "/api/reunions/public/vots") {
+        if (await limiteExcedido(request, env, "reunions-vots", 40, 3600)) return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        if (body.web) return json({ ok: true }); // campo trampa para bots
+        await asegurarTablasReunions(env);
+        const { cfg: config } = await reunionsLlegirConfig(env, false);
+        if (!config.obert) return json({ error: "El calendario no admite nuevas respuestas en este momento." }, 403);
+
+        const nom = reunionsTextNet(body.nom, 40);
+        if (nom.length < 2) return json({ error: "Indique su nombre y apellidos." }, 400);
+        if (!Array.isArray(body.claus) || body.claus.length > REUNIONS_MAX_FRANGES_PER_PERSONA) return json({ error: "Franjas no válidas" }, 400);
+        const claus = [...new Set(body.claus)];
+        if (!claus.every(reunionsClauValida)) return json({ error: "Hay una franja no válida" }, 400);
+
+        let persona = await reunionsPersonaValida(env, body.pid, body.secret);
+        const ara = new Date().toISOString();
+        if (!persona) {
+          const repetit = await env.DB.prepare("SELECT pid FROM reunions_persones WHERE LOWER(nom) = ?").bind(nom.toLowerCase()).first();
+          if (repetit) return json({ error: "Ya existe un participante con ese nombre. Añada su segundo apellido o, si se trata de usted, acceda desde el mismo dispositivo." }, 409);
+          persona = { pid: reunionsNouId(), secret: reunionsNouId() + reunionsNouId(), nom };
+          await env.DB.prepare("INSERT INTO reunions_persones (pid, nom, secret, created_at, updated_at, user_id) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(persona.pid, nom, persona.secret, ara, ara, (acceso.usuario && acceso.usuario.uid) || null).run();
+        } else if (persona.nom !== nom) {
+          const repetit = await env.DB.prepare("SELECT pid FROM reunions_persones WHERE LOWER(nom) = ? AND pid <> ?").bind(nom.toLowerCase(), persona.pid).first();
+          if (repetit) return json({ error: "Ya existe un participante con ese nombre." }, 409);
+          await env.DB.prepare("UPDATE reunions_persones SET nom = ?, updated_at = ? WHERE pid = ?").bind(nom, ara, persona.pid).run();
+        }
+
+        // Solo se aceptan franjas abiertas por el Responsable (o las que esa persona ya tenía, p. ej. una confirmada).
+        const [obertes, previs] = await Promise.all([
+          env.DB.prepare("SELECT clau FROM reunions_franges WHERE estat = 'disponible'").all(),
+          env.DB.prepare("SELECT clau FROM reunions_vots WHERE pid = ?").bind(persona.pid).all(),
+        ]);
+        const permeses = new Set([...(obertes.results || []).map((r) => r.clau)]);
+        const previSet = new Set((previs.results || []).map((r) => r.clau));
+        const finals = claus.filter((c) => permeses.has(c) || previSet.has(c));
+        // updated_at de la persona se renueva en cada guardado: así el modo "en vivo" detecta el cambio aunque el nº de franjas no varíe.
+        const sentencies = [
+          env.DB.prepare("DELETE FROM reunions_vots WHERE pid = ?").bind(persona.pid),
+          env.DB.prepare("UPDATE reunions_persones SET updated_at = ?, user_id = COALESCE(?, user_id) WHERE pid = ?")
+            .bind(ara, (acceso.usuario && acceso.usuario.uid) || null, persona.pid),
+        ];
+        for (const c of finals) {
+          sentencies.push(env.DB.prepare("INSERT INTO reunions_vots (pid, clau) VALUES (?, ?) ON CONFLICT (pid, clau) DO NOTHING").bind(persona.pid, c));
+        }
+        await reunionsBatch(env, sentencies);
+        return json({ ok: true, pid: persona.pid, secret: persona.secret, nom, desades: finals.length });
+      }
+      // Unirse a una reunión ya confirmada (el participante, o alguien nuevo con su nombre).
+      if (path === "/api/reunions/public/unirse") {
+        if (await limiteExcedido(request, env, "reunions-unirse", 40, 3600)) return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        if (body.web) return json({ ok: true }); // campo trampa para bots
+        await asegurarTablasReunions(env);
+        const { cfg: configU } = await reunionsLlegirConfig(env, false);
+        if (!configU.obert) return json({ error: "El calendario no admite nuevas respuestas en este momento." }, 403);
+        const nomU = reunionsTextNet(body.nom, 40);
+        let personaU = await reunionsPersonaValida(env, body.pid, body.secret);
+        const araU = new Date().toISOString();
+        if (!personaU) {
+          if (nomU.length < 2) return json({ error: "Indique su nombre y apellidos." }, 400);
+          const repetitU = await env.DB.prepare("SELECT pid FROM reunions_persones WHERE LOWER(nom) = ?").bind(nomU.toLowerCase()).first();
+          if (repetitU) return json({ error: "Ya existe un participante con ese nombre. Añada su segundo apellido o, si se trata de usted, acceda desde el mismo dispositivo." }, 409);
+          personaU = { pid: reunionsNouId(), secret: reunionsNouId() + reunionsNouId(), nom: nomU };
+          await env.DB.prepare("INSERT INTO reunions_persones (pid, nom, secret, created_at, updated_at, user_id) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(personaU.pid, nomU, personaU.secret, araU, araU, (acceso.usuario && acceso.usuario.uid) || null).run();
+        }
+        const ru = await reunionsUnirAGrupo(env, body.grup, personaU.pid);
+        if (ru.error) return json({ error: ru.error }, ru.status);
+        const correoU = await reunionsCorreoUnido(env, String(body.grup), personaU.pid);
+        return json({ ok: true, pid: personaU.pid, secret: personaU.secret, nom: personaU.nom, correo: { enviados: correoU.enviados || 0 } });
+      }
+      return json({ error: "No encontrado" }, 404);
+    }
+
+    // ---------- ADMIN (solo Responsables) ----------
+    if (path.startsWith("/api/reunions/admin")) {
+      const payload = await requireAuth(request, env);
+      if (!payload) return json({ error: "No autorizado" }, 401);
+      if (!esAdmin(payload)) return json({ error: "Solo un Responsable puede gestionar el calendario de reuniones" }, 403);
+      await asegurarTablasReunions(env);
+
+      if (path === "/api/reunions/admin" && method === "GET") return json(await reunionsEstat(env, true, null));
+
+      if (path === "/api/reunions/admin/config" && method === "PUT") {
+        const b = await request.json().catch(() => null);
+        if (!b) return json({ error: "Cuerpo no válido" }, 400);
+        // Lo que no llega en la petición se conserva tal cual (la página /reuniones solo envía título,
+        // texto y abierto; el panel de admin envía además los avisos y la regla de una reunión por persona).
+        const { cfg: act } = await reunionsLlegirConfig(env);
+        if (b.avisosMinutos !== undefined && (!Array.isArray(b.avisosMinutos)
+          || b.avisosMinutos.some((x) => !Number.isFinite(Number(x)) || Number(x) < 0 || Number(x) > REUNIONS_AVISO_MIN_MAX))) {
+          return json({ error: `Los avisos deben ser minutos entre 0 y ${REUNIONS_AVISO_MIN_MAX}.` }, 400);
+        }
+        if (Array.isArray(b.avisosMinutos) && new Set(b.avisosMinutos.map((x) => Math.round(Number(x)))).size > REUNIONS_AVISOS_MAX) {
+          return json({ error: `Como máximo ${REUNIONS_AVISOS_MAX} avisos por reunión.` }, 400);
+        }
+        const c = {
+          titol: b.titol === undefined ? act.titol : (reunionsTextNet(b.titol, 80) || REUNIONS_CONFIG_DEFECTE.titol),
+          descripcio: b.descripcio === undefined ? act.descripcio : String(b.descripcio || "").replace(/\r/g, "").trim().slice(0, 600),
+          obert: b.obert === undefined ? act.obert : !!b.obert,
+          avisos: b.avisos === undefined ? act.avisos : !!b.avisos,
+          avisosMinutos: b.avisosMinutos === undefined ? act.avisosMinutos : reunionsMinutosAvisoLimpios(b.avisosMinutos),
+          unaPorPersona: b.unaPorPersona === undefined ? act.unaPorPersona : !!b.unaPorPersona,
+          correos: b.correos === undefined ? act.correos : !!b.correos,
+        };
+        await env.DB.prepare(
+          `INSERT INTO settings (key, value, updated_at) VALUES ('reunions_config', ?, datetime('now'))
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+        ).bind(JSON.stringify(c)).run();
+        return json({ ok: true, config: c });
+      }
+
+      // Marca en bloque: estat = disponible | no_puc | buit (borra). Las confirmadas no se tocan.
+      if (path === "/api/reunions/admin/franges" && method === "PUT") {
+        const b = await request.json().catch(() => null);
+        if (!b || !["disponible", "no_puc", "buit"].includes(b.estat) || !Array.isArray(b.claus)) return json({ error: "Petición no válida" }, 400);
+        const claus = [...new Set(b.claus)];
+        if (!claus.length || claus.length > REUNIONS_MAX_CANVIS) return json({ error: `Se admiten, como máximo, ${REUNIONS_MAX_CANVIS} franjas por operación.` }, 400);
+        if (!claus.every(reunionsClauValida)) return json({ error: "Hay una franja no válida" }, 400);
+        const ja = await env.DB.prepare("SELECT clau FROM reunions_franges WHERE estat IN ('confirmada', 'finalizada')").all();
+        const confirmades = new Set((ja.results || []).map((r) => r.clau));
+        const aplicables = claus.filter((c) => !confirmades.has(c));
+        const ara = new Date().toISOString();
+        const s = [];
+        for (const c of aplicables) {
+          if (b.estat === "buit") s.push(env.DB.prepare("DELETE FROM reunions_franges WHERE clau = ?").bind(c));
+          else s.push(env.DB.prepare(
+            `INSERT INTO reunions_franges (clau, estat, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT (clau) DO UPDATE SET estat = excluded.estat, updated_at = excluded.updated_at`
+          ).bind(c, b.estat, ara));
+          // Una franja que ya no está disponible no puede conservar votos.
+          if (b.estat !== "disponible") s.push(env.DB.prepare("DELETE FROM reunions_vots WHERE clau = ?").bind(c));
+        }
+        await reunionsBatch(env, s);
+        return json({ ok: true, aplicades: aplicables.length, saltades: claus.length - aplicables.length });
+      }
+
+      // Confirma una reunión: ocupa N franjas seguidas desde clau.
+      if (path === "/api/reunions/admin/confirmar" && method === "POST") {
+        const b = await request.json().catch(() => null);
+        if (!b || !reunionsClauValida(b.clau)) return json({ error: "Franja no válida" }, 400);
+        const n = Math.min(8, Math.max(1, parseInt(b.franges, 10) || 2));
+        const claus = [b.clau];
+        while (claus.length < n) claus.push(reunionsClauSeguent(claus[claus.length - 1]));
+        const ocupades = await env.DB.prepare(
+          `SELECT clau FROM reunions_franges WHERE estat IN ('confirmada', 'finalizada') AND clau IN (${claus.map(() => "?").join(",")})`
+        ).bind(...claus).all();
+        if ((ocupades.results || []).length) return json({ error: "Ya existe una reunión confirmada en esa franja." }, 409);
+        const grup = reunionsNouId();
+        const nota = reunionsTextNet(b.nota, 140);
+        let enllac = String(b.enllac || "").trim().slice(0, 400);
+        if (enllac && !/^https:\/\//i.test(enllac)) return json({ error: "El enlace debe comenzar por https://" }, 400);
+        const ara = new Date().toISOString();
+        const s = claus.map((c) => env.DB.prepare(
+          `INSERT INTO reunions_franges (clau, estat, grup, enllac, nota, updated_at) VALUES (?, 'confirmada', ?, ?, ?, ?)
+           ON CONFLICT (clau) DO UPDATE SET estat = 'confirmada', grup = excluded.grup, enllac = excluded.enllac, nota = excluded.nota, updated_at = excluded.updated_at`
+        ).bind(c, grup, enllac || null, nota || null, ara));
+        await reunionsBatch(env, s);
+        const { cfg: cfgC } = await reunionsLlegirConfig(env);
+        const correo = cfgC.correos ? await reunionsCorreoDeReunion(env, "convocatoria", grup, cfgC) : { activado: false };
+        return json({ ok: true, grup, claus, correo });
+      }
+
+      // El Responsable apunta a un participante ya existente a una reunión ya confirmada.
+      if (path === "/api/reunions/admin/unir" && method === "POST") {
+        const b = await request.json().catch(() => null);
+        if (!b || !/^[a-f0-9]{8,32}$/.test(String(b.grup || ""))) return json({ error: "Reunión no válida" }, 400);
+        const pe = await env.DB.prepare("SELECT pid FROM reunions_persones WHERE pid = ?").bind(String(b.pid || "")).first();
+        if (!pe) return json({ error: "No se encontró a ese participante" }, 404);
+        const ru = await reunionsUnirAGrupo(env, String(b.grup), pe.pid);
+        if (ru.error) return json({ error: ru.error }, ru.status);
+        const correoA = await reunionsCorreoUnido(env, String(b.grup), pe.pid);
+        return json({ ok: true, correo: correoA });
+      }
+
+      // Cambia el enlace y la nota de una reunión ya confirmada. No toca updated_at a propósito: de él depende
+      // qué reunión se programó primero (regla de una reunión por persona) y editar un texto no debe reordenarlas.
+      if (path === "/api/reunions/admin/editar" && method === "POST") {
+        const b = await request.json().catch(() => null);
+        if (!b || !/^[a-f0-9]{8,32}$/.test(String(b.grup || ""))) return json({ error: "Reunión no válida" }, 400);
+        const nota = reunionsTextNet(b.nota, 140);
+        const enllac = String(b.enllac || "").trim().slice(0, 400);
+        if (enllac && !/^https:\/\//i.test(enllac)) return json({ error: "El enlace debe comenzar por https://" }, 400);
+        const previa = await reunionsGrupoLeer(env, String(b.grup));
+        const r = await env.DB.prepare(
+          "UPDATE reunions_franges SET enllac = ?, nota = ? WHERE grup = ? AND estat = 'confirmada'"
+        ).bind(enllac || null, nota || null, String(b.grup)).run();
+        if (r && r.meta && r.meta.changes === 0) return json({ error: "No se encontró esa reunión" }, 404);
+        // Solo se avisa si cambia algo que les afecta (enlace o asunto), no por guardar sin tocar nada.
+        const cambio = !previa || (previa.enllac || "") !== enllac || (previa.nota || "") !== nota;
+        const { cfg: cfgE } = await reunionsLlegirConfig(env);
+        const correo = cambio && cfgE.correos ? await reunionsCorreoDeReunion(env, "actualizada", String(b.grup), cfgE) : { activado: !!cfgE.correos };
+        return json({ ok: true, correo });
+      }
+
+      if (path === "/api/reunions/admin/cancelar" && method === "POST") {
+        const b = await request.json().catch(() => null);
+        if (!b || !/^[a-f0-9]{8,32}$/.test(String(b.grup || ""))) return json({ error: "Reunión no válida" }, 400);
+        const grupC = String(b.grup);
+        const { cfg: cfgX } = await reunionsLlegirConfig(env);
+        // Los datos y los destinatarios hay que leerlos ANTES de cancelar (después ya no hay reunión).
+        let prepX = null, antes = new Set();
+        if (cfgX.correos) {
+          try { prepX = await reunionsPrepararCorreo(env, grupC, cfgX); antes = await reunionsSuspendidos(env, cfgX); } catch (err) { console.error("[reunions] correo (cancelar):", err && err.message); }
+        }
+        await env.DB.prepare(
+          "UPDATE reunions_franges SET estat = 'disponible', grup = NULL, enllac = NULL, nota = NULL, updated_at = ? WHERE grup = ?"
+        ).bind(new Date().toISOString(), grupC).run();
+        let correo = { activado: !!cfgX.correos };
+        if (cfgX.correos) {
+          try {
+            if (prepX) correo = await reunionsEnviarCorreo(env, "cancelada", prepX);
+            // Quien estaba en pausa por esta reunión y ahora queda libre recibe la convocatoria de la suya
+            // (igual que el aviso push, que "reactiva" la reunión).
+            const despues = await reunionsSuspendidos(env, cfgX);
+            const liberados = new Map();
+            for (const k of antes) {
+              if (despues.has(k)) continue;
+              const [pid, gr] = k.split("|");
+              if (gr === grupC) continue;
+              liberados.set(gr, [...(liberados.get(gr) || []), pid]);
+            }
+            let reactivadas = 0;
+            for (const [gr, pids] of liberados) {
+              const p = await reunionsPrepararCorreo(env, gr, cfgX, pids);
+              if (p && p.destinos.length) { const r = await reunionsEnviarCorreo(env, "convocatoria", p); reactivadas += r.enviados; }
+            }
+            if (reactivadas) correo = { ...(correo || {}), reactivadas };
+          } catch (err) { console.error("[reunions] correo (cancelar):", err && err.message); }
+        }
+        return json({ ok: true, correo });
+      }
+
+      // Da por finalizada una reunión (o la reabre con finalizada:false). La finalizada deja de contar
+      // (no avisa, no ocupa a nadie y no se puede pisar), pero queda registrada. No toca updated_at para
+      // no alterar el orden de prioridad si se reabre.
+      if (path === "/api/reunions/admin/finalizar" && method === "POST") {
+        const b = await request.json().catch(() => null);
+        if (!b || !/^[a-f0-9]{8,32}$/.test(String(b.grup || ""))) return json({ error: "Reunión no válida" }, 400);
+        const grupF = String(b.grup);
+        const reabrir = b.finalizada === false;
+        const { cfg: cfgF } = await reunionsLlegirConfig(env);
+        // Quién asistió se calcula ANTES de finalizar (después la reunión ya no cuenta para la regla de pausa).
+        let asistentesF = [], finF = null;
+        if (!reabrir) {
+          try {
+            const gF = await reunionsGrupoLeer(env, grupF);
+            if (gF) { const d = await reunionsLeerDesdeAyer(env); asistentesF = reunionsAsistentesDe(gF, d.filas, d.vots, cfgF); finF = gF.fin; }
+          } catch (err) { console.error("[reunions] consumir respuestas (finalizar):", err && err.message); }
+        }
+        let antesF = new Set();
+        if (!reabrir && cfgF.correos) { try { antesF = await reunionsSuspendidos(env, cfgF); } catch (err) { console.error("[reunions] correo (finalizar):", err && err.message); } }
+        const rF = await env.DB.prepare(
+          "UPDATE reunions_franges SET estat = ? WHERE grup = ? AND estat = ?"
+        ).bind(reabrir ? "confirmada" : "finalizada", grupF, reabrir ? "finalizada" : "confirmada").run();
+        if (rF && rF.meta && rF.meta.changes === 0) return json({ error: "No se encontró esa reunión" }, 404);
+        if (finF) {
+          try {
+            await reunionsBorrarVotosTrasReunion(env, asistentesF, finF);
+            await reunionsAvisosAsegurar(env);
+            await env.DB.prepare("INSERT INTO reunions_avisos (grup, tipo, enviado_at) VALUES (?, 'consumida', ?) ON CONFLICT (grup, tipo) DO NOTHING").bind(grupF, new Date().toISOString()).run();
+          } catch (err) { console.error("[reunions] consumir respuestas (finalizar):", err && err.message); }
+        }
+        let correoF = { activado: !!cfgF.correos };
+        if (!reabrir && cfgF.correos) {
+          try {
+            const reactivadasF = await reunionsEnviarLiberados(env, cfgF, antesF, grupF);
+            if (reactivadasF) correoF = { ...correoF, reactivadas: reactivadasF };
+          } catch (err) { console.error("[reunions] correo (finalizar):", err && err.message); }
+        }
+        return json({ ok: true, correo: correoF });
+      }
+
+      // Aplaza una reunión confirmada a otra fecha/hora (clau = nueva franja de inicio). Conserva la duración,
+      // el enlace, la nota y a los convocados (sus respuestas se mueven a la nueva franja de inicio).
+      if (path === "/api/reunions/admin/aplazar" && method === "POST") {
+        const b = await request.json().catch(() => null);
+        if (!b || !/^[a-f0-9]{8,32}$/.test(String(b.grup || "")) || !reunionsClauValida(b.clau)) return json({ error: "Petición no válida" }, 400);
+        const grupA = String(b.grup);
+        if (b.clau <= reunionsAraMadrid()) return json({ error: "La nueva fecha tiene que ser posterior a ahora." }, 400);
+        const act = await env.DB.prepare(
+          "SELECT clau, enllac, nota, updated_at FROM reunions_franges WHERE grup = ? AND estat = 'confirmada' ORDER BY clau"
+        ).bind(grupA).all();
+        const filasA = (act && act.results) || [];
+        if (!filasA.length) return json({ error: "No se encontró esa reunión (¿está finalizada? Reábrela primero)." }, 404);
+        const viejas = filasA.map((f) => f.clau);
+        const iniVieja = viejas[0], finVieja = viejas[viejas.length - 1];
+        if (b.clau === iniVieja) return json({ error: "Esa ya es la fecha y hora actual de la reunión." }, 400);
+        const nuevas = [b.clau];
+        while (nuevas.length < viejas.length) nuevas.push(reunionsClauSeguent(nuevas[nuevas.length - 1]));
+        const choque = await env.DB.prepare(
+          `SELECT clau FROM reunions_franges WHERE estat IN ('confirmada', 'finalizada') AND (grup IS NULL OR grup <> ?) AND clau IN (${nuevas.map(() => "?").join(",")})`
+        ).bind(grupA, ...nuevas).all();
+        if (((choque && choque.results) || []).length) return json({ error: "Ya hay otra reunión en esa franja." }, 409);
+        const convA = await env.DB.prepare("SELECT pid FROM reunions_vots WHERE clau = ?").bind(iniVieja).all();
+        const pidsA = ((convA && convA.results) || []).map((v) => v.pid);
+        const tsOrig = filasA.map((f) => f.updated_at || "").sort()[0] || new Date().toISOString();
+        const araIso = new Date().toISOString();
+        const nuevasSet = new Set(nuevas);
+        const sA = [];
+        for (const c of viejas) {
+          if (nuevasSet.has(c)) continue;
+          sA.push(env.DB.prepare(
+            "UPDATE reunions_franges SET estat = 'disponible', grup = NULL, enllac = NULL, nota = NULL, updated_at = ? WHERE clau = ? AND grup = ?"
+          ).bind(araIso, c, grupA));
+        }
+        for (const c of nuevas) {
+          sA.push(env.DB.prepare(
+            `INSERT INTO reunions_franges (clau, estat, grup, enllac, nota, updated_at) VALUES (?, 'confirmada', ?, ?, ?, ?)
+             ON CONFLICT (clau) DO UPDATE SET estat = 'confirmada', grup = excluded.grup, enllac = excluded.enllac, nota = excluded.nota, updated_at = excluded.updated_at`
+          ).bind(c, grupA, filasA[0].enllac || null, filasA[0].nota || null, tsOrig));
+        }
+        for (const pid of pidsA) {
+          sA.push(env.DB.prepare("INSERT INTO reunions_vots (pid, clau) VALUES (?, ?) ON CONFLICT (pid, clau) DO NOTHING").bind(pid, nuevas[0]));
+          if (!nuevasSet.has(iniVieja)) sA.push(env.DB.prepare("DELETE FROM reunions_vots WHERE pid = ? AND clau = ?").bind(pid, iniVieja));
+        }
+        await reunionsBatch(env, sA);
+        // Los avisos push ya enviados eran de la fecha anterior: para la nueva hay que avisar de nuevo.
+        try { await reunionsAvisosAsegurar(env); await env.DB.prepare("DELETE FROM reunions_avisos WHERE grup = ?").bind(grupA).run(); } catch (err) { console.error("[reunions] avisos (aplazar):", err && err.message); }
+        const { cfg: cfgA } = await reunionsLlegirConfig(env);
+        let correoA = { activado: !!cfgA.correos };
+        if (cfgA.correos) {
+          try {
+            const prepA = await reunionsPrepararCorreo(env, grupA, cfgA);
+            if (prepA) { prepA.d.antes = { ini: iniVieja, fin: finVieja }; correoA = await reunionsEnviarCorreo(env, "aplazada", prepA); }
+          } catch (err) { console.error("[reunions] correo (aplazar):", err && err.message); correoA = { activado: true, error: true, configurado: true, total: 0, enviados: 0, fallidos: [], sinCorreo: [], enPausa: [] }; }
+        }
+        return json({ ok: true, claus: nuevas, correo: correoA });
+      }
+
+      // Reenvía la convocatoria por correo a los convocados de una reunión ya confirmada (p. ej. las que se
+      // confirmaron antes de existir el correo, o si alguien dice que no le ha llegado). Va aunque los
+      // correos automáticos estén desactivados: es una orden expresa del Responsable.
+      if (path === "/api/reunions/admin/correo" && method === "POST") {
+        const b = await request.json().catch(() => null);
+        if (!b || !/^[a-f0-9]{8,32}$/.test(String(b.grup || ""))) return json({ error: "Reunión no válida" }, 400);
+        if (await limiteExcedido(request, env, "reunions-correo", 30, 3600)) return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        const { cfg: cfgR } = await reunionsLlegirConfig(env);
+        const prepR = await reunionsPrepararCorreo(env, String(b.grup), cfgR);
+        if (!prepR) return json({ error: "Esa reunión no existe o ya se ha celebrado." }, 404);
+        return json({ ok: true, correo: await reunionsEnviarCorreo(env, "convocatoria", prepR) });
+      }
+
+      // Actividad de una persona: sus reuniones (hechas, en curso, próximas, en pausa), las franjas que tiene
+      // marcadas y su cuenta del equipo. Solo lectura.
+      const mA = path.match(/^\/api\/reunions\/admin\/persona\/([a-f0-9]{8,32})\/actividad$/);
+      if (mA && method === "GET") {
+        const pid = mA[1];
+        const per = await env.DB.prepare("SELECT pid, nom, user_id, created_at, updated_at FROM reunions_persones WHERE pid = ?").bind(pid).first();
+        if (!per) return json({ error: "Participante no encontrado" }, 404);
+        const ara = reunionsAraMadrid();
+        const [fr, vo, vp] = await Promise.all([
+          env.DB.prepare("SELECT clau, estat, grup, enllac, nota, updated_at FROM reunions_franges").all(),
+          env.DB.prepare("SELECT pid, clau FROM reunions_vots WHERE clau >= ?").bind(ara.slice(0, 10) + "T00:00").all(),
+          env.DB.prepare("SELECT clau FROM reunions_vots WHERE pid = ? ORDER BY clau").bind(pid).all(),
+        ]);
+        const filas = (fr && fr.results) || [];
+        const misVotos = ((vp && vp.results) || []).map((v) => v.clau);
+        const { cfg } = await reunionsLlegirConfig(env);
+        const { ocupats, suspesos } = reunionsCalcularOcupacion(filas, (vo && vo.results) || [], ara, cfg.unaPorPersona !== false);
+        const pausa = new Set(suspesos.filter((x) => x.pid === pid).map((x) => x.grup));
+        const activa = (ocupats.find((x) => x.pid === pid) || {}).grup || null;
+        const grups = new Map();
+        for (const f of filas) {
+          if ((f.estat !== "confirmada" && f.estat !== "finalizada") || !f.grup) continue;
+          const g = grups.get(f.grup) || { grup: f.grup, ini: f.clau, fin: f.clau, nota: f.nota || "", enllac: f.enllac || "", finalizada: f.estat === "finalizada" };
+          if (f.clau < g.ini) g.ini = f.clau;
+          if (f.clau > g.fin) g.fin = f.clau;
+          grups.set(f.grup, g);
+        }
+        const mias = new Set(misVotos);
+        const reuniones = [...grups.values()].filter((g) => mias.has(g.ini)).map((g) => {
+          const fin = reunionsClauSeguent(g.fin);
+          const celebrada = fin <= ara;
+          const estado = g.finalizada ? "hecha" : celebrada ? "celebrada" : pausa.has(g.grup) ? "en_pausa" : g.ini <= ara ? "en_curso" : "proxima";
+          return { grup: g.grup, ini: g.ini, fin, nota: g.nota, estado, enllac: estado === "proxima" || estado === "en_curso" ? g.enllac : "" };
+        }).sort((a, b) => (a.ini < b.ini ? 1 : -1));
+        const franjas = misVotos.filter((c) => c >= ara && (filas.find((f) => f.clau === c) || {}).estat === "disponible");
+        let cuenta = null;
+        try {
+          let u = null;
+          if (per.user_id) u = await env.DB.prepare("SELECT id, nombre, email, activo FROM users WHERE id = ?").bind(per.user_id).first();
+          if (u) cuenta = { nombre: u.nombre || "", email: u.email || "", activo: !!u.activo };
+        } catch {}
+        return json({
+          persona: { pid: per.pid, nom: per.nom, alta: per.created_at, ultima: per.updated_at, cuenta },
+          ara, reuniones, franjas, conReunion: activa,
+          resumen: {
+            hechas: reuniones.filter((r) => r.estado === "hecha" || r.estado === "celebrada").length,
+            proximas: reuniones.filter((r) => r.estado === "proxima" || r.estado === "en_curso").length,
+            enPausa: reuniones.filter((r) => r.estado === "en_pausa").length,
+            franjas: franjas.length,
+          },
+        });
+      }
+      const mP = path.match(/^\/api\/reunions\/admin\/persona\/([a-f0-9]{8,32})$/);
+      if (mP && method === "DELETE") {
+        await reunionsBatch(env, [
+          env.DB.prepare("DELETE FROM reunions_vots WHERE pid = ?").bind(mP[1]),
+          env.DB.prepare("DELETE FROM reunions_persones WHERE pid = ?").bind(mP[1]),
+        ]);
+        return json({ ok: true });
+      }
+    }
+    return json({ error: "No encontrado" }, 404);
+  } catch (err) {
+    console.error("[reunions]", err);
+    return json({ error: "Error del servidor" }, 500);
+  }
+}
+
 // ============================================================
 // PODCAST (mini-YouTube público + gestión desde el panel)
 // Tabla creada en caliente con DDL portable (id TEXT, sin AUTOINCREMENT)
@@ -2619,7 +3968,7 @@ function calcularBannerUrgenteHasta(activar) {
 }
 
 // ---------- Publicación directa según el nivel del colaborador ----------
-// A partir del sistema de niveles, un redactor de Nivel 2 o superior ya
+// A partir del sistema de niveles, un redactor de Nivel 3 o superior ya
 // no necesita el PIN de "Última hora" para publicar directamente: la
 // confianza de poder publicar sin revisión se la da su nivel. Un
 // redactor de Nivel 1 (o sin nivel, por compatibilidad con datos
@@ -2951,7 +4300,7 @@ function comparacionConstante(a, b) {
 async function verifyJWT(token, secret) {
   // Falla cerrado: sin JWT_SECRET configurado NUNCA se acepta ningún token
   // (antes, un secreto ausente se convertía en la clave literal "undefined",
-  // con la que cualquiera podía falsificar tokens de administrador).
+  // con la que cualquiera podía falsificar tokens de Responsable).
   if (typeof token !== "string" || typeof secret !== "string" || secret.length < 16) return null;
   const parts = token.split(".");
   if (parts.length !== 3) return null;
@@ -3518,7 +4867,7 @@ function capitalizarNombrePropio(texto) {
 }
 // ---------- Excepción: firmar solo con el nombre (sin apellidos) ----------
 // Redactores y fotógrafos deben tener nombre y apellidos, pero hay quien prefiere no
-// publicar su apellido (privacidad). Un administrador puede marcar esa excepción desde
+// publicar su apellido (privacidad). Un Responsable puede marcar esa excepción desde
 // Usuarios (users.sin_apellidos = 1): a esa persona ya no se le exigen apellidos ni en
 // el panel ni en el servidor. La columna se crea sola la primera vez que se usa.
 let _columnaSinApellidosLista = null;
@@ -3542,6 +4891,143 @@ async function asegurarColumnaSinApellidos(env) {
   _columnaSinApellidosLista.catch(() => { _columnaSinApellidosLista = null; });
   return _columnaSinApellidosLista;
 }
+// ---------- Colaborador anónimo ----------
+// users.anonimo = 1: lo que publica esa persona se muestra SIN su nombre ("Colaborador anónimo"):
+// ni en la web pública, ni en RSS, ni para el resto de colaboradores del panel. Solo los admins
+// (Responsables) siguen viendo quién es, y la propia persona ve lo suyo con su nombre. No cambia lo
+// guardado en la base (autor_id/autor_nombre siguen siendo los reales): se oculta al RESPONDER, en
+// un único sitio (anonimizarRespuesta, que envuelve fetch), para que ningún endpoint se olvide.
+const NOMBRE_AUTOR_ANONIMO = "Colaborador anónimo";
+let _columnaAnonimoLista = null;
+async function asegurarColumnaAnonimo(env) {
+  if (_columnaAnonimoLista) return _columnaAnonimoLista;
+  _columnaAnonimoLista = (async () => {
+    try {
+      await env.DB.prepare("SELECT anonimo FROM users LIMIT 1").first();
+      return true;
+    } catch (err) {
+      if (!/no such column|does not exist|undefined column/i.test(String((err && err.message) || err))) throw err;
+    }
+    console.warn("[ANONIMO] Falta users.anonimo: se crea ahora (migración automática).");
+    try {
+      await env.DB.prepare("ALTER TABLE users ADD COLUMN anonimo INTEGER NOT NULL DEFAULT 0").run();
+    } catch (err) {
+      if (!/duplicate column|already exists/i.test(String((err && err.message) || err))) throw err;
+    }
+    return true;
+  })();
+  _columnaAnonimoLista.catch(() => { _columnaAnonimoLista = null; });
+  return _columnaAnonimoLista;
+}
+
+// Cuentas anónimas (ids y nombres). Caché de 30 s por isolate; si la columna aún no existe o falla
+// la consulta, no hay anónimos (nunca rompe una lectura pública).
+async function cargarAnonimos(env) {
+  try {
+    return await memoCorta("anonimos:lista", 30000, async () => {
+      try {
+        const { results } = await env.DB.prepare("SELECT id, nombre FROM users WHERE anonimo = 1").all();
+        const ids = new Set(); const nombres = new Set();
+        for (const r of results || []) { ids.add(Number(r.id)); if (r.nombre) nombres.add(String(r.nombre)); }
+        return { ids, nombres };
+      } catch (err) {
+        if (!/no such column|does not exist|undefined column/i.test(String((err && err.message) || err))) console.error("[ANONIMO] cargarAnonimos:", err && err.message);
+        return { ids: new Set(), nombres: new Set() };
+      }
+    });
+  } catch { return { ids: new Set(), nombres: new Set() }; }
+}
+
+function ocultarAnonimosEnJson(nodo, anon, propio) {
+  if (Array.isArray(nodo)) { for (const x of nodo) ocultarAnonimosEnJson(x, anon, propio); return; }
+  if (!nodo || typeof nodo !== "object") return;
+  const esAjeno = (id) => id != null && anon.ids.has(Number(id)) && Number(id) !== propio.uid;
+  const nombreAnonimoAjeno = (n) => typeof n === "string" && anon.nombres.has(n) && n !== propio.nombre;
+  for (const [kId, kNombre] of [["autor_id", "autor_nombre"], ["coautor_id", "coautor_nombre"]]) {
+    if (!(kNombre in nodo) && !(kId in nodo)) continue;
+    if (esAjeno(nodo[kId])) { nodo[kId] = null; nodo[kNombre] = NOMBRE_AUTOR_ANONIMO; }
+    else if ((nodo[kId] == null) && nombreAnonimoAjeno(nodo[kNombre])) nodo[kNombre] = NOMBRE_AUTOR_ANONIMO;
+  }
+  if (nombreAnonimoAjeno(nodo.credito)) nodo.credito = NOMBRE_AUTOR_ANONIMO;
+  if (Array.isArray(nodo.firmantes)) {
+    const vistos = new Set();
+    nodo.firmantes = nodo.firmantes.map((f) => (f && (esAjeno(f.id) || (f.id == null && nombreAnonimoAjeno(f.nombre))) ? { id: null, nombre: NOMBRE_AUTOR_ANONIMO } : f))
+      .filter((f) => { const k = f && f.id == null ? "n:" + f.nombre : "i:" + (f && f.id); if (vistos.has(k)) return false; vistos.add(k); return true; });
+  }
+  for (const k of Object.keys(nodo)) { const v = nodo[k]; if (v && typeof v === "object") ocultarAnonimosEnJson(v, anon, propio); }
+}
+
+// Perfil público (y RSS) de una cuenta anónima: no existe para nadie salvo admins y ella misma.
+// Se resuelve ANTES de ejecutar el endpoint (no hace falta ni consultarlo).
+async function bloquearPerfilAnonimo(request, env) {
+  try {
+    if (request.method !== "GET") return null;
+    const m = new URL(request.url).pathname.match(/^\/(?:api\/autores|rss\/autor)\/(\d+)(?:\.xml)?$/);
+    if (!m) return null;
+    const anon = await cargarAnonimos(env);
+    const id = Number(m[1]);
+    if (!anon.ids.has(id)) return null;
+    if ((request.headers.get("Authorization") || "").startsWith("Bearer ")) {
+      const payload = await requireAuth(request, env);
+      if (payload && (payload.rol === "admin" || Number(payload.uid) === id)) return null;
+    }
+    return json({ error: "Autor no encontrado" }, 404);
+  } catch (err) {
+    console.error("[ANONIMO] bloquearPerfilAnonimo:", err && err.message);
+    return null;
+  }
+}
+
+async function anonimizarRespuesta(request, env, resp) {
+  try {
+    if (request.method !== "GET" || !resp || resp.status !== 200) return resp;
+    const path = new URL(request.url).pathname;
+    const esApi = path.startsWith("/api/") && !/^\/api\/(me|users|internal)(\/|$)/.test(path);
+    const esRss = path.startsWith("/rss");
+    if (!esApi && !esRss) return resp;
+    const anon = await cargarAnonimos(env);
+    if (!anon.ids.size) return resp;
+    // Quien mira: un admin lo ve todo; un colaborador anónimo ve lo suyo con su nombre.
+    let propio = { uid: null, nombre: null };
+    if ((request.headers.get("Authorization") || "").startsWith("Bearer ")) {
+      const payload = await requireAuth(request, env);
+      if (payload) {
+        if (payload.rol === "admin") return resp;
+        propio = { uid: Number(payload.uid), nombre: payload.nombre || null };
+      }
+    }
+    const ct = resp.headers.get("Content-Type") || "";
+    const esJson = /json/i.test(ct);
+    const esXml = /xml/i.test(ct);
+    if (!esJson && !esXml) return resp;
+    const texto = await resp.text();
+    const reconstruir = (t) => { const h = new Headers(resp.headers); h.delete("Content-Length"); return new Response(t, { status: resp.status, statusText: resp.statusText, headers: h }); };
+    if (esXml) {
+      let t = texto;
+      for (const n of anon.nombres) {
+        if (n === propio.nombre) continue;
+        t = t.split(`<dc:creator>${escaparXml(n)}</dc:creator>`).join(`<dc:creator>${NOMBRE_AUTOR_ANONIMO}</dc:creator>`);
+      }
+      return reconstruir(t);
+    }
+    // Sin ningún id ni nombre anónimo en el texto no hay nada que tocar (camino rápido).
+    let hay = false;
+    for (const id of anon.ids) { if (texto.includes(`"autor_id":${id}`) || texto.includes(`"coautor_id":${id}`) || texto.includes(`"id":${id}`)) { hay = true; break; } }
+    if (!hay) for (const n of anon.nombres) { if (texto.includes(JSON.stringify(n))) { hay = true; break; } }
+    if (!hay) return reconstruir(texto);
+    let datos;
+    try { datos = JSON.parse(texto); } catch { return reconstruir(texto); }
+    if (path === "/api/autores" && datos && Array.isArray(datos.autores)) {
+      datos.autores = datos.autores.filter((a) => !(a && anon.ids.has(Number(a.id)) && Number(a.id) !== propio.uid));
+    }
+    ocultarAnonimosEnJson(datos, anon, propio);
+    return reconstruir(JSON.stringify(datos));
+  } catch (err) {
+    console.error("[ANONIMO] anonimizarRespuesta:", err && err.message);
+    return resp;
+  }
+}
+
 async function usuarioSinApellidos(env, uid) {
   try {
     await asegurarColumnaSinApellidos(env);
@@ -3642,7 +5128,7 @@ function palabrasNombreFormulario(t) {
 // Se miran los campos de alta de TODOS los roles: si la persona cambió de rol (o ahora es admin) su
 // respuesta sigue en el campo del rol con el que se dio de alta. Una respuesta vinculada a OTRO
 // usuario nunca se borra por los niveles 2-4.
-async function borrarRespuestasDeUsuarioFormulario(env, u) {
+async function borrarRespuestasDeUsuarioFormulario(env, u, opcionesElegidasOut) {
   if (!u) return 0;
   const porId = new Map();
   for (const rol of FORMULARIO_ALTA_ROLES) {
@@ -3681,9 +5167,54 @@ async function borrarRespuestasDeUsuarioFormulario(env, u) {
     if (contenidos.length === 1) elegidas = contenidos;
   }
   for (const c of elegidas) {
+    if (Array.isArray(opcionesElegidasOut)) for (const x of opciones(c)) opcionesElegidasOut.push(x.valor);
     await env.DB.prepare("DELETE FROM formularios_respuestas WHERE id = ?").bind(c.rid).run();
   }
   return elegidas.length;
+}
+
+// Al eliminar un usuario, su nombre también sale de la lista «Selecciona tu nombre» de los formularios con alta
+// de usuario (y de sus invitaciones sueltas): antes solo se borraba su respuesta y la opción volvía a la lista.
+// Se reconoce la opción igual que al dar de alta (alias explícito, o mismo nombre y equipo/categoría) y, además,
+// la que eligió en las respuestas borradas (extra). Los campos con "fuente" (lista viva desde usuarios) no tienen
+// opciones fijas: se actualizan solos. Devuelve cuántas opciones ha quitado.
+async function quitarNombreDeUsuarioFormularios(env, u, extra = []) {
+  if (!u) return 0;
+  const { results: forms } = await env.DB.prepare("SELECT id, slug, campos FROM formularios").all();
+  const claveExtra = new Set((extra || []).map((x) => normalizarOpcionUnica(x)));
+  let quitadas = 0;
+  for (const f of (forms || [])) {
+    const crudos = parsearCamposFormulario(f.campos);
+    const conAlta = camposConAltaPorDefecto(f.slug, crudos);
+    const coincide = (op, alta) => typeof op === "string"
+      && ((alta.alta_usuario === u.rol && opcionCoincideConUsuarioFormulario(op, u, alta.alias_usuarios)) || claveExtra.has(normalizarOpcionUnica(op)));
+    let cambiado = false;
+    const nuevos = crudos.map((c, i) => {
+      const alta = conAlta[i];
+      if (!c || !alta || !FORMULARIO_ALTA_ROLES.includes(String(alta.alta_usuario || "")) || !Array.isArray(c.opciones) || !c.opciones.length) return c;
+      const quedan = c.opciones.filter((op) => !coincide(op, alta));
+      if (quedan.length === c.opciones.length) return c;
+      quitadas += c.opciones.length - quedan.length;
+      cambiado = true;
+      return { ...c, opciones: quedan };
+    });
+    if (cambiado) {
+      await env.DB.prepare("UPDATE formularios SET campos = ?, updated_at = datetime('now') WHERE id = ?").bind(JSON.stringify(nuevos), f.id).run();
+    }
+    // Invitaciones sueltas ("Personas invitadas") de esa persona en los campos con alta de usuario.
+    try {
+      const { results: inv } = await env.DB.prepare("SELECT id, campo_id, opcion FROM formularios_invitados WHERE formulario_id = ?").bind(f.id).all();
+      for (const i of (inv || [])) {
+        const alta = conAlta.find((c) => c && c.id === i.campo_id && FORMULARIO_ALTA_ROLES.includes(String(c.alta_usuario || "")));
+        if (!alta || !coincide(i.opcion, alta)) continue;
+        await env.DB.prepare("DELETE FROM formularios_invitados WHERE id = ?").bind(i.id).run();
+        quitadas++;
+      }
+    } catch (e) {
+      if (!/no such table|does not exist/i.test(String((e && e.message) || e))) throw e; // sin la tabla (migración sin aplicar) no hay invitaciones
+    }
+  }
+  return quitadas;
 }
 async function obtenerFormularioPublico(env, slug) {
   const s = String(slug || "").toLowerCase();
@@ -3811,29 +5342,53 @@ async function obtenerAccesoAcreditacion(env) {
   try {
     const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(ACREDITACION_ACCESO_KEY).first();
     const v = row && row.value ? String(row.value) : "";
-    if (ACREDITACION_ACCESOS.includes(v)) return v;
+    if (ACREDITACION_ACCESOS.includes(v)) return "login"; // el modo guardado se ignora: siempre cuenta + Nivel 2
   } catch {}
-  return "pin";
+  return "login";
 }
 async function guardarAccesoAcreditacion(env, modo) {
   await env.DB.prepare(
     "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
   ).bind(ACREDITACION_ACCESO_KEY, modo).run();
 }
-// Comprueba si la petición puede usar el formulario según el modo vigente.
-async function comprobarAccesoAcreditacion(request, env, pinRecibido) {
-  const modo = await obtenerAccesoAcreditacion(env);
-  if (modo === "solicitar") return { ok: true, modo };
-  if (modo === "login") {
-    let payload = null;
-    try { payload = await requireAuth(request, env); } catch {}
-    if (!payload) return { ok: false, status: 401, modo, error: "Inicia sesión con tu cuenta de colaborador para rellenar el formulario." };
-    return { ok: true, modo, usuario: { nombre: payload.nombre || payload.username || "" } };
+// Las acreditaciones SOLO se piden con cuenta de colaborador y a partir del Nivel 2:
+//  - Responsables (admin): siempre.
+//  - Redactores: Nivel 2 (Aprendiz) o superior.
+//  - Fotógrafos: todos, sea cual sea su nivel (F1 o F2; su escala es propia y no cuenta como editorial).
+// Sin sesión no entra nadie (ya no hay PIN ni acceso libre) y cualquier otro rol queda fuera.
+// El nivel se mira en la base (no en el JWT) para que un ascenso o descenso valga al momento.
+const ACREDITACION_NIVEL_MINIMO_REDACTOR = 2;
+async function comprobarAccesoAcreditacion(request, env, _pinRecibido) {
+  const modo = "login";
+  const sinSesion = { ok: false, status: 401, modo, motivo: "sin_sesion", error: "Inicia sesión con tu cuenta de colaborador para rellenar el formulario." };
+  if (!(request.headers.get("Authorization") || "").startsWith("Bearer ")) return sinSesion;
+  let payload = null;
+  try { payload = await requireAuth(request, env); } catch {}
+  if (!payload || !payload.uid) return sinSesion;
+  let u = null;
+  try { u = await env.DB.prepare("SELECT id, nombre, username, email, rol, nivel, activo FROM users WHERE id = ?").bind(payload.uid).first(); } catch {}
+  if (!u || u.activo === 0) return sinSesion;
+  const nivel = Math.max(1, Number(u.nivel) || 1);
+  const usuario = { nombre: u.nombre || u.username || "", email: u.email || "", rol: u.rol, nivel: u.rol === "admin" ? NIVEL_MAXIMO : nivel };
+  if (u.rol === "admin") return { ok: true, modo, usuario };
+  if (u.rol === "fotografo") return { ok: true, modo, usuario };
+  if (u.rol === "redactor" && nivel >= ACREDITACION_NIVEL_MINIMO_REDACTOR) return { ok: true, modo, usuario };
+  if (u.rol !== "redactor") {
+    return { ok: false, status: 403, modo, motivo: "rol", error: "Las acreditaciones solo las solicitan Responsables, fotógrafos y redactores a partir del Nivel 2." };
   }
-  const esperado = await obtenerPinAcreditacion(env);
-  if (!esperado) return { ok: false, status: 503, modo, error: "El formulario de acreditación no está disponible todavía." };
-  if (!pinAcreditacionCorrecto(esperado, String(pinRecibido || "").trim())) return { ok: false, status: 401, modo, error: "PIN incorrecto" };
-  return { ok: true, modo };
+  const bloqueo = { nivel, nivel_minimo: ACREDITACION_NIVEL_MINIMO_REDACTOR, rol: u.rol, nombre: usuario.nombre };
+  {
+    try {
+      const info = NIVELES_INFO[ACREDITACION_NIVEL_MINIMO_REDACTOR] || {};
+      bloqueo.nombre_nivel_minimo = info.nombre || "Aprendiz";
+      const prog = calcularProgresoNivel(await contarPublicacionesPorTipo(env, u.id), NIVELES_REQUISITOS[ACREDITACION_NIVEL_MINIMO_REDACTOR]);
+      bloqueo.progreso = prog.detalle;
+    } catch (err) { console.error("acreditación: progreso de nivel no disponible", err); }
+  }
+  return {
+    ok: false, status: 403, modo, motivo: "nivel", bloqueo,
+    error: "Las acreditaciones se pueden solicitar a partir del Nivel 2 (Aprendiz). Sigue publicando para subir de nivel.",
+  };
 }
 
 // Tipos de acreditación que acepta el formulario público (acreditacion.html).
@@ -4019,34 +5574,156 @@ function mensajeDespedidaPorRol(rol) {
     + "Un medio como este se construye con personas como tú.";
 }
 
+function rolLegibleDespedida(rol) {
+  if (rol === "fotografo") return "Fotografía";
+  if (rol === "admin") return "Administración";
+  if (rol === "redactor") return "Redacción";
+  return "Equipo";
+}
+
+// "equipo" se guarda como array JSON en texto (p. ej. '["Real Zaragoza"]'). Nunca lanza.
+function equiposDespedida(raw) {
+  try {
+    const arr = JSON.parse(String(raw || "[]"));
+    if (!Array.isArray(arr)) return "";
+    return arr.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 3).join(" · ");
+  } catch (_) {
+    return "";
+  }
+}
+
+// Plantilla propia del correo de despedida: cabecera con logo, portada marino
+// con el agradecimiento en grande, carta con la frase del rol, datos de su paso
+// por el medio y botones para volver o escribirnos. Todo con tablas y estilos en
+// línea (Gmail, Outlook, Apple Mail…) + modo oscuro con la paleta del resto de avisos.
+function plantillaDespedidaEmail({ nombre, rol, equipos, mensaje, preheader }) {
+  const SERIF = "Georgia,'Times New Roman',serif";
+  const SANS = "'Helvetica Neue',Helvetica,Arial,sans-serif";
+  const ROJO = TONOS_EMAIL.marca.color;
+  const e = escapeHtmlEmail;
+  const titulo = nombre ? "Gracias por todo, " + nombre : "Gracias por todo";
+  const mailto = "mailto:" + EMAIL_NOTIFICACIONES + "?subject=" + encodeURIComponent("Quiero volver a ElOtroFútbol");
+  const chips = [rolLegibleDespedida(rol), equipos].filter(Boolean)
+    .map((c) => `<span class="eof-chip" style="display:inline-block;margin:0 8px 8px 0;padding:6px 14px;background:#fdecef;color:${ROJO};font-family:${SANS};font-size:12px;font-weight:700;letter-spacing:.4px;border-radius:20px;">${e(c)}</span>`)
+    .join("");
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+<title>${e(titulo)}</title>
+<style>
+  @media (max-width:600px) {
+    .eof-cuerpo { padding-left:22px !important; padding-right:22px !important; }
+    .eof-titulo { font-size:28px !important; }
+    .eof-boton-td { display:block !important; width:100% !important; padding:0 0 10px 0 !important; }
+    .eof-boton-td a { display:block !important; text-align:center !important; }
+  }
+  @media (prefers-color-scheme: dark) {
+    body, .eof-fondo { background:#11161f !important; }
+    .eof-tarjeta { background:#1a2130 !important; box-shadow:0 8px 28px rgba(0,0,0,.45) !important; }
+    .eof-texto, .eof-texto h2, .eof-texto p { color:#e7eaf0 !important; }
+    .eof-texto-suave { color:#9aa4b8 !important; }
+    .eof-ficha { background:#2a1d25 !important; }
+    .eof-chip { background:#2a1d25 !important; color:#ff6b7d !important; }
+    .eof-firma { color:#ff6b7d !important; }
+    .eof-boton-sec { color:#ff6b7d !important; border-color:#ff6b7d !important; }
+    .eof-pie { background:#171d29 !important; border-top-color:#2a3242 !important; }
+    .eof-pie p, .eof-pie a { color:#7e879b !important; }
+  }
+</style>
+</head>
+<body class="eof-fondo" style="margin:0;padding:0;background:#eef1f5;">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;font-size:1px;line-height:1px;color:#eef1f5;">${e(preheader)}${"&nbsp;&zwnj;".repeat(40)}</div>
+  <table role="presentation" class="eof-fondo" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f5;padding:32px 14px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" class="eof-tarjeta" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 8px 28px rgba(12,27,46,.14);">
+          <tr>
+            <td class="eof-cuerpo" bgcolor="#0c1b2e" style="background:#0c1b2e;background-image:linear-gradient(160deg,#0c1b2e 0%,#152b46 100%);padding:26px 36px 42px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+                <td style="vertical-align:middle;"><img src="${SITIO_URL}/img/logo.png" alt="ELOTROFÚTBOLTV" height="36" style="display:block;border:0;height:36px;width:auto;"></td>
+                <td align="right" style="vertical-align:middle;font-family:${SANS};font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#5bb8e8;">Hasta pronto</td>
+              </tr></table>
+              <div style="margin-top:30px;font-size:30px;line-height:30px;">&#9917;</div>
+              <h1 class="eof-titulo" style="margin:14px 0 0;font-family:${SERIF};font-size:36px;line-height:1.15;font-weight:700;color:#ffffff;">${e(titulo)}</h1>
+              <p style="margin:14px 0 0;font-family:${SANS};font-size:15px;line-height:1.65;color:#b9c6d8;">${nombre ? "Hola " + e(nombre) + ", t" : "T"}u cuenta de ElOtroFútbol ha sido eliminada y ya no tienes acceso al panel. Antes de que te vayas queremos decirte algo importante: gracias.</p>
+            </td>
+          </tr>
+          <tr><td style="height:5px;background:${ROJO};line-height:5px;font-size:0;">&nbsp;</td></tr>
+          <tr>
+            <td class="eof-cuerpo" style="padding:34px 36px 0;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+                <td class="eof-ficha eof-texto" style="background:#fdecef;border-left:4px solid ${ROJO};border-radius:10px;padding:22px 26px 24px;font-family:${SERIF};font-size:18px;line-height:1.7;font-style:italic;color:#0c1b2e;">
+                  <span style="display:block;height:30px;font-family:${SERIF};font-size:60px;line-height:50px;font-style:normal;color:${ROJO};">&ldquo;</span>${e(mensaje)}
+                  <span class="eof-firma" style="display:block;margin-top:16px;font-family:${SANS};font-size:13px;font-style:normal;font-weight:700;letter-spacing:.6px;color:${ROJO};">&mdash; El equipo de ElOtroFútbol</span>
+                </td>
+              </tr></table>
+            </td>
+          </tr>${chips ? `
+          <tr>
+            <td class="eof-cuerpo" style="padding:24px 36px 0;">
+              <p class="eof-texto-suave" style="margin:0 0 10px;font-family:${SANS};font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#8a93a3;">Tu paso por el medio</p>
+              ${chips}
+            </td>
+          </tr>` : ""}
+          <tr>
+            <td class="eof-cuerpo" style="padding:18px 36px 0;">
+              <h2 class="eof-texto" style="margin:0;font-family:${SERIF};font-size:21px;line-height:1.3;font-weight:700;color:#0c1b2e;">Las puertas siguen abiertas</h2>
+              <p class="eof-texto-suave" style="margin:10px 0 0;font-family:${SANS};font-size:15px;line-height:1.65;color:#5a6270;">Si crees que ha sido un error o algún día quieres volver, responde a este correo y lo hablamos. Aquí siempre habrá un sitio para ti.</p>
+              <table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:20px;"><tr>
+                <td class="eof-boton-td" style="padding-right:10px;">
+                  <a href="${SITIO_URL}" style="display:inline-block;padding:14px 28px;background:${ROJO};border:2px solid ${ROJO};border-radius:8px;font-family:${SANS};font-size:14px;font-weight:700;letter-spacing:.3px;color:#ffffff;text-decoration:none;">Visitar ElOtroFútbol&nbsp;&rarr;</a>
+                </td>
+                <td class="eof-boton-td">
+                  <a class="eof-boton-sec" href="${mailto}" style="display:inline-block;padding:14px 28px;border:2px solid ${ROJO};border-radius:8px;font-family:${SANS};font-size:14px;font-weight:700;letter-spacing:.3px;color:${ROJO};text-decoration:none;">Escríbenos</a>
+                </td>
+              </tr></table>
+            </td>
+          </tr>
+          <tr>
+            <td class="eof-cuerpo" style="padding:30px 36px 0;">
+              <p class="eof-texto" style="margin:0;font-family:${SERIF};font-size:17px;line-height:1.5;color:#0c1b2e;">Un abrazo enorme,<br><strong>El equipo de ElOtroFútbol</strong></p>
+            </td>
+          </tr>
+          <tr><td style="height:34px;line-height:34px;font-size:0;">&nbsp;</td></tr>
+          <tr>
+            <td class="eof-pie eof-cuerpo" style="padding:22px 36px 26px;background:#f5f7fa;border-top:1px solid #e6e9ef;">
+              <p class="eof-texto" style="margin:0 0 6px;font-family:${SANS};font-size:12px;font-weight:700;letter-spacing:1.4px;text-transform:uppercase;color:#0c1b2e;">EL<span style="color:${ROJO};">OTRO</span>FÚTBOLTV</p>
+              <p style="margin:0;font-family:${SANS};font-size:12px;line-height:1.6;color:#8a93a3;">Este correo se ha enviado porque tu cuenta de ElOtroFútbol ha sido eliminada. Puedes responder a este mensaje si tienes cualquier duda.</p>
+              <p style="margin:8px 0 0;font-family:${SANS};font-size:12px;line-height:1.6;color:#8a93a3;"><a href="${SITIO_URL}" style="color:#8a93a3;text-decoration:underline;">${SITIO_URL.replace(/^https?:\/\//, "")}</a></p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
 async function enviarCorreoDespedidaCuenta(env, u) {
   try {
     if (!u || !emailLectorEntregable(u.email)) return false;
     const email = String(u.email).trim();
     const nombre = String(u.nombre || "").trim().split(/\s+/)[0] || "";
     const asunto = "Gracias por todo, " + (nombre || "de corazón") + " · ElOtroFútbol";
+    const mensaje = mensajeDespedidaPorRol(u.rol);
+    const equipos = equiposDespedida(u.equipo);
     const parrafo = (nombre ? "Hola " + nombre + ", t" : "T") + "u cuenta de ElOtroFútbol ha sido eliminada y ya no tienes acceso al panel. "
       + "Antes de que te vayas queremos decirte algo importante: gracias.";
-    const mensaje = mensajeDespedidaPorRol(u.rol);
     const texto = [
-      parrafo, "", mensaje, "",
+      "Gracias por todo" + (nombre ? ", " + nombre : ""), "",
+      parrafo, "",
+      mensaje, "",
       "Si crees que ha sido un error o algún día quieres volver, responde a este correo y lo hablamos. Las puertas siempre estarán abiertas.",
       "", "Un abrazo enorme,", "El equipo de ElOtroFútbol", SITIO_URL,
     ].join("\n");
-    const bloqueHtml = `<div class="eof-ficha eof-texto" style="margin:18px 0 6px;padding:16px 18px;background:#fdecef;border-left:4px solid #d1132e;border-radius:8px;font-family:Georgia,'Times New Roman',serif;font-size:16px;line-height:1.6;color:#0c1b2e;">`
-      + escapeHtmlEmail(mensaje) + `</div>`
-      + `<p class="eof-texto-suave" style="margin:16px 0 0;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.6;color:#5a6270;">`
-      + `Si crees que ha sido un error o algún día quieres volver, responde a este correo y lo hablamos. Las puertas siempre estarán abiertas.</p>`
-      + `<p class="eof-texto" style="margin:18px 0 0;font-family:Georgia,'Times New Roman',serif;font-size:16px;line-height:1.5;color:#0c1b2e;">Un abrazo enorme,<br><strong>El equipo de ElOtroFútbol</strong></p>`;
-    const html = plantillaEmail({
-      etiqueta: "Hasta pronto",
-      titulo: nombre ? "Gracias por todo, " + nombre : "Gracias por todo",
-      tono: "marca",
+    const html = plantillaDespedidaEmail({
+      nombre, rol: u.rol, equipos, mensaje,
       preheader: "Tu cuenta se ha eliminado. Gracias por formar parte de ElOtroFútbol.",
-      parrafo,
-      bloqueHtml,
-      boton: { texto: "Visitar ElOtroFútbol", url: SITIO_URL },
-      pieHtml: "Este correo se ha enviado porque tu cuenta de ElOtroFútbol ha sido eliminada. Puedes responder a este mensaje si tienes cualquier duda.",
     });
     return await enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario: email, replyTo: EMAIL_NOTIFICACIONES });
   } catch (e) {
@@ -4079,6 +5756,45 @@ async function enviarCorreoSolicitadaAcreditacion(env, a) {
     pieHtml: "Equipo de ElOtroFútbol. Puedes responder a este correo si tienes cualquier duda.",
   });
   return enviarEmailNotificacion(env, { asunto, texto, html }, { destinatario: a.email, replyTo: EMAIL_NOTIFICACIONES });
+}
+
+// ---------- LaLiga Hypermotion: no se cubre a pie de campo ----------
+// Es fútbol profesional y LaLiga exige requisitos muy altos para acreditarse, así que el formulario no
+// admite solicitudes de sus clubes (el formulario avisa al elegir el equipo; esto es la red de seguridad
+// del servidor, por si alguien se salta el aviso). Lista = clubs.js (CLUBS_BY_CATEGORY.hypermotion).
+const ACRED_HYPERMOTION_CLUBES = [
+  "AD Ceuta FC", "Albacete Balompié", "Burgos CF", "Cádiz CF", "CD Castellón", "CD Eldense", "CD Leganés", "CD Tenerife",
+  "CE Sabadell", "Celta Fortuna", "Córdoba CF", "FC Andorra", "Girona FC", "Granada CF", "Real Sociedad B", "RCD Mallorca",
+  "Real Oviedo", "Real Sporting", "Real Valladolid CF", "SD Eibar", "UD Almería", "UD Las Palmas",
+];
+// Nombres cortos o alternativos con los que la gente escribe estos clubes en "Otro…".
+const ACRED_HYPERMOTION_ALIAS = [
+  "Celta B", "Celta de Vigo B", "Celta Vigo B", "RC Celta B", "Sporting", "Sporting de Gijón", "Sporting Gijón", "Real Sporting de Gijón",
+  "Albacete", "Almería", "Tenerife", "Mallorca", "Burgos", "Las Palmas", "Castellón", "Girona", "Cádiz", "Granada", "Sabadell",
+  "Córdoba", "Eibar", "Valladolid", "Eldense", "Ceuta", "Leganés", "Andorra", "Oviedo", "Real Sociedad B",
+];
+// Mismo criterio que el de las demás comparaciones de equipos: sin tildes ni mayúsculas ni signos, y sin las
+// siglas de tipo de club (CD, UD, FC…). Coincidencia EXACTA: "Girona FC B" o "Real Oviedo Vetusta" no cuentan.
+function claveEquipoAcred(t) {
+  const SIGLAS = new Set(["cd", "ud", "sd", "cf", "rc", "rcd", "ce", "ad", "fc"]);
+  return String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ").trim().split(" ").filter((p) => p && !SIGLAS.has(p)).join(" ");
+}
+const ACRED_HYPERMOTION_CLAVES = new Set([...ACRED_HYPERMOTION_CLUBES, ...ACRED_HYPERMOTION_ALIAS].map(claveEquipoAcred));
+async function equipoEsHypermotion(env, equipo) {
+  const k = claveEquipoAcred(equipo);
+  if (!k) return false;
+  if (ACRED_HYPERMOTION_CLAVES.has(k)) return true;
+  // Clubes dados de alta a mano en el panel dentro de Hypermotion y alias externos que apuntan a uno de sus clubes.
+  try {
+    const { results: propios } = await env.DB.prepare("SELECT nombre FROM custom_clubs WHERE categoria = 'hypermotion'").all();
+    if ((propios || []).some((c) => claveEquipoAcred(c.nombre) === k)) return true;
+  } catch {}
+  try {
+    const { results: alias } = await env.DB.prepare("SELECT nombre_externo, nombre_interno FROM equipo_alias_externo").all();
+    if ((alias || []).some((a) => claveEquipoAcred(a.nombre_externo) === k && ACRED_HYPERMOTION_CLAVES.has(claveEquipoAcred(a.nombre_interno)))) return true;
+  } catch {}
+  return false;
 }
 
 // ---------- Configuración editable del formulario de acreditaciones ----------
@@ -4367,7 +6083,7 @@ function aplicarEstadoUsuario(payload, estado) {
   return payload;
 }
 
-async function requireAuth(request, env, url) {
+async function requireAuthBase(request, env, url) {
   const auth = request.headers.get("Authorization") || "";
   let token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
   // La descarga se abre como enlace normal del navegador (no un fetch),
@@ -4536,6 +6252,52 @@ function esAdmin(payload) {
   return !!payload && payload.rol === "admin";
 }
 
+// ---------- GESTORES DE CONTENIDO (Sub-Responsables de Contenido y de Diseño) ----------
+// Un Sub-Responsable de Contenido o de Diseño (líder de un grupo de trabajo, o miembro de un área de
+// Sub-Responsables, con ese nombre; o un área con el permiso "contenido") tiene permiso COMPLETO sobre las
+// galerías, la mediateca (Subir contenido) y las noticias/crónicas/resultados: ver, editar, mover y borrar lo
+// de cualquiera. NO es Responsable: usuarios, ajustes, formularios, analíticas, comentarios y el borrado
+// definitivo de la papelera siguen siendo solo de un Responsable. Solo redactores (un fotógrafo no entra).
+const GESTOR_CONTENIDO_REGEX = /^(contenidos?|disenos?)( y (contenidos?|disenos?))?$/;
+const nombreCargoNormalizado = (s) => String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim().replace(/^(el|la|los|las) /, "");
+const nombreEsGestorContenido = (s) => GESTOR_CONTENIDO_REGEX.test(nombreCargoNormalizado(s));
+
+// Conjunto de ids de usuario que son gestores de contenido (caché corta: un cambio se nota en segundos).
+async function uidsGestoresContenido(env) {
+  return memoCorta("gestores_contenido", 20000, async () => {
+    const uids = new Set();
+    try {
+      const grupos = await leerGruposTrabajo(env);
+      for (const g of grupos.grupos) {
+        if (nombreEsGestorContenido(g.nombre) && grupos.lideres[g.id]) uids.add(Number(grupos.lideres[g.id]));
+      }
+      const areas = await leerAreasSub(env);
+      for (const a of areas.areas) {
+        if (a.permiso !== "contenido") continue;
+        for (const uid of (areas.asignaciones[a.id] || [])) uids.add(Number(uid));
+      }
+    } catch (err) { console.error("gestores de contenido: no se pudieron leer", err); }
+    return uids;
+  });
+}
+
+async function marcarGestorContenido(env, payload) {
+  payload.gestor_contenido = false;
+  if (!payload || payload.rol !== "redactor") return payload;
+  payload.gestor_contenido = (await uidsGestoresContenido(env)).has(Number(payload.uid));
+  return payload;
+}
+
+// Responsable o gestor de contenido: lo que antes era solo "admin" en galerías, mediateca y contenido.
+const esAdminOGestor = (payload) => !!payload && (payload.rol === "admin" || payload.gestor_contenido === true);
+
+async function requireAuth(request, env, url) {
+  const payload = await requireAuthBase(request, env, url);
+  if (payload) await marcarGestorContenido(env, payload);
+  return payload;
+}
+
+
 function esRedactor(payload) {
   return !!payload && payload.rol === "redactor";
 }
@@ -4677,7 +6439,7 @@ function describirDispositivo(userAgent) {
 }
 
 // =====================================================================
-// VERIFICACIÓN EN DOS PASOS (TOTP, RFC 6238): OBLIGATORIA PARA ADMINISTRADORES, OPCIONAL PARA REDACTORES
+// VERIFICACIÓN EN DOS PASOS (TOTP, RFC 6238): OBLIGATORIA PARA RESPONSABLES, OPCIONAL PARA REDACTORES
 // =====================================================================
 // Los usuarios con un rol de ROLES_CON_2FA_OBLIGATORIO NO obtienen sesión solo con
 // usuario + contraseña: además deben tener configurada una app de
@@ -4857,6 +6619,53 @@ async function asegurarColumnas2fa(env) {
     throw err;
   });
   return _columnas2faListas;
+}
+// ---------- 2FA (TOTP) PARA LECTORES ----------
+// Mismo mecanismo que el de los redactores (secreto cifrado, códigos de un solo uso, 8 códigos de
+// recuperación), pero OPCIONAL y solo para cuentas con contraseña: se pide al entrar con correo y
+// contraseña. Quien entra con Google/Microsoft/Discord/X ya pasa por la verificación de ese proveedor.
+// Columnas en "readers": totp_secret, totp_activo, totp_ultimo_paso, totp_recovery
+// (ver worker/migracion_2fa_lectores.sql; si faltan, se crean solas la primera vez que se usa).
+let _columnas2faLectorListas = null;
+async function asegurarColumnas2faLector(env) {
+  if (_columnas2faLectorListas) return _columnas2faLectorListas;
+  _columnas2faLectorListas = (async () => {
+    try {
+      await env.DB.prepare("SELECT totp_secret, totp_activo, totp_ultimo_paso, totp_recovery FROM readers LIMIT 1").first();
+      return true;
+    } catch (err) {
+      if (!/no such column|does not exist|undefined column/i.test(String((err && err.message) || err))) throw err;
+    }
+    console.warn("[2FA lectores] Faltan las columnas totp_* en readers: se crean ahora (migración automática).");
+    const tipoPaso = env.PGPOOL ? "BIGINT" : "INTEGER";
+    const sentencias = [
+      "ALTER TABLE readers ADD COLUMN totp_secret TEXT",
+      "ALTER TABLE readers ADD COLUMN totp_activo INTEGER NOT NULL DEFAULT 0",
+      `ALTER TABLE readers ADD COLUMN totp_ultimo_paso ${tipoPaso}`,
+      "ALTER TABLE readers ADD COLUMN totp_recovery TEXT",
+    ];
+    for (const sql of sentencias) {
+      try {
+        await env.DB.prepare(sql).run();
+      } catch (err) {
+        if (!/duplicate column|already exists/i.test(String((err && err.message) || err))) throw err;
+      }
+    }
+    return true;
+  })().catch((err) => {
+    _columnas2faLectorListas = null;
+    throw err;
+  });
+  return _columnas2faLectorListas;
+}
+async function crearDesafio2faLector(env, lector) {
+  // Sin "rid" ni "sid": requireReaderAuth lo rechaza, no sirve como sesión.
+  return createJWT({ fa2r: lector.id }, env.JWT_SECRET, 10 * 60);
+}
+async function leerDesafio2faLector(env, token) {
+  const p = await verifyJWT(token, env.JWT_SECRET);
+  if (!p || !p.fa2r || p.uid || p.rid) return null;
+  return p;
 }
 async function crearDesafio2fa(env, user) {
   // Sin "uid" ni "sid": requireAuth lo rechaza, no sirve como sesión.
@@ -5049,6 +6858,7 @@ async function requireAuthSubida(request, env) {
     console.error("requireAuthSubida: no se pudo comprobar la sesión/usuario:", err.message);
     return null;
   }
+  await marcarGestorContenido(env, payload);
   return payload;
 }
 
@@ -5064,6 +6874,35 @@ async function requireAuthSubida(request, env) {
 // con la cuenta en /api/readers/me/lecturas/sincronizar.
 const LECTURAS_MAX_GUARDADAS = 200;
 const LECTURAS_MAX_HISTORIAL = 100;
+
+// Autoreparación (D1): si en la base de datos aún no se ejecutó
+// worker/migracion_lecturas_cuenta.sql, cualquier consulta de guardadas/historial
+// fallaba con "no such table" y el principal respondía 500. Las tablas se crean en
+// caliente (IF NOT EXISTS: no toca nada si ya existen) una vez por instancia.
+let LECTURAS_TABLAS_LISTAS = false;
+async function asegurarTablasLecturas(env) {
+  if (LECTURAS_TABLAS_LISTAS) return;
+  const sentencias = [
+    `CREATE TABLE IF NOT EXISTS reader_saved_articles (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       reader_id INTEGER NOT NULL REFERENCES readers(id) ON DELETE CASCADE,
+       article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+       UNIQUE (reader_id, article_id))`,
+    "CREATE INDEX IF NOT EXISTS idx_reader_saved_reader_fecha ON reader_saved_articles(reader_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_reader_saved_article ON reader_saved_articles(article_id)",
+    `CREATE TABLE IF NOT EXISTS reader_reading_history (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       reader_id INTEGER NOT NULL REFERENCES readers(id) ON DELETE CASCADE,
+       article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+       UNIQUE (reader_id, article_id))`,
+    "CREATE INDEX IF NOT EXISTS idx_reader_history_reader_fecha ON reader_reading_history(reader_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_reader_history_article ON reader_reading_history(article_id)",
+  ];
+  for (const sql of sentencias) await env.DB.prepare(sql).run();
+  LECTURAS_TABLAS_LISTAS = true;
+}
 
 // Ids de noticia válidos de una lista que llega del cliente: acepta números,
 // cadenas numéricas u objetos {id}; descarta lo demás y los repetidos; respeta
@@ -5877,6 +7716,57 @@ async function resolverCarpetaMediaDeSubida(env, valorRaw, esPrivado) {
   return { id };
 }
 
+// Vínculo con la galería de partido (match_gallery) de VARIOS archivos a la vez: vincula,
+// cambia de partido o quita el vínculo (resultId undefined = no tocar). Misma lógica que
+// PUT /api/media/:id, pero por lotes. Es un "extra": un fallo aquí no deshace lo ya guardado.
+async function sincronizarGaleriaPartidoLoteMedia(env, payload, mediaIds, resultId, equipoGaleria) {
+  if (resultId === undefined || !mediaIds.length) return;
+  try {
+    if (resultId === null) {
+      for (let i = 0; i < mediaIds.length; i += 50) {
+        const lote = mediaIds.slice(i, i + 50);
+        await env.DB.prepare(`DELETE FROM match_gallery WHERE media_id IN (${lote.map(() => "?").join(",")})`).bind(...lote).run();
+      }
+      return;
+    }
+    const enlaces = new Map();
+    for (let i = 0; i < mediaIds.length; i += 50) {
+      const lote = mediaIds.slice(i, i + 50);
+      const { results } = await env.DB.prepare(
+        `SELECT id, media_id, result_id FROM match_gallery WHERE media_id IN (${lote.map(() => "?").join(",")})`
+      ).bind(...lote).all();
+      for (const f of (results || [])) enlaces.set(Number(f.media_id), f);
+    }
+    const maxFila = await env.DB.prepare("SELECT COALESCE(MAX(orden), -1) AS max_orden FROM match_gallery WHERE result_id = ?").bind(resultId).first();
+    let siguienteOrden = (maxFila && maxFila.max_orden !== null && maxFila.max_orden !== undefined ? Number(maxFila.max_orden) : -1) + 1;
+    const sentencias = [];
+    const cambiadosDePartido = [];
+    for (const mediaId of mediaIds) {
+      const existente = enlaces.get(mediaId);
+      if (existente) {
+        sentencias.push(env.DB.prepare("UPDATE match_gallery SET result_id = ?, equipo = ? WHERE id = ?").bind(resultId, equipoGaleria, existente.id));
+        if (Number(existente.result_id) !== Number(resultId)) cambiadosDePartido.push(existente.id);
+      } else {
+        sentencias.push(env.DB.prepare(
+          "INSERT INTO match_gallery (result_id, media_id, orden, vinculado_por_id, equipo) VALUES (?, ?, ?, ?, ?)"
+        ).bind(resultId, mediaId, siguienteOrden++, payload.uid, equipoGaleria));
+      }
+    }
+    for (let i = 0; i < sentencias.length; i += 80) await env.DB.batch(sentencias.slice(i, i + 80));
+    // La portada lo es de UN partido: lo que cambia de partido no puede llegar ya marcado.
+    for (let i = 0; i < cambiadosDePartido.length; i += 50) {
+      const lote = cambiadosDePartido.slice(i, i + 50);
+      try {
+        await env.DB.prepare(`UPDATE match_gallery SET es_portada = 0 WHERE id IN (${lote.map(() => "?").join(",")})`).bind(...lote).run();
+      } catch (errPortada) {
+        if (!esErrorColumnaFaltante(errPortada)) console.error("No se pudo quitar la marca de portada al editar en lote:", errPortada.message);
+      }
+    }
+  } catch (err) {
+    console.error("No se pudo actualizar el vínculo con la galería del partido al editar media en lote:", err.message);
+  }
+}
+
 // Guarda la carpeta en la fila de media ya insertada. Va aparte del INSERT
 // (que tiene varios reintentos por columnas que pueden faltar) para no
 // tocar esa cadena; si falla, el archivo queda subido sin carpeta.
@@ -5987,7 +7877,7 @@ const PLANTILLAS_COLLAGE_VALIDAS = ["2-horizontal", "2-vertical", "3-una-grande"
 // "collage"). Devuelve un array nuevo; no modifica el original.
 function separarFotosSeguidas(imagenes, portadaUrl, hayMarcador) {
   if (!Array.isArray(imagenes)) return imagenes;
-  const esFoto = (f) => f && typeof f === "object" && f.tipo !== "tweet" && typeof f.url === "string" && f.url.trim() !== "";
+  const esFoto = (f) => f && typeof f === "object" && !esItemNoFoto(f) && typeof f.url === "string" && f.url.trim() !== "";
   const enTexto = (f) => ["inicio", "personalizada", "medio", "final"].includes(f.posicion);
   const hueco = (f) => {
     if (f.posicion === "inicio") return "inicio";
@@ -6085,21 +7975,60 @@ function copiarMarcasSeccionFusion(origen, destino) {
 // tenga generado el recorte (g_auto es lento la primera vez) cuando X/Facebook/
 // WhatsApp pidan el enlace. La transformación DEBE coincidir con
 // seoImagenSocialWorker() de public/src-worker.js (misma URL = misma caché).
-const IMG_SOCIAL_TRANSFORM_PROGRAMADA = "f_jpg,q_auto:good,c_fill,g_auto,w_1200,h_630";
+// Con foco elegido, la URL incluye el centro de recorte calculado con las medidas de la
+// foto (fl_getinfo), exactamente como el worker del sitio, para que sea LA MISMA URL.
+async function medidasFotoCloudinaryApi(url, i, marca) {
+  const controlador = new AbortController();
+  const temporizador = setTimeout(() => controlador.abort(), 1500);
+  try {
+    const r = await fetch(url.slice(0, i + marca.length) + "fl_getinfo/" + url.slice(i + marca.length), { signal: controlador.signal });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const w = Number(j && j.input && j.input.width), h = Number(j && j.input && j.input.height);
+    return w > 0 && h > 0 ? { w, h } : null;
+  } catch { return null; } finally { clearTimeout(temporizador); }
+}
 function precalentarVistaPreviaProgramada(ctx, programadoPara, imagenPortada, imagenes) {
   if (!programadoPara || !ctx || typeof ctx.waitUntil !== "function") return;
-  const primera = Array.isArray(imagenes) ? imagenes.find((x) => x && x.tipo !== "tweet" && x.url) : null;
+  const primera = Array.isArray(imagenes) ? imagenes.find((x) => x && !esItemNoFoto(x) && x.url) : null;
   const url = imagenPortada || (primera && primera.url);
   if (!url || typeof url !== "string") return;
   const marca = "/upload/";
   const i = url.indexOf(marca);
-  if (i === -1 || !/res\.cloudinary\.com/.test(url)) return;
-  const destino = url.slice(0, i + marca.length) + IMG_SOCIAL_TRANSFORM_PROGRAMADA + "/" + url.slice(i + marca.length);
-  ctx.waitUntil(
-    fetch(destino, { headers: { "Accept": "image/jpeg,image/*;q=0.8" } })
-      .then((r) => r.arrayBuffer())
-      .catch(() => {})
-  );
+  // SEGURIDAD: se comprueba el HOST real de la URL, no que el texto
+  // "res.cloudinary.com" aparezca en cualquier parte (p. ej. en el path de
+  // https://otro-sitio.com/res.cloudinary.com/upload/...), porque a
+  // continuación el Worker hace un fetch() a esa URL.
+  let hostCloudinary = false;
+  try { hostCloudinary = new URL(url).hostname === "res.cloudinary.com"; } catch { /* URL inválida: no se pide */ }
+  if (i === -1 || !hostCloudinary) return;
+  ctx.waitUntil((async () => {
+    try {
+      const foco = focoDePortada({ imagen_url: url, imagenes });
+      const dims = await medidasFotoCloudinaryApi(url, i, marca);
+      const destino = url.slice(0, i + marca.length) + transformacionSocialCloudinary(foco, 1200, 630, dims) + "/" + url.slice(i + marca.length);
+      const r = await fetch(destino, { headers: { "Accept": "image/jpeg,image/*;q=0.8" } });
+      await r.arrayBuffer();
+    } catch { /* solo es un precalentado */ }
+  })());
+}
+
+// Vídeos incrustados en una noticia (mismo array "imagenes" que las fotos y los
+// tweets, marcados con tipo:"video"). Se admiten solo dos orígenes, los mismos que
+// permite la CSP de la página de noticia: YouTube (se incrusta con youtube-nocookie)
+// y vídeos ya subidos a la mediateca (Cloudinary). Cualquier otra URL se descarta.
+const POSICIONES_VIDEO_VALIDAS = POSICIONES_TWEET_VALIDAS;
+function datosVideoDesdeUrlServidor(url) {
+  const limpia = String(url || "").trim().replace(/^http:/i, "https:");
+  const yt = limpia.match(/^https:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?(?:[^#]*&)?v=|shorts\/|embed\/|live\/)|youtu\.be\/)([A-Za-z0-9_-]{11})(?:[?&#/]|$)/i);
+  if (yt) return { plataforma: "youtube", url: `https://www.youtube.com/watch?v=${yt[1]}` };
+  if (/^https:\/\/res\.cloudinary\.com\/[^/\s]+\/video\/upload\/\S+$/i.test(limpia)) return { plataforma: "cloudinary", url: limpia };
+  return null;
+}
+// Tweets y vídeos no son fotos: no cuentan como portada, ni para la vista previa, ni
+// para las comprobaciones de fotos repetidas.
+function esItemNoFoto(x) {
+  return !!x && typeof x === "object" && (x.tipo === "tweet" || x.tipo === "video");
 }
 
 function normalizarImagenes(raw) {
@@ -6116,6 +8045,19 @@ function normalizarImagenes(raw) {
         if (!url || !plataforma) return null;
         const posicion = POSICIONES_TWEET_VALIDAS.includes(item.posicion) ? item.posicion : "galeria";
         const resultado = { tipo: "tweet", url, plataforma, posicion };
+        if (posicion === "personalizada") {
+          const n = parseInt(item.trasParrafo, 10);
+          resultado.trasParrafo = Number.isFinite(n) && n > 0 ? n : 1;
+        }
+        copiarMarcasSeccionFusion(item, resultado);
+        return resultado;
+      }
+      if (item && typeof item === "object" && item.tipo === "video" && typeof item.url === "string") {
+        const datos = datosVideoDesdeUrlServidor(item.url);
+        if (!datos) return null;
+        const posicion = POSICIONES_VIDEO_VALIDAS.includes(item.posicion) ? item.posicion : "galeria";
+        const resultado = { tipo: "video", url: datos.url, plataforma: datos.plataforma, posicion };
+        if (typeof item.titulo === "string" && item.titulo.trim()) resultado.titulo = item.titulo.trim().slice(0, 120);
         if (posicion === "personalizada") {
           const n = parseInt(item.trasParrafo, 10);
           resultado.trasParrafo = Number.isFinite(n) && n > 0 ? n : 1;
@@ -6476,6 +8418,42 @@ async function remapearSlugsFusion(env, articulos) {
   return salida;
 }
 
+// Datos del encuentro y estadísticas de un partido (Centro de partido): solo se aceptan las claves
+// conocidas, con texto recortado y números acotados. Devuelve el objeto limpio o null si queda vacío.
+const DATOS_PARTIDO_TEXTO = ["arbitro", "asistencia", "tv", "clima"];
+const DATOS_PARTIDO_ESTADISTICAS = ["posesion", "tiros", "tiros_puerta", "corners", "faltas", "fueras_juego", "paradas"];
+function normalizarDatosPartido(d) {
+  if (!d || typeof d !== "object" || Array.isArray(d)) return null;
+  const limpio = {};
+  for (const clave of DATOS_PARTIDO_TEXTO) {
+    const v = typeof d[clave] === "string" || typeof d[clave] === "number" ? String(d[clave]).trim().slice(0, 120) : "";
+    if (v) limpio[clave] = v;
+  }
+  const est = d.estadisticas && typeof d.estadisticas === "object" && !Array.isArray(d.estadisticas) ? d.estadisticas : null;
+  if (est) {
+    const e = {};
+    for (const clave of DATOS_PARTIDO_ESTADISTICAS) {
+      const par = est[clave];
+      if (!Array.isArray(par) || par.length !== 2) continue;
+      const [l, v] = par.map((x) => (x === null || x === undefined || x === "" ? null : Number(x)));
+      const ok = (x) => x === null || (Number.isFinite(x) && x >= 0 && x <= (clave === "posesion" ? 100 : 999));
+      if (l === null && v === null) continue;
+      if (!ok(l) || !ok(v)) continue;
+      e[clave] = [l === null ? 0 : Math.round(l), v === null ? 0 : Math.round(v)];
+    }
+    if (Object.keys(e).length) limpio.estadisticas = e;
+  }
+  return Object.keys(limpio).length ? limpio : null;
+}
+// La columna guarda texto JSON: la API pública lo devuelve ya como objeto (o null).
+function leerDatosPartido(fila) {
+  if (!fila || !Object.prototype.hasOwnProperty.call(fila, "datos_partido")) return fila;
+  let d = fila.datos_partido;
+  if (typeof d === "string") { try { d = JSON.parse(d); } catch { d = null; } }
+  fila.datos_partido = d && typeof d === "object" ? d : null;
+  return fila;
+}
+
 // Ficha técnica de una crónica: solo se aceptan las claves conocidas, con texto
 // recortado y límites de tamaño (el panel ya la manda normalizada, pero la API
 // es pública para cualquier redactor: no se guarda nada que no sea texto).
@@ -6750,6 +8728,318 @@ function normalizarJugadoresAlineacion(raw) {
 // actividad del equipo desde el panel ("Historial"). No debe romper
 // nunca la operación principal: si falla el registro, solo se anota en
 // los logs del Worker.
+// ---------- GRUPOS DE TRABAJO (solo para organizarse) ----------
+// Etiqueta interna que un admin da a cada persona del equipo (p. ej. "Previas", "Fotografía",
+// "Redes"). NO da ni quita permisos: no toca rol ni categorías (única excepción: «Redacción nivel N», ver nivelRedactorDeGrupo). Se guarda en settings,
+// clave 'grupos_trabajo' (sin columnas nuevas, así no hay migraciones):
+//   { grupos: [{ id, nombre, color, descripcion }], asignaciones: { "<userId>": "<grupoId>" } }
+// Cada persona tiene como mucho un grupo.
+const GRUPOS_TRABAJO_MAX = 30;
+const GRUPOS_TRABAJO_COLORES = ["#d1132e", "#1d6fd1", "#1c9c5b", "#e08a00", "#7a4fd6", "#0e8fa6", "#c2358a", "#5b6672"];
+// Solo redactores y Responsables pueden estar en un grupo de trabajo (los fotógrafos no).
+const GRUPOS_TRABAJO_ROLES = ["admin", "redactor"];
+const puedeTenerGrupoTrabajo = (rol) => GRUPOS_TRABAJO_ROLES.includes(rol);
+
+// Un grupo de trabajo llamado «Redacción nivel N» (N = 1..4; también vale «Redacción N3» o sin tilde)
+// lleva el nivel de redactor asociado: al poner a un redactor en él, su nivel pasa a N automáticamente
+// (con constancia en nivel_historial y en el historial de actividad). Cualquier otro grupo sigue
+// siendo solo una etiqueta. Los Responsables siempre están en el nivel máximo y no se tocan.
+function nivelRedactorDeGrupo(nombre) {
+  const m = /^\s*redacci[oó]n\s*[-–·:]?\s*(?:nivel|n)\s*\.?\s*(\d)\s*$/i.exec(String(nombre || ""));
+  const n = m ? Number(m[1]) : 0;
+  return n >= 1 && n <= NIVEL_MAXIMO ? n : null;
+}
+
+// Nivel que tenía cada redactor ANTES de que un grupo «Redacción nivel N» se lo cambiara: { "<userId>": nivel }.
+// Sirve para devolverle ese nivel cuando sale del grupo. Se guarda en settings, clave 'grupos_nivel_previo'.
+async function leerNivelesPreviosGrupos(env) {
+  const salida = {};
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'grupos_nivel_previo'").first();
+    const bruto = row && row.value ? JSON.parse(row.value) : {};
+    if (bruto && typeof bruto === "object" && !Array.isArray(bruto)) {
+      for (const [uid, n] of Object.entries(bruto)) if (/^\d{1,12}$/.test(uid) && Number.isInteger(n) && n >= 1 && n <= NIVEL_MAXIMO) salida[uid] = n;
+    }
+  } catch (err) { console.error("niveles previos de grupos: valor ilegible", err); }
+  return salida;
+}
+async function guardarNivelesPreviosGrupos(env, mapa) {
+  await env.DB.prepare(
+    `INSERT INTO settings (key, value, updated_at) VALUES ('grupos_nivel_previo', ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+  ).bind(JSON.stringify(mapa)).run();
+}
+
+// ---------- CARGOS: Responsable y Sub-Responsable ----------
+// "Responsable" es el nombre público del rol técnico `admin`. Cada Responsable puede llevar una o
+// dos FUNCIONES (p. ej. "el Sitio Web" y "los Recursos Humanos"), que se escriben CON artículo para
+// que el cargo suene natural: "Responsable del Sitio Web y los Recursos Humanos". Se guardan en
+// settings, clave 'responsables_funciones': { "<userId>": ["el Sitio Web", "los Recursos Humanos"] }.
+// Un "Sub-Responsable de <grupo>" es el líder de un grupo de trabajo (ver `lideres` más abajo).
+// Ninguno de estos cargos cambia permisos por sí solo: son el nombre que se ve en el equipo.
+const FUNCIONES_RESPONSABLE_MAX = 2;
+const FUNCION_RESPONSABLE_LARGO = 40;
+
+// "el Sitio Web" -> "del Sitio Web"; "las acreditaciones" -> "de las acreditaciones"; "Redes" -> "de Redes".
+function funcionConDe(f) {
+  const t = typeof f === "string" ? f.trim() : "";
+  if (!t) return "";
+  return /^el\s/i.test(t) ? "del " + t.replace(/^el\s+/i, "") : "de " + t;
+}
+
+// tituloCargo("Responsable", ["el Diseño", "las Redes Sociales"]) -> "Responsable del Diseño y las Redes Sociales"
+function tituloCargo(prefijo, funciones) {
+  const fs = (Array.isArray(funciones) ? funciones : []).filter((x) => typeof x === "string" && x.trim());
+  if (!fs.length) return prefijo;
+  return `${prefijo} ${funcionConDe(fs[0])}${fs.slice(1).map((x) => " y " + x.trim()).join("")}`;
+}
+
+// Devuelve { funciones } o { error }.
+function limpiarFuncionesResponsable(entrada) {
+  if (!Array.isArray(entrada)) return { error: "Faltan las funciones del Responsable" };
+  const vistas = new Set();
+  const funciones = [];
+  for (const f of entrada) {
+    if (typeof f !== "string") return { error: "Función no válida" };
+    const t = f.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+    if (!t) continue;
+    if (t.length > FUNCION_RESPONSABLE_LARGO) return { error: `Cada función puede tener como máximo ${FUNCION_RESPONSABLE_LARGO} caracteres` };
+    const clave = t.toLowerCase();
+    if (vistas.has(clave)) continue;
+    vistas.add(clave);
+    funciones.push(t);
+  }
+  if (funciones.length > FUNCIONES_RESPONSABLE_MAX) return { error: `Cada Responsable puede tener como máximo ${FUNCIONES_RESPONSABLE_MAX} funciones` };
+  return { funciones };
+}
+
+// Lee { "<userId>": [funciones] } de settings. Nunca lanza: si el valor está roto, devuelve {}.
+async function leerFuncionesResponsables(env) {
+  const salida = {};
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'responsables_funciones'").first();
+    if (!row || !row.value) return salida;
+    const bruto = JSON.parse(row.value);
+    if (!bruto || typeof bruto !== "object" || Array.isArray(bruto)) return salida;
+    for (const [uid, lista] of Object.entries(bruto)) {
+      if (!/^\d{1,12}$/.test(uid)) continue;
+      const r = limpiarFuncionesResponsable(lista);
+      if (!r.error && r.funciones.length) salida[uid] = r.funciones;
+    }
+  } catch (err) { console.error("funciones de responsables: valor ilegible", err); }
+  return salida;
+}
+
+async function guardarFuncionesResponsables(env, mapa) {
+  await env.DB.prepare(
+    `INSERT INTO settings (key, value, updated_at) VALUES ('responsables_funciones', ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+  ).bind(JSON.stringify(mapa)).run();
+}
+
+// Quita de `lideres` a quien ya no está en el grupo que lidera (o si el grupo ya no existe).
+function podarLideresGrupos(datos) {
+  const vivos = new Set(datos.grupos.map((g) => g.id));
+  const limpios = {};
+  for (const [gid, uid] of Object.entries(datos.lideres || {})) {
+    if (vivos.has(gid) && datos.asignaciones[String(uid)] === gid) limpios[gid] = uid;
+  }
+  datos.lideres = limpios;
+  return datos;
+}
+
+// Cargo visible de una persona: Responsable (+ funciones) o Sub-Responsable de su grupo y/o de áreas
+// (separados por " · " si son varios); si no, null.
+function cargoDeUsuario(u, grupos, funcionesPorUsuario, areasSub) {
+  if (u.rol === "admin") return tituloCargo("Responsable", funcionesPorUsuario[String(u.id)] || []);
+  const titulos = [];
+  const g = grupos.grupos.find((x) => String(grupos.lideres[x.id]) === String(u.id));
+  if (g) titulos.push(tituloCargo("Sub-Responsable", [g.nombre]));
+  if (areasSub && AREAS_SUB_ROLES.includes(u.rol)) for (const a of areasDeUsuarioSub(areasSub, u.id)) titulos.push(tituloArea(a));
+  return titulos.length ? titulos.join(" · ") : null;
+}
+
+// ---------- SUB-RESPONSABLES DE ÁREAS (cargos que NO son grupos de trabajo) ----------
+// Un Sub-Responsable de área (p. ej. "Sub-Responsable de las acreditaciones") es una persona con un cargo
+// visible que, además, puede llevar un PERMISO concreto. Se guarda en settings, clave 'subresponsables_areas':
+//   { areas: [{ id, nombre, permiso }], asignaciones: { "<areaId>": [<userId>, ...] } }
+// `nombre` lleva artículo ("las acreditaciones") y el cargo se compone con tituloCargo. El área
+// "acreditaciones" existe siempre y da el permiso "acreditaciones": gestionar las SOLICITUDES de acreditación
+// (ver, aprobar/rechazar, indicaciones, historial). NO da el PIN, el acceso, la edición del formulario, la
+// importación ni borrar solicitudes: eso sigue siendo solo de un Responsable. Las demás áreas son solo cargo.
+const AREAS_SUB_MAX = 20;
+const AREAS_SUB_PERSONAS_MAX = 5;
+const AREAS_SUB_ROLES = ["redactor"]; // un Responsable ya lo puede todo y un fotógrafo no entra en estas áreas
+const AREA_SUB_ACREDITACIONES = { id: "acreditaciones", nombre: "las acreditaciones", permiso: "acreditaciones" };
+
+function areasSubVacias() { return { areas: [{ ...AREA_SUB_ACREDITACIONES }], asignaciones: {} }; }
+
+function limpiarAreasSub(entrada) {
+  if (!Array.isArray(entrada)) return { error: "Faltan las áreas" };
+  const texto = (v, max) => (typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max) : "");
+  const ids = new Set([AREA_SUB_ACREDITACIONES.id]);
+  const nombres = new Set([AREA_SUB_ACREDITACIONES.nombre.toLowerCase()]);
+  const areas = [{ ...AREA_SUB_ACREDITACIONES }]; // fija: no se puede quitar ni renombrar
+  for (const a of entrada) {
+    if (!a || typeof a !== "object") return { error: "Área no válida" };
+    if (a.id === AREA_SUB_ACREDITACIONES.id) continue;
+    const nombre = texto(a.nombre, 40);
+    if (!nombre) return { error: "Todas las áreas necesitan un nombre" };
+    const clave = nombre.toLowerCase();
+    if (nombres.has(clave)) return { error: `Hay dos áreas llamadas "${nombre}"` };
+    nombres.add(clave);
+    let id = typeof a.id === "string" ? a.id.trim() : "";
+    if (!/^[a-z0-9_-]{1,24}$/i.test(id)) id = "";
+    if (!id || ids.has(id)) {
+      do { id = "a" + crypto.randomUUID().replace(/-/g, "").slice(0, 8); } while (ids.has(id));
+    }
+    ids.add(id);
+    areas.push({ id, nombre, permiso: nombreEsGestorContenido(nombre) ? "contenido" : null }); // «el Contenido» / «el Diseño» dan permiso de gestor de contenido
+  }
+  if (areas.length > AREAS_SUB_MAX) return { error: `Como máximo puede haber ${AREAS_SUB_MAX} áreas` };
+  return { areas };
+}
+
+// Nunca lanza: si el valor está roto, devuelve el catálogo por defecto sin nadie asignado.
+async function leerAreasSub(env) {
+  const datos = areasSubVacias();
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'subresponsables_areas'").first();
+    if (!row || !row.value) return datos;
+    const bruto = JSON.parse(row.value);
+    const r = limpiarAreasSub(bruto && Array.isArray(bruto.areas) ? bruto.areas : []);
+    if (r.error) return datos;
+    datos.areas = r.areas;
+    const vivas = new Set(r.areas.map((a) => a.id));
+    const asig = bruto.asignaciones && typeof bruto.asignaciones === "object" && !Array.isArray(bruto.asignaciones) ? bruto.asignaciones : {};
+    for (const [aid, lista] of Object.entries(asig)) {
+      if (!vivas.has(aid) || !Array.isArray(lista)) continue;
+      const uids = [...new Set(lista.map(Number).filter((n) => Number.isInteger(n) && n > 0))].slice(0, AREAS_SUB_PERSONAS_MAX);
+      if (uids.length) datos.asignaciones[aid] = uids;
+    }
+  } catch (err) { console.error("sub-responsables de áreas: valor ilegible", err); }
+  return datos;
+}
+
+async function guardarAreasSub(env, datos) {
+  await env.DB.prepare(
+    `INSERT INTO settings (key, value, updated_at) VALUES ('subresponsables_areas', ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+  ).bind(JSON.stringify({ areas: datos.areas, asignaciones: datos.asignaciones })).run();
+}
+
+const tituloArea = (area) => tituloCargo("Sub-Responsable", [area.nombre]);
+const areasDeUsuarioSub = (datos, uid) => datos.areas.filter((a) => (datos.asignaciones[a.id] || []).includes(Number(uid)));
+
+// ¿Puede esta persona gestionar las solicitudes de acreditación? Un Responsable siempre; un redactor solo
+// si es Sub-Responsable de un área con el permiso "acreditaciones". payload.rol viene ya refrescado de la
+// base por requireAuth, así que un cambio de rol o una cuenta desactivada se nota enseguida.
+async function puedeGestionarAcreditaciones(env, payload) {
+  if (!payload || !payload.uid) return false;
+  if (payload.rol === "admin") return true;
+  if (!AREAS_SUB_ROLES.includes(payload.rol)) return false;
+  const datos = await leerAreasSub(env);
+  return datos.areas.some((a) => a.permiso === "acreditaciones" && (datos.asignaciones[a.id] || []).includes(Number(payload.uid)));
+}
+
+// Áreas con sus personas activas (solo redactores), tal como las consume el panel.
+async function respuestaAreasSub(env) {
+  const datos = await leerAreasSub(env);
+  const { results } = await env.DB.prepare("SELECT id, nombre, rol, avatar_url FROM users WHERE activo = 1 ORDER BY nombre").all();
+  const porId = new Map((results || []).map((u) => [Number(u.id), u]));
+  return {
+    areas: datos.areas.map((a) => ({
+      id: a.id,
+      nombre: a.nombre,
+      permiso: a.permiso || null,
+      titulo: tituloArea(a),
+      fija: a.id === AREA_SUB_ACREDITACIONES.id,
+      miembros: (datos.asignaciones[a.id] || [])
+        .map((uid) => porId.get(uid))
+        .filter((u) => u && AREAS_SUB_ROLES.includes(u.rol))
+        .map((u) => ({ id: Number(u.id), nombre: u.nombre, avatar: u.avatar_url || null })),
+    })),
+  };
+}
+
+function limpiarGruposTrabajo(entrada) {
+  if (!entrada || typeof entrada !== "object" || !Array.isArray(entrada.grupos)) return { error: "Faltan los grupos de trabajo" };
+  if (entrada.grupos.length > GRUPOS_TRABAJO_MAX) return { error: `Como máximo puede haber ${GRUPOS_TRABAJO_MAX} grupos de trabajo` };
+  const texto = (v, max) => (typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max) : "");
+  const ids = new Set();
+  const nombres = new Set();
+  const grupos = [];
+  for (const g of entrada.grupos) {
+    if (!g || typeof g !== "object") return { error: "Grupo no válido" };
+    const nombre = texto(g.nombre, 40);
+    if (!nombre) return { error: "Todos los grupos necesitan un nombre" };
+    const clave = nombre.toLowerCase();
+    if (nombres.has(clave)) return { error: `Hay dos grupos llamados "${nombre}"` };
+    nombres.add(clave);
+    let id = typeof g.id === "string" ? g.id.trim() : "";
+    if (!/^[a-z0-9_-]{1,24}$/i.test(id)) id = "";
+    if (!id || ids.has(id)) {
+      do { id = "g" + crypto.randomUUID().replace(/-/g, "").slice(0, 8); } while (ids.has(id));
+    }
+    ids.add(id);
+    const color = typeof g.color === "string" && /^#[0-9a-f]{6}$/i.test(g.color.trim())
+      ? g.color.trim().toLowerCase()
+      : GRUPOS_TRABAJO_COLORES[grupos.length % GRUPOS_TRABAJO_COLORES.length];
+    grupos.push({ id, nombre, color, descripcion: texto(g.descripcion, 120) });
+  }
+  return { grupos };
+}
+
+// Lee y limpia lo guardado; las asignaciones a grupos que ya no existen se descartan.
+async function leerGruposTrabajo(env) {
+  const datos = { grupos: [], asignaciones: {}, lideres: {} };
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'grupos_trabajo'").first();
+    if (!row || !row.value) return datos;
+    const bruto = JSON.parse(row.value);
+    const r = limpiarGruposTrabajo({ grupos: Array.isArray(bruto.grupos) ? bruto.grupos : [] });
+    if (r.error) return datos;
+    datos.grupos = r.grupos;
+    const vivos = new Set(r.grupos.map((g) => g.id));
+    const asig = bruto.asignaciones && typeof bruto.asignaciones === "object" ? bruto.asignaciones : {};
+    for (const [uid, gid] of Object.entries(asig)) {
+      if (/^\d{1,12}$/.test(uid) && typeof gid === "string" && vivos.has(gid)) datos.asignaciones[uid] = gid;
+    }
+    // Sub-Responsable (líder) de cada grupo: { "<grupoId>": <userId> }. Solo vale si esa persona sigue
+    // asignada a ese grupo; cada grupo tiene como mucho uno.
+    const lid = bruto.lideres && typeof bruto.lideres === "object" && !Array.isArray(bruto.lideres) ? bruto.lideres : {};
+    for (const [gid, uid] of Object.entries(lid)) {
+      const n = Number(uid);
+      if (vivos.has(gid) && Number.isInteger(n) && n > 0) datos.lideres[gid] = n;
+    }
+    podarLideresGrupos(datos);
+  } catch (err) { console.error("grupos de trabajo: valor ilegible", err); }
+  return datos;
+}
+
+async function guardarGruposTrabajo(env, datos) {
+  await env.DB.prepare(
+    `INSERT INTO settings (key, value, updated_at) VALUES ('grupos_trabajo', ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+  ).bind(JSON.stringify({ grupos: datos.grupos, asignaciones: datos.asignaciones, lideres: datos.lideres || {} })).run();
+}
+
+// Respuesta común de GET/PUT: grupos con sus miembros activos y el grupo de quien pregunta.
+async function respuestaGruposTrabajo(env, payload) {
+  const datos = await leerGruposTrabajo(env);
+  const { results } = await env.DB.prepare("SELECT id, nombre, rol, avatar_url FROM users WHERE activo = 1 ORDER BY nombre").all();
+  const porId = new Map((results || []).map((u) => [String(u.id), u]));
+  const grupos = datos.grupos.map((g) => {
+    const miembros = Object.entries(datos.asignaciones)
+      .filter(([uid, gid]) => gid === g.id && porId.has(uid) && puedeTenerGrupoTrabajo(porId.get(uid).rol))
+      .map(([uid]) => ({ id: Number(uid), nombre: porId.get(uid).nombre, rol: porId.get(uid).rol, avatar: porId.get(uid).avatar_url || null }));
+    // Sub-Responsable del grupo: solo si sigue activo y es miembro (si no, el grupo queda sin líder).
+    const lider = miembros.find((m) => String(m.id) === String(datos.lideres[g.id])) || null;
+    return { ...g, miembros, lider, titulo_lider: tituloCargo("Sub-Responsable", [g.nombre]) };
+  });
+  return { grupos, mio: puedeTenerGrupoTrabajo(payload.rol) ? (datos.asignaciones[String(payload.uid)] || null) : null };
+}
+
 // ---------- ORGANIGRAMA (Funcionalidades > Información) ----------
 // Se guarda entero como JSON en settings bajo la clave 'organigrama'.
 // Forma: { orientacion: "vertical"|"horizontal", nodos: [{ id, nombre, cargo,
@@ -6836,8 +9126,381 @@ function limpiarOrganigrama(entrada) {
   return { datos: { orientacion: entrada.orientacion === "horizontal" ? "horizontal" : "vertical", nodos } };
 }
 
+// ---------- ELIMINATORIAS Y PLAYOFFS (automáticos) ----------
+// Los cuadros de playoff de cada liga se generan SOLOS al leer: no se guardan ni
+// hay editor. Cuando una liga llega a su última jornada se mira la clasificación y
+// se enfrentan los equipos; cuando los partidos del playoff existen en `results`
+// (jornada posterior a la última de la liga regular) se enlazan solos y de ahí
+// salen los marcadores, las fechas, los penaltis y quién pasa de ronda.
+//   modo "clasificacion": el cuadro sale de la tabla. puestos [p1, p2, p3, p4] →
+//     semifinales p1-p4 y p2-p3, y final; un cuadro por grupo.
+//   modo "sorteo": los clasificados salen de la tabla pero los cruces los decide un
+//     sorteo, así que se montan con los partidos de playoff que haya en results.
+// Cuadro devuelto: { id, nombre, competicion, grupo, temporada, tipo, visible, clasif,
+//   nota, rondas: [{ id, nombre, cruces: [{ id, a, b, partidos: [{ a, b, fecha,
+//   resultado_id }], penaltis: { a, b }, ganador, empate, sa, sb }] }] }
+// `empate` = 'a' | 'b': equipo que pasa si el global sigue igualado (el mejor
+// clasificado, donde la normativa lo prevé). `sa`/`sb` = semilla { g: grupo, p: puesto }.
+// Si cambia el formato de una liga, se toca SOLO esta tabla.
+const ELIM_LIGAS = {
+  hypermotion: { titulo: "Playoff de ascenso a Primera División", modo: "clasificacion", puestos: [3, 4, 5, 6], partidos: 2, empate: "" },
+  primera_federacion: { titulo: "Playoff de ascenso a Segunda División", modo: "clasificacion", puestos: [2, 3, 4, 5], partidos: 2, empate: "mejor" },
+  segunda_federacion: { titulo: "Playoff de ascenso a Primera Federación", modo: "sorteo", puestos: [2, 3, 4, 5], partidos: 2, empate: "" },
+};
+const ELIM_MAX_VUELTAS = 8;
+// true: los cuadros de modo "clasificacion" se enseñan YA, con la clasificación del momento
+// (marcados «Provisional»), y se fijan al terminar la última jornada. false: solo salen cuando la
+// última jornada ha empezado.
+const ELIM_CUADRO_PROVISIONAL = true;
+
+function elimGoles(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 && n <= 99 ? n : null;
+}
+function elimFecha(v) {
+  const s = String(v || "").trim();
+  return /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$/.test(s) ? s : "";
+}
+
+// ---- Enlace con los partidos reales (tabla results) y avance de ganadores ----
+// Nada de esto se guarda: se calcula al leer. Un partido del cuadro con
+// resultado_id manda sobre los goles/fecha/penaltis escritos a mano. Los
+// ganadores de una ronda rellenan los equipos vacíos de la siguiente (el cruce
+// k de la ronda siguiente recoge a los ganadores de los cruces 2k y 2k+1 de la
+// anterior), pero un equipo escrito a mano nunca se pisa.
+function elimNorm(s) {
+  return String(s == null ? "" : s).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// true = A es el local; false = A es el visitante; null = los equipos no encajan
+// (o todavía no se sabe quién es A y quién B).
+function elimOrientar(res, x, indice) {
+  const loc = elimNorm(res.equipo_local), vis = elimNorm(res.equipo_visitante);
+  const a = elimNorm(x.a), b = elimNorm(x.b);
+  if (a && b) {
+    if (a === loc && b === vis) return true;
+    if (a === vis && b === loc) return false;
+    return null;
+  }
+  if (a) return a === loc ? true : a === vis ? false : null;
+  if (b) return b === vis ? true : b === loc ? false : null;
+  return indice === 0 ? true : null;
+}
+
+function elimPartidoReal(res, directo) {
+  const sinCubrir = Number(res.finalizado_no_cubierto) === 1;
+  const estado = sinCubrir ? "sin_cubrir" : String(res.estado || "programado");
+  const gl = elimGoles(res.goles_local), gv = elimGoles(res.goles_visitante);
+  const jugado = (estado === "finalizado" || estado === "en_juego") && gl != null && gv != null;
+  const pl = elimGoles(res.penaltis_local), pv = elimGoles(res.penaltis_visitante);
+  const hayPen = estado === "finalizado" && pl != null && pv != null;
+  return {
+    id: res.id, local: res.equipo_local, visitante: res.equipo_visitante, estado, desajuste: false,
+    a: jugado ? (directo ? gl : gv) : null,
+    b: jugado ? (directo ? gv : gl) : null,
+    pen_a: hayPen ? (directo ? pl : pv) : null,
+    pen_b: hayPen ? (directo ? pv : pl) : null,
+    fecha: elimFecha(res.fecha_partido_retrasado || res.fecha_partido),
+  };
+}
+
+// Quién pasa: forzado a mano; si no, global de goles y, si hay empate, penaltis.
+// Los partidos en juego no cierran el cruce. Igualado sin penaltis = sin ganador.
+function elimGanador(x) {
+  if (x.ganador === "a" || x.ganador === "b") return x.ganador;
+  const partidos = Array.isArray(x.partidos) && x.partidos.length ? x.partidos : [{ a: null, b: null }];
+  let ga = 0, gb = 0, jugados = 0;
+  for (const p of partidos) {
+    if (p.a != null && p.b != null && !p.vivo) { ga += p.a; gb += p.b; jugados++; }
+  }
+  if (jugados !== partidos.length) return "";
+  if (ga > gb) return "a";
+  if (gb > ga) return "b";
+  const pen = x.penaltis || {};
+  if (pen.a != null && pen.b != null && pen.a !== pen.b) return pen.a > pen.b ? "a" : "b";
+  if (x.empate === "a" || x.empate === "b") return x.empate; // sigue igualado: pasa el mejor clasificado
+  return "";
+}
+function elimGanadorNombre(x) {
+  const g = elimGanador(x);
+  return g === "a" ? x.a : g === "b" ? x.b : "";
+}
+
+// Equipo que ocupa el puesto `sem.p` de la clasificación del grupo `sem.g` (o del
+// grupo del cuadro si la semilla no lo indica). clasif = { [competicion]:
+// [{ grupo, tabla, completo }] }. Con clasif = 'final' solo vale cuando todos los
+// partidos del grupo están finalizados; con 'provisional', con lo jugado hasta hoy.
+function elimEquipoPorPuesto(c, clasif, sem) {
+  if (!sem || !c.clasif || !clasif) return "";
+  const grupos = clasif[c.competicion] || [];
+  const g = elimNorm(sem.g || c.grupo);
+  let ent = grupos.find((e) => elimNorm(e.grupo) === g);
+  if (!ent && !g && grupos.length === 1) ent = grupos[0];
+  if (!ent) return "";
+  if (c.clasif === "final" && !ent.completo) return "";
+  const fila = ent.tabla[sem.p - 1];
+  return fila ? fila.equipo : "";
+}
+
+// Devuelve una copia de los cuadros con los partidos reales aplicados y los
+// ganadores avanzados. mapa = { [results.id]: fila de results }. clasif (opcional):
+// clasificaciones para rellenar solos los equipos de la 1.ª ronda por su puesto.
+// Cada partido vinculado lleva `real`; los equipos rellenados solos, auto_a/auto_b.
+function elimEfectivo(cuadros, mapa, clasif) {
+  const out = JSON.parse(JSON.stringify(cuadros));
+  for (const c of out) {
+    c.rondas.forEach((r, ri) => {
+      const previa = ri > 0 ? c.rondas[ri - 1] : null;
+      const avanza = !!previa && r.cruces.length > 0 && previa.cruces.length === r.cruces.length * 2;
+      r.cruces.forEach((x, xi) => {
+        if (ri === 0) {
+          if (!x.a) { const e = elimEquipoPorPuesto(c, clasif, x.sa); if (e) { x.a = e; x.auto_a = e; } }
+          if (!x.b) { const e = elimEquipoPorPuesto(c, clasif, x.sb); if (e) { x.b = e; x.auto_b = e; } }
+        }
+        if (avanza) {
+          const na = elimGanadorNombre(previa.cruces[2 * xi]);
+          const nb = elimGanadorNombre(previa.cruces[2 * xi + 1]);
+          if (!x.a && na) { x.a = na; x.auto_a = na; }
+          if (!x.b && nb) { x.b = nb; x.auto_b = nb; }
+        }
+        x.partidos.forEach((p, pi) => {
+          p.real = null;
+          const res = p.resultado_id ? mapa[p.resultado_id] : null;
+          if (!res) return;
+          if (pi === 0 && !x.a && !x.b) {
+            x.a = res.equipo_local; x.auto_a = res.equipo_local;
+            x.b = res.equipo_visitante; x.auto_b = res.equipo_visitante;
+          }
+          const directo = elimOrientar(res, x, pi);
+          if (directo === null) {
+            p.real = { id: res.id, local: res.equipo_local, visitante: res.equipo_visitante, estado: String(res.estado || ""), desajuste: true, a: null, b: null, pen_a: null, pen_b: null, fecha: "" };
+            return;
+          }
+          const real = elimPartidoReal(res, directo);
+          p.real = real;
+          p.a = real.a;
+          p.b = real.b;
+          p.vivo = real.estado === "en_juego";
+          if (real.fecha) p.fecha = real.fecha;
+        });
+        const ultimo = x.partidos[x.partidos.length - 1];
+        if (ultimo && ultimo.real && !ultimo.real.desajuste && ultimo.real.pen_a != null && ultimo.real.pen_b != null) {
+          x.penaltis = { a: ultimo.real.pen_a, b: ultimo.real.pen_b };
+        }
+      });
+    });
+  }
+  return out;
+}
+
+// Temporada en curso: desde el 1 de julio.
+function elimTemporada(ahora) {
+  const ini = ahora.getUTCMonth() >= 6 ? ahora.getUTCFullYear() : ahora.getUTCFullYear() - 1;
+  return { desde: `${ini}-07-01`, etiqueta: `${ini}/${String(ini + 1).slice(2)}` };
+}
+
+// Lee de results los partidos de la temporada de cada liga con playoff automático.
+async function elimLeerLigas(env, ahora) {
+  const { desde } = elimTemporada(ahora);
+  const out = {};
+  for (const comp of Object.keys(ELIM_LIGAS)) {
+    let results;
+    try {
+      ({ results } = await env.DB.prepare(
+        `SELECT id, grupo, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, estado, fecha_partido,
+                fecha_partido_retrasado, penaltis_local, penaltis_visitante, finalizado_no_cubierto
+         FROM results WHERE competicion = ? AND fecha_partido >= ?`
+      ).bind(comp, desde).all());
+    } catch (err) {
+      // Si a la base le falta alguna columna opcional (migración sin aplicar) la consulta explícita falla:
+      // se reintenta con SELECT * para que los cuadros no desaparezcan en silencio.
+      console.error("eliminatorias: consulta completa fallida, se usa SELECT *", err);
+      ({ results } = await env.DB.prepare(
+        "SELECT * FROM results WHERE competicion = ? AND fecha_partido >= ?"
+      ).bind(comp, desde).all());
+    }
+    out[comp] = results || [];
+  }
+  return out;
+}
+
+// Separa, por grupo, la liga regular de lo que viene después. En una liga a doble
+// vuelta de n equipos hay n/2 partidos en la jornada 1 y 2·(n-1) jornadas, así que
+// la última jornada sale de los propios datos. Lo que tenga una jornada posterior
+// (los partidos del playoff) no cuenta para la tabla y va a `fuera`.
+//   completo  = la liga regular ha terminado (todos sus partidos finalizados)
+//   empezada  = la última jornada ya ha empezado (algún partido en juego o finalizado)
+function elimAnalizarLiga(filas, calcular) {
+  const grupos = [...new Set(filas.map((p) => p.grupo || ""))].sort((a, b) => a.localeCompare(b, "es"));
+  const info = [];
+  const fuera = [];
+  for (const g of grupos) {
+    const del = filas.filter((p) => (p.grupo || "") === g);
+    // Partidos por jornada = el máximo de las tres primeras (nunca son de playoff). Mirar solo la J1
+    // fallaba si faltaba un partido en ella: la liga parecía más corta y la "última jornada" salía antes.
+    const porJornada = [1, 2, 3].map((j) => del.filter((p) => Number(p.jornada) === j).length);
+    const n = Math.max(...porJornada) * 2;
+    if (n < 4) { fuera.push(...del); continue; } // sin liga regular propia: solo pueden ser partidos de playoff
+    const ultima = 2 * (n - 1);
+    const regular = del.filter((p) => Number(p.jornada) <= ultima);
+    fuera.push(...del.filter((p) => Number(p.jornada) > ultima));
+    const finales = regular.filter((p) => Number(p.jornada) === ultima);
+    info.push({
+      grupo: g || null,
+      tabla: calcular(regular),
+      ultima,
+      completo: finales.length > 0 && regular.every((p) => p.estado === "finalizado"),
+      empezada: finales.some((p) => p.estado === "en_juego" || p.estado === "finalizado"),
+    });
+  }
+  return { grupos: info, fuera };
+}
+
+const elimHueco = () => ({ a: null, b: null, fecha: "", resultado_id: null });
+
+// Cuadro de 4 equipos (semifinales + final) de un grupo, con las semillas por puesto.
+function elimCuadroClasificacion(comp, cfg, gi, temporada) {
+  const g = gi.grupo || "";
+  const [p1, p2, p3, p4] = cfg.puestos;
+  const cruce = (id, sa, sb) => ({
+    id, a: "", b: "", partidos: Array.from({ length: cfg.partidos }, elimHueco),
+    penaltis: { a: null, b: null }, ganador: "", empate: cfg.empate === "mejor" ? "a" : "", sa, sb,
+  });
+  const notas = [gi.completo
+    ? "Cruces fijados con la clasificación final."
+    : "Provisional: según la clasificación actual; los cruces se fijarán al terminar la última jornada."];
+  if (cfg.empate === "mejor") notas.push("Si sigue el empate en el global, pasa el mejor clasificado.");
+  return {
+    id: `${comp}-${elimNorm(g) || "unico"}`,
+    nombre: cfg.titulo, competicion: comp, grupo: g, temporada, tipo: "playoff_ascenso", visible: true,
+    clasif: gi.completo ? "final" : "provisional", nota: notas.join(" "),
+    rondas: [
+      { id: "r1", nombre: "Semifinales", cruces: [cruce("x1", { g, p: p1 }, { g, p: p4 }), cruce("x2", { g, p: p2 }, { g, p: p3 })] },
+      { id: "r2", nombre: "Final", cruces: [cruce("x3", null, null)] },
+    ],
+  };
+}
+
+const elimFechaPartido = (p) => String(p.fecha_partido_retrasado || p.fecha_partido || "");
+const elimPorFecha = (x, y) => elimFechaPartido(x).localeCompare(elimFechaPartido(y)) || Number(x.id) - Number(y.id);
+
+// Liga con sorteo: los clasificados (puestos del playoff de cada grupo ya terminado)
+// salen de la tabla y los cruces, de los partidos de playoff que haya en results
+// entre ellos. La ronda de cada cruce es 1 + la última en la que ha jugado alguno
+// de sus equipos (semifinales → final). Sin partidos todavía, no hay cuadro.
+function elimCuadroSorteo(comp, cfg, an, temporada) {
+  const clasificados = new Set();
+  for (const gi of an.grupos) {
+    if (!gi.completo) continue;
+    for (const p of cfg.puestos) { const f = gi.tabla[p - 1]; if (f) clasificados.add(elimNorm(f.equipo)); }
+  }
+  if (!clasificados.size) return null;
+  const pares = new Map();
+  for (const p of an.fuera) {
+    const l = elimNorm(p.equipo_local), v = elimNorm(p.equipo_visitante);
+    if (!clasificados.has(l) || !clasificados.has(v)) continue;
+    const k = [l, v].sort().join("|");
+    if (!pares.has(k)) pares.set(k, []);
+    pares.get(k).push(p);
+  }
+  if (!pares.size) return null;
+  const lista = [...pares.values()].map((ps) => ps.sort(elimPorFecha).slice(0, cfg.partidos)).sort((x, y) => elimPorFecha(x[0], y[0]));
+  const ultimaRonda = new Map();
+  const rondas = [];
+  for (const ps of lista) {
+    const l = elimNorm(ps[0].equipo_local), v = elimNorm(ps[0].equipo_visitante);
+    const n = Math.max(ultimaRonda.get(l) || 0, ultimaRonda.get(v) || 0) + 1;
+    ultimaRonda.set(l, n); ultimaRonda.set(v, n);
+    while (rondas.length < n) rondas.push({ id: `r${rondas.length + 1}`, nombre: "", cruces: [] });
+    const partidos = ps.map((p) => ({ a: null, b: null, fecha: "", resultado_id: p.id }));
+    while (partidos.length < cfg.partidos) partidos.push(elimHueco());
+    rondas[n - 1].cruces.push({
+      id: `x${n}-${rondas[n - 1].cruces.length + 1}`, a: ps[0].equipo_local, b: ps[0].equipo_visitante, partidos,
+      penaltis: { a: null, b: null }, ganador: "", empate: "", sa: null, sb: null,
+    });
+  }
+  rondas.forEach((r, i) => { r.nombre = rondas.length <= 2 ? (i === rondas.length - 1 && rondas.length === 2 ? "Final" : "Semifinales") : `Ronda ${i + 1}`; });
+  return {
+    id: `${comp}-playoff`, nombre: cfg.titulo, competicion: comp, grupo: "", temporada, tipo: "playoff_ascenso", visible: true,
+    clasif: "", nota: "Los cruces salen del sorteo: aparecen en cuanto hay partidos programados.", rondas,
+  };
+}
+
+// Aplica los partidos reales y enlaza solos, ronda a ronda, los partidos de playoff
+// de cada cruce cuyos dos equipos ya se conocen (por semilla o por ganador previo).
+// Devuelve los cuadros efectivos (con los marcadores y los equipos rellenados).
+function elimMontar(cuadros, piscina, clasif) {
+  const mapa = {};
+  for (const p of piscina) mapa[p.id] = p;
+  let efectivos = elimEfectivo(cuadros, mapa, clasif);
+  for (let vuelta = 0; vuelta < ELIM_MAX_VUELTAS; vuelta++) {
+    let cambio = false;
+    cuadros.forEach((c, ci) => c.rondas.forEach((r, ri) => r.cruces.forEach((x, xi) => {
+      const e = efectivos[ci].rondas[ri].cruces[xi];
+      if (!e.a || !e.b || x.partidos.every((p) => p.resultado_id)) return;
+      const A = elimNorm(e.a), B = elimNorm(e.b);
+      const candidatos = piscina.filter((p) => {
+        const l = elimNorm(p.equipo_local), v = elimNorm(p.equipo_visitante);
+        return (l === A && v === B) || (l === B && v === A);
+      }).sort(elimPorFecha);
+      x.partidos.forEach((p, i) => { if (!p.resultado_id && candidatos[i]) { p.resultado_id = candidatos[i].id; cambio = true; } });
+    })));
+    if (!cambio) break;
+    efectivos = elimEfectivo(cuadros, mapa, clasif);
+  }
+  return efectivos;
+}
+
+// Donde la normativa lo prevé, el empate global lo resuelve la clasificación de liga:
+// pasa el equipo mejor colocado en la tabla de su grupo.
+function elimAplicarEmpate(efectivos, an, cfg) {
+  if (cfg.empate !== "mejor") return;
+  for (const c of efectivos) {
+    const gi = an.grupos.find((g) => (g.grupo || "") === (c.grupo || ""));
+    if (!gi) continue;
+    const pos = new Map(gi.tabla.map((f, i) => [elimNorm(f.equipo), i]));
+    const puesto = (nombre) => (pos.has(elimNorm(nombre)) ? pos.get(elimNorm(nombre)) : 999);
+    for (const r of c.rondas) for (const x of r.cruces) {
+      if (x.a && x.b) x.empate = puesto(x.a) <= puesto(x.b) ? "a" : "b";
+    }
+  }
+}
+
+// Todos los cuadros que toca enseñar ahora. ligas = { [competición]: filas de results }.
+// calcular = calcularClasificacionBoletin. Pura: no toca la base de datos.
+function elimGenerarCuadros(ligas, calcular, ahora) {
+  const temporada = elimTemporada(ahora).etiqueta;
+  const salida = [];
+  for (const [comp, cfg] of Object.entries(ELIM_LIGAS)) {
+    const an = elimAnalizarLiga(ligas[comp] || [], calcular);
+    const clasif = { [comp]: an.grupos.map((g) => ({ grupo: g.grupo, tabla: g.tabla, completo: g.completo })) };
+    const cuadros = [];
+    if (cfg.modo === "sorteo") {
+      const c = elimCuadroSorteo(comp, cfg, an, temporada);
+      if (c) cuadros.push(c);
+    } else {
+      for (const gi of an.grupos) {
+        if (!(ELIM_CUADRO_PROVISIONAL || gi.completo || gi.empezada) || gi.tabla.length < Math.max(...cfg.puestos)) continue;
+        cuadros.push(elimCuadroClasificacion(comp, cfg, gi, temporada));
+      }
+    }
+    if (!cuadros.length) continue;
+    const efectivos = elimMontar(cuadros, an.fuera, clasif);
+    elimAplicarEmpate(efectivos, an, cfg);
+    salida.push(...efectivos);
+  }
+  return elimParaPublico(salida);
+}
+
+// Los partidos públicos no necesitan el detalle interno del enlace.
+function elimParaPublico(efectivos) {
+  for (const c of efectivos) c.rondas.forEach((r) => r.cruces.forEach((x) => x.partidos.forEach((p) => { delete p.real; })));
+  return efectivos;
+}
+
 // ---------- RESPONSABILIDADES ESPECÍFICAS (Funcionalidades > Responsabilidades) ----------
-// Solo administradores. Se guarda entero como JSON en settings bajo la clave
+// Solo Responsables. Se guarda entero como JSON en settings bajo la clave
 // 'responsabilidades'. Forma:
 //   { relaciones: { clubes: [slug, ...],
 //                   contactos: [{ id, tipo, entidad, area, nombre, cargo,
@@ -6986,13 +9649,17 @@ function responsabilidadesVacias() {
   return { relaciones: { clubes: [], contactos: [] }, rrhh: { redactores: [], fotografos: [], fichajes: [], contacto_mensual: { dia: 1, historial: [], marcados: { mes: "", ids: [] } } } };
 }
 // Colaboradores con la cuenta activa (redactores y fotógrafos) para el contacto
-// de RRHH (cada dos meses). Solo la lee un administrador. Además de nombre, rol y
+// de RRHH (cada dos meses). Solo la lee un Responsable. Además de nombre, rol y
 // correo devuelve datos para conocer mejor a cada persona: foto, equipos, nivel,
 // fecha de alta, último acceso, noticias publicadas (total y en los últimos dos
 // meses), última noticia y una biografía corta. Si la consulta ampliada falla
 // (p. ej. falta alguna columna en esa base de datos) se usa la básica; si también
 // falla, vacío.
+// 10 min de caché: la consulta ampliada recorre articles y activity_log y solo la usa RRHH.
 async function colaboradoresActivosResp(env) {
+  return memoCorta("colab:activos", 600000, () => colaboradoresActivosRespSinCache(env));
+}
+async function colaboradoresActivosRespSinCache(env) {
   const base = (u) => ({
     id: Number(u.id),
     nombre: String(u.nombre || "").trim() || "Sin nombre",
@@ -7037,7 +9704,7 @@ async function colaboradoresActivosResp(env) {
 // (hasta 3) de cada redactor o fotógrafo activo (users.equipo). El panel los marca
 // solo en las checklists de RRHH. Devuelve { redactores: { "Club": ["Nombre"] },
 // fotografos: { … } }; no se guarda nada, se calcula en cada lectura. Los
-// administradores no cuentan. Si la consulta falla, devuelve vacío.
+// Responsables no cuentan. Si la consulta falla, devuelve vacío.
 async function asignacionesAutoResp(env) {
   const out = { redactores: Object.create(null), fotografos: Object.create(null) };
   try {
@@ -7074,9 +9741,472 @@ async function registrarActividad(env, request, payload, { accion, entidad = nul
       detalle ? JSON.stringify(detalle) : null,
       ip
     ).run();
+    // Guardián de Responsables: solo acciones sensibles de una cuenta admin (nunca rompe el registro).
+    if (payload && payload.rol === "admin" && payload.uid) await guardianEvaluar(env, payload, accion);
   } catch (err) {
     console.log("Error al registrar actividad:", err.message);
   }
+}
+
+// ===== GUARDIAN-ADMINS:INICIO =====
+// GUARDIÁN DE RESPONSABLES (admins): detecta actividad sospechosa de una cuenta de Responsable en el
+// panel (muchos borrados, cambios de rol/desactivaciones en cadena, contraseñas restablecidas en
+// serie...) y, si se pasa del umbral, de forma AUTOMÁTICA:
+//   1) le quita el rol de Responsable (pasa a redactor) y cierra todas sus sesiones;
+//   2) devuelve de la papelera lo que esa cuenta borró dentro de la ventana (noticias y archivos);
+//   3) lo registra (activity_log, acción guardian_bloqueo) y avisa por Discord y por correo a los
+//      demás Responsables.
+// Para volver a darle el rol basta con editar su usuario (Usuarios > Colaboradores > rol).
+// Seguridad contra bloqueos: NUNCA actúa si no queda otro Responsable activo (solo avisa), y se pueden
+// eximir cuentas (settings "guardian_admins" -> exentos). Sin migraciones: usa activity_log y settings.
+// Puntos por acción dentro de la ventana (por defecto 40 puntos en 10 min); editar_usuario solo
+// puntúa si cambia el rol o desactiva (marcas _rol_cambiado/_desactivado del detalle).
+const GUARDIAN_PESOS = {
+  eliminar_articulo: 3, eliminar_media: 2, eliminar_resultado: 3, eliminar_usuario: 6, eliminar_lector: 3,
+  borrar_comentario: 1, borrar_encuesta: 2, borrar_podcast: 3, borrar_noticia_rapida: 2,
+  borrar_producto_tienda: 3, borrar_pedido_tienda: 2, eliminar_carpeta_media: 3, borrar_votacion_interna: 2,
+  formulario_eliminado: 5, vaciar_papelera: 6, restablecer_password: 5, crear_usuario: 3,
+  editar_usuario: 6, editar_settings: 1,
+};
+// La cuenta #1 (la del dueño del medio, Adrià) está exenta por defecto: puede hacer limpiezas masivas sin que el guardián actúe.
+const GUARDIAN_CONFIG_DEFECTO = { activo: true, ventana_min: 10, umbral: 40, exentos: [1] };
+const GUARDIAN_MAX_RESTAURAR = 60;
+
+function guardianLimpiarConfig(bruto) {
+  const c = { ...GUARDIAN_CONFIG_DEFECTO, exentos: [...GUARDIAN_CONFIG_DEFECTO.exentos] };
+  if (!bruto || typeof bruto !== "object") return c;
+  if (typeof bruto.activo === "boolean") c.activo = bruto.activo;
+  const v = Number(bruto.ventana_min);
+  if (Number.isFinite(v)) c.ventana_min = Math.min(60, Math.max(5, Math.round(v)));
+  const u = Number(bruto.umbral);
+  if (Number.isFinite(u)) c.umbral = Math.min(500, Math.max(20, Math.round(u)));
+  if (Array.isArray(bruto.exentos)) {
+    c.exentos = Array.from(new Set(bruto.exentos.map((x) => Number(x)).filter((x) => Number.isInteger(x) && x > 0))).slice(0, 20);
+  }
+  return c;
+}
+
+async function guardianLeerConfig(env) {
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'guardian_admins'").first();
+    if (!row || !row.value) return guardianLimpiarConfig(null);
+    return guardianLimpiarConfig(JSON.parse(row.value));
+  } catch { return guardianLimpiarConfig(null); }
+}
+
+function guardianDesde(ventanaMin) {
+  return new Date(Date.now() - ventanaMin * 60000).toISOString().slice(0, 19).replace("T", " ");
+}
+
+// Puntos de una cuenta en la ventana + desglose por acción.
+async function guardianPuntos(env, uid, cfg) {
+  const acciones = Object.keys(GUARDIAN_PESOS);
+  const marcas = acciones.map(() => "?").join(",");
+  const { results } = await env.DB.prepare(
+    `SELECT accion, detalle FROM activity_log WHERE usuario_id = ? AND created_at >= ? AND accion IN (${marcas}) ORDER BY id DESC LIMIT 500`
+  ).bind(uid, guardianDesde(cfg.ventana_min), ...acciones).all();
+  let puntos = 0;
+  const resumen = {};
+  for (const f of results || []) {
+    let peso = GUARDIAN_PESOS[f.accion] || 0;
+    if (f.accion === "editar_usuario") {
+      let d = null;
+      try { d = f.detalle ? JSON.parse(f.detalle) : null; } catch { d = null; }
+      peso = d && (d._rol_cambiado === true || d._desactivado === true) ? peso : 0;
+    }
+    if (!peso) continue;
+    puntos += peso;
+    resumen[f.accion] = (resumen[f.accion] || 0) + 1;
+  }
+  return { puntos, resumen };
+}
+
+// Llamar tras registrar una actividad. Nunca lanza.
+async function guardianEvaluar(env, payload, accion) {
+  try {
+    if (!payload || !payload.uid || payload.rol !== "admin") return;
+    if (!Object.prototype.hasOwnProperty.call(GUARDIAN_PESOS, accion)) return;
+    const cfg = await guardianLeerConfig(env);
+    if (!cfg.activo || cfg.exentos.includes(Number(payload.uid))) return;
+    const { puntos, resumen } = await guardianPuntos(env, payload.uid, cfg);
+    if (puntos < cfg.umbral) return;
+    await guardianActuar(env, payload.uid, cfg, puntos, resumen);
+  } catch (err) {
+    console.error("[guardian] no se pudo evaluar:", err && err.message);
+  }
+}
+
+async function guardianActuar(env, uid, cfg, puntos, resumen) {
+  const u = await env.DB.prepare("SELECT id, nombre, rol, activo FROM users WHERE id = ?").bind(uid).first();
+  if (!u || u.rol !== "admin") return; // ya no es Responsable (otra petición se adelantó)
+  const { results: otros } = await env.DB.prepare(
+    "SELECT id, nombre, email FROM users WHERE rol = 'admin' AND activo = 1 AND id != ?"
+  ).bind(uid).all();
+  const sistema = { uid: null, nombre: "Guardián", rol: "sistema" };
+  const lista = Object.entries(resumen).map(([a, n]) => `${a} x${n}`).join(", ");
+
+  if (!otros || !otros.length) {
+    // Es el único Responsable activo: quitarle el rol dejaría el panel sin nadie al mando. Solo se avisa.
+    const desde = guardianDesde(cfg.ventana_min);
+    const ya = await env.DB.prepare(
+      "SELECT id FROM activity_log WHERE accion = 'guardian_alerta' AND entidad_id = ? AND created_at >= ? LIMIT 1"
+    ).bind(String(uid), desde).first();
+    if (ya) return;
+    await registrarActividad(env, null, sistema, {
+      accion: "guardian_alerta", entidad: "usuario", entidad_id: uid,
+      descripcion: `Actividad sospechosa de "${u.nombre}" (${puntos} puntos en ${cfg.ventana_min} min). No se le ha quitado el rol porque es el único Responsable activo.`,
+      detalle: { puntos, acciones: resumen },
+    });
+    await enviarAlerta(env, `guardian-alerta:${uid}`, "Guardián: actividad sospechosa de un Responsable",
+      `${u.nombre} (único Responsable activo) suma ${puntos} puntos en ${cfg.ventana_min} min: ${lista}. No se ha tocado su rol.`);
+    return;
+  }
+
+  const desde = guardianDesde(cfg.ventana_min);
+  // 1) Cortar el daño primero: fuera el rol y fuera las sesiones.
+  await env.DB.prepare("UPDATE users SET rol = 'redactor' WHERE id = ? AND rol = 'admin'").bind(uid).run();
+  await env.DB.prepare("UPDATE sessions SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL").bind(uid).run();
+  invalidarCacheCorta("sesion:");
+
+  // 2) Devolver de la papelera lo que borró en la ventana (noticias y archivos).
+  let restaurados = 0, fallidos = 0, pendientes = 0;
+  try {
+    const { results: borrados } = await env.DB.prepare(
+      "SELECT * FROM papelera WHERE eliminado_por_id = ? AND created_at >= ? ORDER BY id ASC LIMIT ?"
+    ).bind(uid, desde, GUARDIAN_MAX_RESTAURAR + 1).all();
+    const lote = (borrados || []).slice(0, GUARDIAN_MAX_RESTAURAR);
+    pendientes = (borrados || []).length > GUARDIAN_MAX_RESTAURAR ? 1 : 0;
+    for (const fila of lote) {
+      try {
+        await papeleraRestaurar(env, fila);
+        restaurados++;
+        if (fila.tipo === "articulo" && typeof indexarArticuloBusqueda === "function") {
+          try { await indexarArticuloBusqueda(env, fila.entidad_id); } catch { /* el índice se rehace solo */ }
+        }
+      } catch (err) {
+        fallidos++;
+        console.error("[guardian] no se pudo restaurar de la papelera:", fila.id, err && err.message);
+      }
+    }
+  } catch (err) { console.error("[guardian] papelera:", err && err.message); }
+
+  // Lo que NO se puede devolver solo (no pasa por la papelera): se dice claro en el aviso.
+  const noRecuperable = ["eliminar_usuario", "eliminar_resultado", "eliminar_lector", "borrar_comentario", "borrar_encuesta",
+    "borrar_podcast", "borrar_noticia_rapida", "borrar_producto_tienda", "borrar_pedido_tienda", "formulario_eliminado",
+    "vaciar_papelera", "eliminar_carpeta_media", "borrar_votacion_interna", "editar_settings", "restablecer_password"]
+    .filter((a) => resumen[a]).map((a) => `${a} x${resumen[a]}`);
+
+  await registrarActividad(env, null, sistema, {
+    accion: "guardian_bloqueo", entidad: "usuario", entidad_id: uid,
+    descripcion: `El guardián ha quitado el rol de Responsable a "${u.nombre}" por actividad sospechosa (${puntos} puntos en ${cfg.ventana_min} min)`,
+    detalle: { rol_anterior: "admin", rol_nuevo: "redactor", puntos, acciones: resumen, restaurados, fallidos, pendientes: !!pendientes, no_recuperable: noRecuperable },
+  });
+
+  const texto = [
+    `${u.nombre} ha pasado a redactor y se le han cerrado las sesiones: ${puntos} puntos de actividad sospechosa en ${cfg.ventana_min} min (${lista}).`,
+    `Devuelto de la papelera: ${restaurados}${fallidos ? ` (fallaron ${fallidos})` : ""}${pendientes ? `; quedan más en la Papelera: restáuralos a mano` : ""}.`,
+    noRecuperable.length ? `No recuperable automáticamente (revisar a mano): ${noRecuperable.join(", ")}.` : "",
+    `Si fue un falso positivo, devuélvele el rol en Usuarios > Colaboradores.`,
+  ].filter(Boolean).join("\n");
+  await enviarAlerta(env, `guardian:${uid}:${Date.now()}`, "Guardián: Responsable degradado automáticamente", texto);
+  for (const o of (otros || []).slice(0, 10)) {
+    if (!o.email || !emailLectorEntregable(o.email)) continue;
+    try {
+      await enviarEmailNotificacion(env, { asunto: `Guardián: ${u.nombre} ha perdido el rol de Responsable`, texto }, { destinatario: String(o.email).trim() });
+    } catch { /* un correo que falla no debe parar el resto */ }
+  }
+}
+// ===== GUARDIAN-ADMINS:FIN =====
+
+// ---------- HISTORIAL DE VERSIONES DE NOTICIAS ----------
+// Cada vez que se crea o se edita una noticia desde el panel se guarda una copia
+// (titular, subtítulo, texto y datos básicos) en article_versions, con quién la
+// guardó y cuándo. Así, si un redactor pisa el texto de otro o se equivoca, se
+// puede ver qué cambió y recuperar la versión anterior desde el editor.
+// Esquema: worker/migracion_versiones_noticia.sql. Si la tabla aún no existe, las
+// noticias se guardan igual (el historial nunca puede romper un guardado).
+const VERSIONES_MAX_POR_NOTICIA = 60;
+const VERSIONES_COLUMNAS_NOTICIA = "titulo, subtitulo, contenido, tipo, categoria, categorias_adicionales, club, imagen_url, imagenes, resultado_id, publicado, programado_para, estado_borrador, autor_nombre, coautor_nombre, created_at, updated_at";
+
+// Huella barata (djb2) del contenido guardable: evita crear una versión nueva si
+// el guardado no cambió nada (p. ej. se pulsó "Guardar" dos veces seguidas).
+function huellaVersionNoticia(f) {
+  const base = [f.titulo, f.subtitulo, f.contenido, f.tipo, f.categoria, f.club, f.imagen_url, f.imagenes, f.resultado_id, f.categorias_adicionales]
+    .map((v) => (v === null || v === undefined ? "" : String(v))).join("\u0001");
+  let h = 5381;
+  for (let i = 0; i < base.length; i++) h = ((h << 5) + h + base.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(16) + ":" + base.length;
+}
+
+function fechaVersionComoTexto(v) {
+  if (!v) return aSqliteDatetimeUTC(new Date());
+  if (v instanceof Date) return isNaN(v.getTime()) ? aSqliteDatetimeUTC(new Date()) : aSqliteDatetimeUTC(v);
+  return String(v);
+}
+
+// Guarda en el historial el estado ACTUAL de la noticia en la base de datos.
+//   motivo: "creacion" | "edicion" | "revision" (Nivel 4 sobre contenido ajeno) | "inicial"
+//   soloSiNoHay: se usa justo ANTES de un UPDATE para las noticias anteriores al
+//     historial: si todavía no tienen ninguna versión, se guarda su estado previo
+//     (motivo "inicial", sin autor conocido) para poder volver a él.
+async function registrarVersionNoticia(env, payload, articuloId, motivo = "edicion", soloSiNoHay = false) {
+  try {
+    if (soloSiNoHay) {
+      const hay = await env.DB.prepare("SELECT 1 AS x FROM article_versions WHERE article_id = ? LIMIT 1").bind(articuloId).first();
+      if (hay) return;
+    }
+    const f = await env.DB.prepare(`SELECT ${VERSIONES_COLUMNAS_NOTICIA} FROM articles WHERE id = ?`).bind(articuloId).first();
+    if (!f) return;
+    const huella = huellaVersionNoticia(f);
+    const ultima = soloSiNoHay ? null
+      : await env.DB.prepare("SELECT numero, hash FROM article_versions WHERE article_id = ? ORDER BY id DESC LIMIT 1").bind(articuloId).first();
+    if (ultima && ultima.hash === huella) return;
+    const numero = ultima ? Number(ultima.numero) + 1 : 1;
+    const datos = JSON.stringify({
+      tipo: f.tipo ?? null, categoria: f.categoria ?? null, categorias_adicionales: f.categorias_adicionales ?? null,
+      club: f.club ?? null, imagen_url: f.imagen_url ?? null, imagenes: f.imagenes ?? null,
+      resultado_id: f.resultado_id ?? null, publicado: f.publicado ? 1 : 0, programado_para: f.programado_para ? fechaVersionComoTexto(f.programado_para) : null,
+      estado_borrador: f.estado_borrador ?? null, autor_nombre: f.autor_nombre ?? null, coautor_nombre: f.coautor_nombre ?? null,
+    });
+    // La copia "inicial" conserva la fecha de la última vez que se guardó la noticia.
+    const fecha = soloSiNoHay ? fechaVersionComoTexto(f.updated_at || f.created_at) : aSqliteDatetimeUTC(new Date());
+    await env.DB.prepare(
+      `INSERT INTO article_versions (article_id, numero, titulo, subtitulo, contenido, datos, hash, editor_id, editor_nombre, motivo, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      articuloId, numero, f.titulo || "", f.subtitulo ?? null, f.contenido || "", datos, huella,
+      soloSiNoHay ? null : (payload?.uid ?? null), soloSiNoHay ? "" : (payload?.nombre || "Desconocido"), motivo, fecha
+    ).run();
+    if (numero > VERSIONES_MAX_POR_NOTICIA) {
+      await env.DB.prepare(
+        "DELETE FROM article_versions WHERE article_id = ? AND id NOT IN (SELECT id FROM article_versions WHERE article_id = ? ORDER BY id DESC LIMIT ?)"
+      ).bind(articuloId, articuloId, VERSIONES_MAX_POR_NOTICIA).run();
+    }
+  } catch (err) {
+    if (!/no such table|does not exist|no existe/i.test(String((err && err.message) || err))) {
+      console.error("[versiones] No se pudo guardar la versión de la noticia:", err && err.message);
+    }
+  }
+}
+
+// ---------- PAPELERA: borrado recuperable de noticias y archivos ----------
+// Borrar una noticia o un archivo del panel ya no es definitivo: antes de quitar
+// la fila se guarda una copia completa (JSON) en la tabla "papelera" (esquema en
+// worker/migracion_papelera.sql), junto con lo que el borrado arrastraba por
+// ON DELETE CASCADE (comentarios, alineaciones, galerías, enlaces a noticias...).
+// Durante PAPELERA_DIAS días se puede restaurar desde el panel; pasado ese plazo
+// la limpia el cron y, en el caso de los archivos, SOLO entonces se destruye el
+// original en Cloudinary (hasta entonces el archivo sigue ahí).
+// Si no se consigue guardar la copia, NO se borra nada (falla cerrado).
+// Las noticias vuelven siempre como BORRADOR, sin programación ni banner, para
+// que una restauración nunca publique nada por sorpresa.
+const PAPELERA_DIAS = 30;
+
+class ErrorPapelera extends Error {
+  constructor(mensaje, status = 409) {
+    super(mensaje);
+    this.status = status;
+  }
+}
+
+function papeleraEsErrorTablaFaltante(err) {
+  return /no such table|does not exist|no existe/i.test(String((err && err.message) || err));
+}
+
+function papeleraInsertSql(tabla, fila) {
+  const cols = Object.keys(fila).filter((c) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(c));
+  return {
+    sql: `INSERT INTO ${tabla} (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`,
+    binds: cols.map((c) => (fila[c] === undefined ? null : fila[c])),
+  };
+}
+
+async function papeleraLeerRelacionados(env, tabla, columna, id) {
+  try {
+    const { results } = await env.DB.prepare(`SELECT * FROM ${tabla} WHERE ${columna} = ? ORDER BY id`).bind(id).all();
+    return results || [];
+  } catch (err) {
+    if (papeleraEsErrorTablaFaltante(err)) return [];
+    throw err;
+  }
+}
+
+async function papeleraInsertar(env, payload, f) {
+  const caduca = new Date(Date.now() + PAPELERA_DIAS * 86400000).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO papelera (tipo, subtipo, entidad_id, titulo, miniatura, datos, relacionados,
+        cloudinary_public_id, cloudinary_resource_type, cloud_name, eliminado_por_id, eliminado_por_nombre, purgar_despues)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    f.tipo, f.subtipo ?? null, f.entidadId, f.titulo || "", f.miniatura ?? null,
+    JSON.stringify(f.datos), JSON.stringify(f.relacionados || {}),
+    f.cloudinaryPublicId ?? null, f.cloudinaryResourceType ?? null, f.cloudName ?? null,
+    payload?.uid ?? null, payload?.nombre || "Desconocido", caduca
+  ).run();
+}
+
+// Copia la noticia (y lo que arrastra su borrado) a la papelera. No borra nada.
+async function papeleraGuardarArticulo(env, payload, id) {
+  const fila = await env.DB.prepare("SELECT * FROM articles WHERE id = ?").bind(id).first();
+  if (!fila) return;
+  const relacionados = {};
+  for (const tabla of ["comments", "article_media", "alineaciones"]) {
+    relacionados[tabla] = await papeleraLeerRelacionados(env, tabla, "article_id", id);
+  }
+  await papeleraInsertar(env, payload, {
+    tipo: "articulo", subtipo: fila.tipo, entidadId: id, titulo: fila.titulo,
+    miniatura: fila.imagen_url || null, datos: fila, relacionados,
+  });
+}
+
+// Copia el archivo de la mediateca a la papelera. No borra nada (ni en Cloudinary).
+async function papeleraGuardarMedia(env, payload, id) {
+  const fila = await env.DB.prepare("SELECT * FROM media WHERE id = ?").bind(id).first();
+  if (!fila) return;
+  const relacionados = {
+    match_gallery: await papeleraLeerRelacionados(env, "match_gallery", "media_id", id),
+    article_media: await papeleraLeerRelacionados(env, "article_media", "media_id", id),
+  };
+  await papeleraInsertar(env, payload, {
+    tipo: "media", subtipo: fila.tipo, entidadId: id, titulo: fila.titulo || fila.nombre_archivo,
+    miniatura: fila.tipo === "video" ? null : fila.cloudinary_url, datos: fila, relacionados,
+    cloudinaryPublicId: fila.cloudinary_public_id, cloudinaryResourceType: fila.cloudinary_resource_type,
+    cloudName: cloudNameDeUrlCloudinary(fila.cloudinary_url),
+  });
+}
+
+async function papeleraIdsExistentes(env, tabla, ids) {
+  const unicos = [...new Set(ids.filter((v) => v !== null && v !== undefined).map((v) => Number(v)))];
+  const vivos = new Set();
+  for (let i = 0; i < unicos.length; i += 50) {
+    const trozo = unicos.slice(i, i + 50);
+    const { results } = await env.DB.prepare(`SELECT id FROM ${tabla} WHERE id IN (${trozo.map(() => "?").join(", ")})`).bind(...trozo).all();
+    for (const r of results || []) vivos.add(Number(r.id));
+  }
+  return vivos;
+}
+
+// Si lo que apuntaba una columna (usuario, partido...) ya no existe, se deja a NULL
+// en vez de romper la restauración por la clave foránea.
+async function papeleraAnularReferencias(env, filas, refs) {
+  for (const [col, tabla] of refs) {
+    const vivos = await papeleraIdsExistentes(env, tabla, filas.map((f) => f[col]));
+    for (const f of filas) {
+      if (f[col] !== null && f[col] !== undefined && !vivos.has(Number(f[col]))) f[col] = null;
+    }
+  }
+}
+
+async function papeleraRestaurarArticulo(env, fila) {
+  const datos = JSON.parse(fila.datos);
+  const rel = JSON.parse(fila.relacionados || "{}");
+  const ocupado = await env.DB.prepare("SELECT id FROM articles WHERE id = ?").bind(datos.id).first();
+  if (ocupado) throw new ErrorPapelera("Ya existe una noticia con este identificador, así que no se puede restaurar encima.");
+  let slug = datos.slug;
+  let libre = false;
+  for (let n = 0; n < 50 && !libre; n++) {
+    if (n > 0) slug = `${datos.slug}-restaurada${n > 1 ? "-" + n : ""}`;
+    libre = !(await env.DB.prepare("SELECT id FROM articles WHERE slug = ?").bind(slug).first());
+  }
+  if (!libre) throw new ErrorPapelera("No se ha encontrado un enlace libre para la noticia.");
+  datos.slug = slug;
+  datos.publicado = 0;
+  for (const k of ["programado_para", "banner_urgente_hasta", "redes_destino"]) if (k in datos) datos[k] = null;
+  for (const k of ["destacado", "banner_urgente", "fuera_calendario"]) if (k in datos) datos[k] = 0;
+  if ("estado_borrador" in datos) datos.estado_borrador = "en_proceso"; // sin avisar por correo a la redacción
+
+  const comentarios = rel.comments || [];
+  const alineaciones = rel.alineaciones || [];
+  await papeleraAnularReferencias(env, [datos], [["autor_id", "users"], ["coautor_id", "users"], ["resultado_id", "results"]]);
+  await papeleraAnularReferencias(env, comentarios, [["moderado_por_id", "users"], ["reader_id", "readers"]]);
+  await papeleraAnularReferencias(env, alineaciones, [["autor_id", "users"], ["result_id", "results"]]);
+  const mediaVivos = await papeleraIdsExistentes(env, "media", (rel.article_media || []).map((r) => r.media_id));
+  const enlaces = (rel.article_media || []).filter((r) => mediaVivos.has(Number(r.media_id)));
+
+  const sentencias = [];
+  const anadir = (tabla, f) => { const q = papeleraInsertSql(tabla, f); sentencias.push(env.DB.prepare(q.sql).bind(...q.binds)); };
+  anadir("articles", datos);
+  for (const c of comentarios) anadir("comments", c);
+  for (const e of enlaces) anadir("article_media", e);
+  for (const a of alineaciones) anadir("alineaciones", a);
+  sentencias.push(env.DB.prepare("DELETE FROM papelera WHERE id = ?").bind(fila.id));
+  await env.DB.batch(sentencias);
+  return { slug };
+}
+
+async function papeleraRestaurarMedia(env, fila) {
+  const datos = JSON.parse(fila.datos);
+  const rel = JSON.parse(fila.relacionados || "{}");
+  if (await env.DB.prepare("SELECT id FROM media WHERE id = ?").bind(datos.id).first()) {
+    throw new ErrorPapelera("Ya existe un archivo con este identificador, así que no se puede restaurar encima.");
+  }
+  if (await env.DB.prepare("SELECT id FROM media WHERE cloudinary_public_id = ?").bind(datos.cloudinary_public_id).first()) {
+    throw new ErrorPapelera("Este archivo ya está en la mediateca otra vez.");
+  }
+  if (datos.hash_archivo && await env.DB.prepare("SELECT id FROM media WHERE hash_archivo = ?").bind(datos.hash_archivo).first()) {
+    throw new ErrorPapelera("Ya se ha vuelto a subir un archivo idéntico a este; no hace falta restaurarlo.");
+  }
+  await papeleraAnularReferencias(env, [datos], [["autor_id", "users"], ["carpeta_id", "media_carpetas"]]);
+
+  const galerias = rel.match_gallery || [];
+  await papeleraAnularReferencias(env, galerias, [["vinculado_por_id", "users"]]);
+  const partidosVivos = await papeleraIdsExistentes(env, "results", galerias.map((g) => g.result_id));
+  const galeriasVivas = galerias.filter((g) => partidosVivos.has(Number(g.result_id)));
+  for (const g of galeriasVivas) {
+    // Una galería solo tiene una portada: si mientras tanto se eligió otra, esta foto vuelve como normal.
+    if ("es_portada" in g && Number(g.es_portada) === 1) {
+      const otra = await env.DB.prepare("SELECT id FROM match_gallery WHERE result_id = ? AND es_portada = 1").bind(g.result_id).first();
+      if (otra) g.es_portada = 0;
+    }
+  }
+  const articulosVivos = await papeleraIdsExistentes(env, "articles", (rel.article_media || []).map((r) => r.article_id));
+  const enlaces = (rel.article_media || []).filter((r) => articulosVivos.has(Number(r.article_id)));
+
+  const sentencias = [];
+  const anadir = (tabla, f) => { const q = papeleraInsertSql(tabla, f); sentencias.push(env.DB.prepare(q.sql).bind(...q.binds)); };
+  anadir("media", datos);
+  for (const g of galeriasVivas) anadir("match_gallery", g);
+  for (const e of enlaces) anadir("article_media", e);
+  sentencias.push(env.DB.prepare("DELETE FROM papelera WHERE id = ?").bind(fila.id));
+  await env.DB.batch(sentencias);
+  return {};
+}
+
+async function papeleraRestaurar(env, fila) {
+  if (fila.tipo === "articulo") return papeleraRestaurarArticulo(env, fila);
+  if (fila.tipo === "media") return papeleraRestaurarMedia(env, fila);
+  throw new ErrorPapelera("Tipo de elemento desconocido.", 400);
+}
+
+// Borrado DEFINITIVO de una entrada de la papelera. En un archivo es aquí (y no
+// antes) cuando se destruye el original en Cloudinary.
+async function papeleraPurgar(env, fila) {
+  if (fila.tipo === "media" && fila.cloudinary_public_id) {
+    await borrarDeCloudinary(env, fila.cloudinary_public_id, fila.cloudinary_resource_type, fila.cloud_name || null);
+  }
+  await env.DB.prepare("DELETE FROM papelera WHERE id = ?").bind(fila.id).run();
+}
+
+// Cron (una vez al día): vacía lo que lleva más de PAPELERA_DIAS días. Si algo falla
+// (p. ej. Cloudinary no responde) se queda en la papelera y se reintenta al día siguiente.
+async function papeleraVaciarCaducados(env) {
+  const ahora = new Date().toISOString();
+  let filas = [];
+  try {
+    const { results } = await env.DB.prepare(
+      "SELECT id, tipo, cloudinary_public_id, cloudinary_resource_type, cloud_name FROM papelera WHERE purgar_despues <= ? ORDER BY purgar_despues LIMIT 50"
+    ).bind(ahora).all();
+    filas = results || [];
+  } catch (err) {
+    if (papeleraEsErrorTablaFaltante(err)) return 0;
+    throw err;
+  }
+  let n = 0;
+  for (const f of filas) {
+    try { await papeleraPurgar(env, f); n++; }
+    catch (err) { console.error("[papelera] No se pudo vaciar la entrada " + f.id + ":", err && err.message); }
+  }
+  return n;
 }
 
 // ---------- Compartir en redes: aviso de previa/crónica ya subida ----------
@@ -7124,15 +10254,28 @@ async function estadoSubidaARedes(env, art) {
 }
 
 function slugify(text) {
-  return text
+  const base = text
     .toString()
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .trim()
+    // Raya, guion largo, barra o "·" separan palabras ("Alcoyano–Mallorca" ->
+    // "alcoyano-mallorca", no "alcoyanomallorca"). Se hace antes de quitar el
+    // resto de símbolos.
+    .replace(/[\u2010-\u2015\u2212/\\·|_]/g, " ")
     .replace(/[^a-z0-9\s-]/g, "")
     .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .slice(0, 90);
+    .replace(/-+/g, "-");
+  // Máximo 90 caracteres, pero sin cortar una palabra a la mitad
+  // ("...en-la-zaga-del-linar" en vez de "...linares"): si el corte cae
+  // dentro de una palabra se retrocede hasta el último guion.
+  if (base.length <= 90) return base;
+  let corte = base.slice(0, 90);
+  if (base[90] !== "-") {
+    const ultimoGuion = corte.lastIndexOf("-");
+    if (ultimoGuion > 30) corte = corte.slice(0, ultimoGuion);
+  }
+  return corte.replace(/-+$/, "");
 }
 
 // ---------- SEO de previas/crónicas: slug con los dos equipos ----------
@@ -7289,7 +10432,7 @@ function longitudTextoPlano(html) {
 const CONTENIDO_MIN = 1500;
 const CONTENIDO_MAX = 8000;
 // Los artículos de opinión admiten más texto que el resto.
-const CONTENIDO_MAX_OPINION = 8500;
+const CONTENIDO_MAX_OPINION = 10000;
 function contenidoMaxPorTipo(tipo) {
   return tipo === "opinion" ? CONTENIDO_MAX_OPINION : CONTENIDO_MAX;
 }
@@ -7310,29 +10453,39 @@ function contenidoMaxPorTipo(tipo) {
 // ascender, basta con añadirlas aquí como una clave más.
 const NIVELES_REQUISITOS = {
   1: null, // Principiante: nivel inicial, no requiere nada.
-  2: { noticia: 20, cronica: 10, opinion: 2, entrevista: 1 },
-  3: { noticia: 30, cronica: 15, opinion: 3, entrevista: 1 },
-  4: { noticia: 40, cronica: 20, opinion: 4, entrevista: 2 },
+  // N2 bajo a propósito: es el nivel que permite solicitar acreditaciones y no debe ser una barrera.
+  2: { noticia: 6, cronica: 3, opinion: 1 },
+  3: { noticia: 15, cronica: 8, opinion: 2, entrevista: 1 },
+  4: { noticia: 24, cronica: 12, opinion: 3, entrevista: 1 },
 };
 
 const NIVELES_INFO = {
   1: {
     nombre: "Principiante", emoji: "🟢",
-    descripcion: "Todo el contenido pasa por revisión de un administrador antes de publicarse.",
+    descripcion: "Todo el contenido pasa por revisión de un Responsable antes de publicarse.",
   },
   2: {
     nombre: "Aprendiz", emoji: "🔵",
-    descripcion: "Publica noticias, crónicas y artículos de opinión sin revisión previa.",
+    descripcion: "Nivel 1 + poder pedir acreditaciones.",
   },
   3: {
     nombre: "Maestro", emoji: "🟣",
-    descripcion: "Publicación sin revisión + puede publicar contenido del medio en Instagram y TikTok.",
+    descripcion: "Niveles 1 y 2 + publicación sin revisión en redes y en web.",
   },
   4: {
     nombre: "Experto", emoji: "🟠",
-    descripcion: "Puede revisar y corregir noticias de otros, optar al consejo de administración y a coordinaciones.",
+    descripcion: "Niveles 1, 2 y 3 + revisar y corregir noticias de otros compañeros y optar al consejo de administración.",
   },
 };
+
+// Niveles que desbloquean cada permiso (fuente única: el panel usa los mismos números).
+//  - Nivel 2: pedir acreditaciones (ACREDITACION_NIVEL_MINIMO_REDACTOR).
+//  - Nivel 3: publicar SIN revisión (web y redes): publicar directo, programar, destacar, banner
+//    de última hora, aplicar fichas de club sin aprobación y subir/organizar para redes.
+//  - Nivel 4: revisar y corregir el contenido de otros compañeros y optar al consejo de administración.
+// Por debajo del Nivel 3 todo pasa por revisión de un Responsable (salvo el PIN de "Última hora").
+const NIVEL_PUBLICACION_DIRECTA = 3;
+const NIVEL_REDES_MINIMO = 3;
 
 // Cuenta, por tipo, cuántos artículos PUBLICADOS tiene un autor. Se
 // cuentan solo publicados (publicado = 1): un borrador o una noticia
@@ -7637,6 +10790,528 @@ async function construirResumenMensual(env, usuario, mes) {
   };
 }
 
+// ---------- Estadísticas personales de la cuenta (con su evolución) ----------
+// Lo que ha hecho una cuenta desde que existe: totales y evolución mes a mes de los últimos
+// ESTADISTICAS_MESES meses (publicaciones por tipo, visitas, fotos y vídeos subidos, fotos vinculadas a
+// galerías, partidos creados, acciones y días activos en el panel), cambios de nivel, racha semanal e
+// insignias. Dos vistas del mismo cálculo:
+//   GET /api/me/estadisticas            -> la propia persona (Ajustes de cuenta > Estadísticas)
+//   GET /api/users/:id/estadisticas     -> solo Responsables (modal «Gestionar» > Estadísticas)
+// Solo lee: no guarda nada ni toca insignias (usa las ya guardadas). Cada bloque es independiente: si uno
+// falla (p. ej. una tabla que aún no existe en la réplica) sale vacío y el resto de la respuesta sigue.
+// Los meses se agrupan por el texto de la fecha guardada (UTC), igual que el resumen mensual.
+const ESTADISTICAS_MESES = 12;
+
+function estadisticasListaMeses(mesActual, primerMes) {
+  const lista = [];
+  let m = mesActual;
+  for (let i = 0; i < ESTADISTICAS_MESES; i++) {
+    if (primerMes && m < primerMes) break;
+    lista.unshift(m);
+    m = resumenMesAnterior(m);
+  }
+  return lista;
+}
+
+async function construirEstadisticasCuenta(env, usuario) {
+  const uid = usuario.id;
+  const seguro = async (fn, vacio) => { try { return await fn(); } catch { return vacio; } };
+  const hoy = resumenMesFechaMadrid();
+  const mesActual = hoy.slice(0, 7);
+  const alta = usuario.created_at ? String(usuario.created_at).slice(0, 10) : "";
+  const primerMes = resumenMesValido(alta.slice(0, 7)) ? alta.slice(0, 7) : "";
+  const meses = estadisticasListaMeses(mesActual, primerMes);
+  const desde = resumenMesInicioUtc(`${meses[0]}-01`);
+  const todas = async (sql, ...binds) => ((await env.DB.prepare(sql).bind(...binds).all()).results) || [];
+
+  const pPublicaciones = seguro(() => todas(
+    `SELECT substr(fecha_publicacion, 1, 7) AS mes, tipo, COUNT(*) AS n FROM articles
+      WHERE autor_id = ?1 AND publicado = 1 AND fecha_publicacion >= ?2
+      GROUP BY substr(fecha_publicacion, 1, 7), tipo
+     UNION ALL
+     SELECT substr(fecha_publicacion, 1, 7) AS mes, tipo, COUNT(*) AS n FROM articles
+      WHERE coautor_id = ?1 AND publicado = 1 AND fecha_publicacion >= ?2
+      GROUP BY substr(fecha_publicacion, 1, 7), tipo`, uid, desde), []);
+  const pTotalPorTipo = seguro(() => contarPublicacionesPorTipo(env, uid), null);
+  const pFechasPub = seguro(() => todas(
+    `SELECT MIN(fecha_publicacion) AS primera, MAX(fecha_publicacion) AS ultima FROM articles WHERE autor_id = ?1 AND publicado = 1
+     UNION ALL
+     SELECT MIN(fecha_publicacion) AS primera, MAX(fecha_publicacion) AS ultima FROM articles WHERE coautor_id = ?1 AND publicado = 1`, uid), []);
+  // Visitas de lo que ha firmado, por mes de la visita (todo el histórico: da el total y la evolución).
+  const pVisitas = seguro(() => todas(
+    `SELECT substr(v.created_at, 1, 7) AS mes, COUNT(*) AS n FROM article_views v
+       JOIN articles a ON a.id = v.article_id
+      WHERE a.autor_id = ?1 AND a.publicado = 1 GROUP BY substr(v.created_at, 1, 7)
+     UNION ALL
+     SELECT substr(v.created_at, 1, 7) AS mes, COUNT(*) AS n FROM article_views v
+       JOIN articles a ON a.id = v.article_id
+      WHERE a.coautor_id = ?1 AND a.publicado = 1 GROUP BY substr(v.created_at, 1, 7)`, uid), []);
+  const pMediaMes = seguro(() => todas(
+    `SELECT substr(created_at, 1, 7) AS mes, tipo, COUNT(*) AS n FROM media
+      WHERE autor_id = ?1 AND created_at >= ?2 GROUP BY substr(created_at, 1, 7), tipo`, uid, desde), []);
+  const pMediaTotal = seguro(() => todas(
+    "SELECT tipo, COUNT(*) AS n, COALESCE(SUM(tamano_bytes), 0) AS bytes FROM media WHERE autor_id = ?1 GROUP BY tipo", uid), []);
+  const pGaleriasMes = seguro(() => todas(
+    `SELECT substr(created_at, 1, 7) AS mes, COUNT(*) AS n FROM match_gallery
+      WHERE vinculado_por_id = ?1 AND created_at >= ?2 GROUP BY substr(created_at, 1, 7)`, uid, desde), []);
+  const pGaleriasTotal = seguro(async () => {
+    const f = await env.DB.prepare("SELECT COUNT(*) AS n, COUNT(DISTINCT result_id) AS partidos FROM match_gallery WHERE vinculado_por_id = ?1").bind(uid).first();
+    return { fotos_vinculadas: Number(f && f.n) || 0, partidos: Number(f && f.partidos) || 0 };
+  }, { fotos_vinculadas: 0, partidos: 0 });
+  const pResultadosMes = seguro(() => todas(
+    `SELECT substr(created_at, 1, 7) AS mes, COUNT(*) AS n FROM results
+      WHERE autor_id = ?1 AND created_at >= ?2 GROUP BY substr(created_at, 1, 7)`, uid, desde), []);
+  const pResultadosTotal = seguro(async () => {
+    const f = await env.DB.prepare("SELECT COUNT(*) AS n FROM results WHERE autor_id = ?1").bind(uid).first();
+    return Number(f && f.n) || 0;
+  }, 0);
+  const pActividadMes = seguro(() => todas(
+    `SELECT substr(created_at, 1, 7) AS mes, COUNT(*) AS acciones, COUNT(DISTINCT substr(created_at, 1, 10)) AS dias FROM activity_log
+      WHERE usuario_id = ?1 AND created_at >= ?2 GROUP BY substr(created_at, 1, 7)`, uid, desde), []);
+  const pActividadTotal = seguro(async () => {
+    const f = await env.DB.prepare("SELECT COUNT(*) AS acciones, COUNT(DISTINCT substr(created_at, 1, 10)) AS dias FROM activity_log WHERE usuario_id = ?1").bind(uid).first();
+    return { acciones: Number(f && f.acciones) || 0, dias_activos: Number(f && f.dias) || 0 };
+  }, { acciones: 0, dias_activos: 0 });
+  const pNiveles = seguro(() => todas(
+    "SELECT nivel_anterior, nivel_nuevo, created_at FROM nivel_historial WHERE usuario_id = ?1 ORDER BY created_at", uid), []);
+  const pRacha = usuario.rol === "admin" ? Promise.resolve(null) : seguro(() => calcularRachaSemanal(env, usuario), null);
+  const pInsignias = usuario.rol === "admin" ? Promise.resolve({}) : seguro(() => leerInsigniasGuardadas(env, uid), {});
+
+
+  // Actividad diaria de las últimas 12 semanas (mapa de calor), últimas acciones y último acceso.
+  const desdeDia = new Date(Date.parse(`${hoy}T00:00:00Z`) - 83 * 86400000).toISOString().slice(0, 10);
+  const pActDiaria = seguro(() => todas(
+    `SELECT substr(created_at, 1, 10) AS dia, COUNT(*) AS n FROM activity_log
+      WHERE usuario_id = ?1 AND created_at >= ?2 GROUP BY substr(created_at, 1, 10)`, uid, desdeDia), []);
+  const pActReciente = seguro(() => todas(
+    `SELECT accion, entidad, descripcion, created_at FROM activity_log
+      WHERE usuario_id = ?1 AND accion <> 'login' ORDER BY created_at DESC, id DESC LIMIT 12`, uid), []);
+  const pActUltimos = seguro(async () => {
+    const f = await env.DB.prepare(
+      "SELECT MAX(created_at) AS ultima, MAX(CASE WHEN accion = 'login' THEN created_at ELSE NULL END) AS acceso FROM activity_log WHERE usuario_id = ?1"
+    ).bind(uid).first();
+    return { ultima: (f && f.ultima) || null, acceso: (f && f.acceso) || null };
+  }, { ultima: null, acceso: null });
+  const pTopArticulos = seguro(() => todas(
+    `SELECT a.id AS id, a.titulo AS titulo, a.tipo AS tipo, a.fecha_publicacion AS fecha, COUNT(*) AS n
+       FROM article_views v JOIN articles a ON a.id = v.article_id
+      WHERE (a.autor_id = ?1 OR a.coautor_id = ?1) AND a.publicado = 1
+      GROUP BY a.id, a.titulo, a.tipo, a.fecha_publicacion ORDER BY n DESC LIMIT 5`, uid), []);
+
+  const [pubMes, totalTipos, fechasPub, visitas, mediaMes, mediaTotal, galMes, galTotal, resMes, resTotal, actMes, actTotal, niveles, racha, guardadas] =
+    await Promise.all([pPublicaciones, pTotalPorTipo, pFechasPub, pVisitas, pMediaMes, pMediaTotal, pGaleriasMes, pGaleriasTotal, pResultadosMes, pResultadosTotal, pActividadMes, pActividadTotal, pNiveles, pRacha, pInsignias]);
+  const [actDiaria, actReciente, actUltimos, topArticulos] = await Promise.all([pActDiaria, pActReciente, pActUltimos, pTopArticulos]);
+
+  const porMes = new Map(meses.map((m) => [m, {
+    mes: m, publicaciones: 0, visitas: 0, fotos: 0, videos: 0, fotos_vinculadas: 0, resultados_creados: 0, acciones: 0, dias_activos: 0,
+    por_tipo: Object.fromEntries(RESUMEN_MES_TIPOS.map((t) => [t, 0])),
+  }]));
+  const en = (f) => porMes.get(String(f.mes || ""));
+  for (const f of pubMes) { const x = en(f); if (!x) continue; const n = Number(f.n) || 0; x.publicaciones += n; if (x.por_tipo[f.tipo] !== undefined) x.por_tipo[f.tipo] += n; }
+  let visitasTotal = 0;
+  for (const f of visitas) { const n = Number(f.n) || 0; visitasTotal += n; const x = en(f); if (x) x.visitas += n; }
+  for (const f of mediaMes) { const x = en(f); if (!x) continue; if (f.tipo === "foto") x.fotos += Number(f.n) || 0; else if (f.tipo === "video") x.videos += Number(f.n) || 0; }
+  for (const f of galMes) { const x = en(f); if (x) x.fotos_vinculadas += Number(f.n) || 0; }
+  for (const f of resMes) { const x = en(f); if (x) x.resultados_creados += Number(f.n) || 0; }
+  for (const f of actMes) { const x = en(f); if (x) { x.acciones += Number(f.acciones) || 0; x.dias_activos += Number(f.dias) || 0; } }
+  const evolucion = meses.map((m) => porMes.get(m));
+
+  const porTipo = Object.fromEntries(RESUMEN_MES_TIPOS.map((t) => [t, Number(totalTipos && totalTipos[t]) || 0]));
+  const totalPublicaciones = Object.values(porTipo).reduce((s, n) => s + n, 0);
+  const contenido = { fotos: 0, videos: 0, bytes: 0 };
+  for (const f of mediaTotal) {
+    if (f.tipo === "foto") contenido.fotos += Number(f.n) || 0;
+    else if (f.tipo === "video") contenido.videos += Number(f.n) || 0;
+    contenido.bytes += Number(f.bytes) || 0;
+  }
+  const fechas = (fechasPub || []).flatMap((f) => [f.primera, f.ultima]).filter(Boolean).map((t) => String(t).slice(0, 10)).sort();
+  const mejorMes = evolucion.reduce((mejor, x) => (x.publicaciones > (mejor ? mejor.publicaciones : 0) ? x : mejor), null);
+  const mesesActivos = evolucion.filter((x) => x.publicaciones > 0 || x.fotos > 0 || x.videos > 0 || x.fotos_vinculadas > 0 || x.resultados_creados > 0).length;
+  const clave = insigniaClaveRol(usuario.rol);
+  const insignias = usuario.rol === "admin" ? null : INSIGNIAS_HITOS.filter((h) => h.roles.includes(clave)).map((h) => ({
+    id: h.id, nombre: h.nombre, emoji: h.emoji, conseguida: !!guardadas[h.id], fecha: guardadas[h.id] ? String(guardadas[h.id]).slice(0, 10) : null,
+  }));
+  const cambiosNivel = (niveles || []).map((c) => ({ de: Number(c.nivel_anterior), a: Number(c.nivel_nuevo), fecha: String(c.created_at || "").slice(0, 10) }));
+
+  return {
+    usuario: { id: usuario.id, nombre: usuario.nombre, rol: usuario.rol, nivel: Number(usuario.nivel) || 1, alta: alta || null },
+    generado: hoy,
+    meses,
+    totales: {
+      publicaciones: totalPublicaciones,
+      por_tipo: porTipo,
+      visitas: visitasTotal,
+      visitas_por_publicacion: totalPublicaciones > 0 ? Math.round((visitasTotal / totalPublicaciones) * 10) / 10 : 0,
+      contenido,
+      galerias: galTotal,
+      resultados_creados: resTotal,
+      acciones: actTotal.acciones,
+      dias_activos: actTotal.dias_activos,
+      primera_publicacion: fechas[0] || null,
+      ultima_publicacion: fechas[fechas.length - 1] || null,
+    },
+    evolucion,
+    resumen_periodo: {
+      meses_con_actividad: mesesActivos,
+      mejor_mes: mejorMes && mejorMes.publicaciones > 0 ? { mes: mejorMes.mes, publicaciones: mejorMes.publicaciones } : null,
+      publicaciones: evolucion.reduce((s, x) => s + x.publicaciones, 0),
+      visitas: evolucion.reduce((s, x) => s + x.visitas, 0),
+    },
+    cambios_nivel: cambiosNivel,
+    racha: racha ? { actual: racha.actual, mejor: racha.mejor, semanas_activas_total: racha.semanas_activas_total, semanas: racha.semanas } : null,
+    insignias,
+    actividad_diaria: (actDiaria || []).map((f) => ({ fecha: String(f.dia || "").slice(0, 10), n: Number(f.n) || 0 })).filter((f) => f.fecha),
+    actividad_reciente: (actReciente || []).map((f) => ({
+      accion: String(f.accion || ""), entidad: f.entidad ? String(f.entidad) : "", descripcion: String(f.descripcion || "").slice(0, 200), fecha: String(f.created_at || "").slice(0, 19),
+    })),
+    ultima_actividad: actUltimos && actUltimos.ultima ? String(actUltimos.ultima).slice(0, 19) : null,
+    ultimo_acceso: actUltimos && actUltimos.acceso ? String(actUltimos.acceso).slice(0, 19) : null,
+    top_articulos: (topArticulos || []).map((f) => ({ id: Number(f.id), titulo: String(f.titulo || ""), tipo: f.tipo || "", fecha: String(f.fecha || "").slice(0, 10), visitas: Number(f.n) || 0 })),
+  };
+}
+
+// ---------- Resumen de INICIO del panel (GET /api/me/resumen-inicio) ----------
+// Alimenta la pestaña «Inicio» (public/admin/js/inicio-resumen.js) con datos de TODA la redacción que
+// /api/me/estadisticas (que es personal) no da. Solo lectura. Cada bloque es independiente: si falla uno,
+// sale vacío y el resto sigue. Según el rol devuelve:
+//   · Responsable: estadísticas del equipo (publicaciones y visitas del mes y de los últimos 6), quién ha estado
+//     activo, nuevos colaboradores, cola de revisión con antigüedad, acreditaciones y solicitudes de edición.
+//   · Redactor/a: ranking del mes, partidos sin cubrir de SU club, progreso hacia el siguiente nivel y, si es
+//     Nivel 4, también la cola de revisión, acreditaciones y solicitudes (como el Responsable).
+//   · Fotógrafo/a: partidos recientes de su club sin fotos en la galería y los partidos con más visitas donde ha
+//     vinculado fotos suyas (hoy no se cuentan visitas por foto: se usan las visitas del partido).
+//   · Todos: últimas noticias publicadas y el anuncio fijado (clave «inicio_anuncio» de settings).
+// Todo con SQL común a D1 y PostgreSQL (fechas como texto, sin datetime()), para que ambos workers den lo mismo.
+const INICIO_ANUNCIO_KEY = "inicio_anuncio";
+const INICIO_ANUNCIO_MAX_TITULO = 80;
+const INICIO_ANUNCIO_MAX_TEXTO = 400;
+
+async function leerAnuncioInicio(env) {
+  try {
+    const f = await env.DB.prepare("SELECT value, updated_at FROM settings WHERE key = ?").bind(INICIO_ANUNCIO_KEY).first();
+    if (!f || !f.value) return null;
+    const a = JSON.parse(f.value);
+    const texto = String((a && a.texto) || "").trim();
+    if (!texto) return null;
+    const caduca = /^\d{4}-\d{2}-\d{2}$/.test(String((a && a.caduca) || "")) ? a.caduca : null;
+    if (caduca && caduca < resumenMesFechaMadrid()) return null;
+    return {
+      titulo: String(a.titulo || "").trim().slice(0, INICIO_ANUNCIO_MAX_TITULO),
+      texto: texto.slice(0, INICIO_ANUNCIO_MAX_TEXTO),
+      autor: String(a.autor || "").slice(0, 80),
+      caduca,
+      fecha: String(f.updated_at || "").slice(0, 19),
+    };
+  } catch { return null; }
+}
+
+async function construirResumenInicio(env, usuario) {
+  const seguro = async (fn, vacio) => { try { return await fn(); } catch { return vacio; } };
+  const todas = async (sql, ...binds) => ((await env.DB.prepare(sql).bind(...binds).all()).results) || [];
+  const una = async (sql, ...binds) => (await env.DB.prepare(sql).bind(...binds).first()) || {};
+  const sumaDias = (ymd, dias) => new Date(Date.parse(`${ymd}T12:00:00Z`) + dias * 86400000).toISOString().slice(0, 10);
+
+  const uid = usuario.id;
+  const esAdmin = usuario.rol === "admin";
+  const esFoto = usuario.rol === "fotografo";
+  const nivel = esAdmin ? NIVEL_MAXIMO : (Number(usuario.nivel) || 1);
+  const revisa = esAdmin || (!esFoto && nivel >= NIVEL_MAXIMO);
+  const equipos = parsearEquipos(usuario.equipo);
+
+  const hoy = resumenMesFechaMadrid();
+  const mesActual = hoy.slice(0, 7);
+  const mesPrevio = resumenMesAnterior(mesActual);
+  const meses = [];
+  let m = mesActual;
+  for (let i = 0; i < 6; i++) { meses.unshift(m); m = resumenMesAnterior(m); }
+  const inicioMes = resumenMesInicioUtc(`${mesActual}-01`);
+  const inicioSeis = resumenMesInicioUtc(`${meses[0]}-01`);
+  const hace30 = resumenMesInicioUtc(sumaDias(hoy, -29));
+  const esEquipo = (r) => equipos.some((e) => mismoEquipoGaleria(e, r.equipo_local) || mismoEquipoGaleria(e, r.equipo_visitante));
+  const partidoPublico = (r) => ({
+    id: Number(r.id), local: String(r.equipo_local || ""), visitante: String(r.equipo_visitante || ""),
+    fecha: String(r.fecha_partido || "").slice(0, 16), estado: String(r.estado || ""), jornada: r.jornada == null ? null : Number(r.jornada),
+    escudo_local: r.escudo_local_url || null, escudo_visitante: r.escudo_visitante_url || null,
+  });
+
+  // ----- Para todos: últimas noticias y anuncio fijado -----
+  const pRecientes = seguro(async () => {
+    const filas = await todas(
+      `SELECT id, titulo, tipo, autor_nombre, fecha_publicacion FROM articles
+        WHERE publicado = 1 ORDER BY fecha_publicacion DESC, id DESC LIMIT 5`);
+    if (!filas.length) return [];
+    const ids = filas.map((f) => Number(f.id));
+    const vis = await seguro(() => todas(
+      `SELECT article_id, COUNT(*) AS n FROM article_views WHERE article_id IN (${ids.map(() => "?").join(",")}) GROUP BY article_id`, ...ids), []);
+    const porId = new Map(vis.map((v) => [Number(v.article_id), Number(v.n) || 0]));
+    return filas.map((f) => ({
+      id: Number(f.id), titulo: String(f.titulo || ""), tipo: String(f.tipo || ""), autor: String(f.autor_nombre || ""),
+      fecha: String(f.fecha_publicacion || "").slice(0, 19), visitas: porId.get(Number(f.id)) || 0,
+    }));
+  }, []);
+  const pAnuncio = leerAnuncioInicio(env);
+
+  // ----- Responsable: estadísticas del equipo -----
+  const pEquipo = !esAdmin ? Promise.resolve(null) : seguro(async () => {
+    const [pub, vis, activos, totalActivos, nuevos, nuevosN] = await Promise.all([
+      seguro(() => todas(
+        `SELECT substr(fecha_publicacion, 1, 7) AS mes, COUNT(*) AS n FROM articles
+          WHERE publicado = 1 AND fecha_publicacion >= ?1 GROUP BY substr(fecha_publicacion, 1, 7)`, inicioSeis), []),
+      seguro(() => todas(
+        `SELECT substr(created_at, 1, 7) AS mes, COUNT(*) AS n FROM article_views
+          WHERE created_at >= ?1 GROUP BY substr(created_at, 1, 7)`, inicioSeis), []),
+      seguro(() => todas(
+        `SELECT usuario_id, usuario_nombre, usuario_rol, MAX(created_at) AS ultima FROM activity_log
+          WHERE usuario_id IS NOT NULL AND created_at >= ?1
+          GROUP BY usuario_id, usuario_nombre, usuario_rol ORDER BY ultima DESC LIMIT 200`, hace30), []),
+      seguro(async () => Number((await una("SELECT COUNT(*) AS n FROM users WHERE activo = 1")).n) || 0, 0),
+      seguro(() => todas(
+        `SELECT id, nombre, rol, created_at FROM users WHERE activo = 1 AND created_at >= ?1 ORDER BY created_at DESC LIMIT 5`, inicioMes), []),
+      seguro(async () => Number((await una("SELECT COUNT(*) AS n FROM users WHERE activo = 1 AND created_at >= ?1", inicioMes)).n) || 0, 0),
+    ]);
+    const serie = (filas) => meses.map((mes) => ({ mes, n: Number((filas.find((f) => String(f.mes) === mes) || {}).n) || 0 }));
+    const sPub = serie(pub), sVis = serie(vis);
+    const ult = (s, i) => (s[s.length - 1 - i] || { n: 0 }).n;
+    // Una persona cuenta una sola vez aunque tenga varias filas (cambios de nombre o rol en el registro).
+    const unicos = new Map();
+    for (const f of activos) if (!unicos.has(Number(f.usuario_id))) unicos.set(Number(f.usuario_id), f);
+    return {
+      mes: { publicaciones: ult(sPub, 0), publicaciones_previo: ult(sPub, 1), visitas: ult(sVis, 0), visitas_previo: ult(sVis, 1) },
+      evolucion: meses.map((mes, i) => ({ mes, publicaciones: sPub[i].n, visitas: sVis[i].n })),
+      activos_30d: unicos.size,
+      colaboradores_activos_total: totalActivos,
+      activos_recientes: Array.from(unicos.values()).slice(0, 6).map((f) => ({
+        id: Number(f.usuario_id), nombre: String(f.usuario_nombre || ""), rol: String(f.usuario_rol || ""), ultima: String(f.ultima || "").slice(0, 19),
+      })),
+      nuevos_mes: nuevosN,
+      nuevos: nuevos.map((u) => ({ id: Number(u.id), nombre: String(u.nombre || ""), rol: String(u.rol || ""), alta: String(u.created_at || "").slice(0, 10) })),
+    };
+  }, null);
+
+  // ----- Responsable y redactores de Nivel 4: cola de revisión, acreditaciones y solicitudes -----
+  const pRevision = !revisa ? Promise.resolve(null) : seguro(async () => {
+    const [tot, filas] = await Promise.all([
+      una(`SELECT COUNT(*) AS n, MIN(updated_at) AS antigua FROM articles
+            WHERE publicado = 0 AND programado_para IS NULL AND estado_borrador = 'terminado'`),
+      todas(`SELECT id, titulo, tipo, autor_nombre, updated_at FROM articles
+              WHERE publicado = 0 AND programado_para IS NULL AND estado_borrador = 'terminado'
+              ORDER BY updated_at ASC, id ASC LIMIT 5`),
+    ]);
+    return {
+      total: Number(tot.n) || 0,
+      mas_antigua: tot.antigua ? String(tot.antigua).slice(0, 19) : null,
+      items: filas.map((f) => ({ id: Number(f.id), titulo: String(f.titulo || ""), tipo: String(f.tipo || ""), autor: String(f.autor_nombre || ""), desde: String(f.updated_at || "").slice(0, 19) })),
+    };
+  }, null);
+  const pAcreditaciones = !revisa ? Promise.resolve(null) : seguro(async () => {
+    const f = await una("SELECT COUNT(*) AS n, MIN(created_at) AS antigua FROM acreditaciones WHERE estado = 'pendiente'");
+    return { pendientes: Number(f.n) || 0, mas_antigua: f.antigua ? String(f.antigua).slice(0, 19) : null };
+  }, null);
+  const pSolicitudes = esFoto ? Promise.resolve(null) : seguro(async () => {
+    const f = esAdmin
+      ? await una("SELECT COUNT(*) AS n FROM edit_requests WHERE estado = 'pendiente' AND solicitante_id <> ?1", uid)
+      : await una("SELECT COUNT(*) AS n FROM edit_requests WHERE estado = 'pendiente' AND solicitante_id <> ?1 AND autor_id = ?1", uid);
+    return { ediciones: Number(f.n) || 0 };
+  }, null);
+
+  // ----- Redactores y Responsable: ranking del mes -----
+  const pRanking = esFoto ? Promise.resolve(null) : seguro(async () => {
+    const filas = await todas(
+      `SELECT uid, SUM(n) AS n FROM (
+         SELECT autor_id AS uid, COUNT(*) AS n FROM articles
+          WHERE publicado = 1 AND fecha_publicacion >= ?1 AND autor_id IS NOT NULL GROUP BY autor_id
+         UNION ALL
+         SELECT coautor_id AS uid, COUNT(*) AS n FROM articles
+          WHERE publicado = 1 AND fecha_publicacion >= ?1 AND coautor_id IS NOT NULL GROUP BY coautor_id
+       ) t GROUP BY uid ORDER BY SUM(n) DESC`, inicioMes);
+    if (!filas.length) return { top: [], yo: null, participantes: 0, total_publicaciones: 0 };
+    const ids = filas.map((f) => Number(f.uid));
+    const us = await todas(`SELECT id, nombre, rol, activo FROM users WHERE id IN (${ids.map(() => "?").join(",")})`, ...ids);
+    const porId = new Map(us.map((u) => [Number(u.id), u]));
+    // Solo cuentan redactores activos (los Responsables y los fotógrafos no compiten).
+    const lista = filas
+      .map((f) => ({ id: Number(f.uid), n: Number(f.n) || 0, u: porId.get(Number(f.uid)) }))
+      .filter((x) => x.u && x.u.rol === "redactor" && Number(x.u.activo) !== 0)
+      .sort((a, b) => b.n - a.n || String(a.u.nombre).localeCompare(String(b.u.nombre), "es"));
+    let pos = 0, previo = null, posReal = 0;
+    const conPos = lista.map((x) => { posReal++; if (x.n !== previo) { pos = posReal; previo = x.n; } return { ...x, pos }; });
+    const yo = conPos.find((x) => x.id === uid) || null;
+    return {
+      top: conPos.slice(0, 5).map((x) => ({ pos: x.pos, id: x.id, nombre: String(x.u.nombre || ""), publicaciones: x.n, yo: x.id === uid })),
+      yo: yo ? { pos: yo.pos, publicaciones: yo.n } : null,
+      participantes: conPos.length,
+      total_publicaciones: conPos.reduce((s, x) => s + x.n, 0),
+    };
+  }, null);
+
+  // ----- Redactores: partidos sin cubrir de su club y progreso de nivel -----
+  const pSinCubrir = (esFoto || esAdmin) ? Promise.resolve(null) : seguro(async () => {
+    if (!equipos.length) return { equipos: [], items: [], total: 0 };
+    const desde = sumaDias(hoy, -21), hasta = sumaDias(hoy, 15);
+    const filas = await todas(
+      `SELECT id, equipo_local, equipo_visitante, fecha_partido, estado, jornada, autor_id, finalizado_no_cubierto, escudo_local_url, escudo_visitante_url
+         FROM results
+        WHERE (estado = 'en_juego')
+           OR (estado = 'finalizado' AND finalizado_no_cubierto = 1 AND fecha_partido >= ?1)
+           OR (estado = 'programado' AND fecha_partido >= ?2 AND fecha_partido < ?3)
+        ORDER BY fecha_partido ASC LIMIT 400`, desde, hoy, hasta);
+    const orden = { en_juego_sin_responsable: 0, cerrado_sin_confirmar: 1, programado_sin_cubrir: 2 };
+    const items = filas.filter(esEquipo).map((r) => {
+      let motivo = null;
+      if (r.estado === "en_juego" && !r.autor_id) motivo = "en_juego_sin_responsable";
+      else if (r.estado === "finalizado" && Number(r.finalizado_no_cubierto) === 1) motivo = "cerrado_sin_confirmar";
+      else if (r.estado === "programado" && !r.autor_id) motivo = "programado_sin_cubrir";
+      return motivo ? { ...partidoPublico(r), motivo } : null;
+    }).filter(Boolean).sort((a, b) => orden[a.motivo] - orden[b.motivo] || a.fecha.localeCompare(b.fecha));
+    return { equipos, total: items.length, items: items.slice(0, 6) };
+  }, null);
+  const pProgreso = esAdmin ? Promise.resolve(null) : seguro(async () => {
+    const p = await construirProgresoNivel(env, usuario);
+    const detalle = (p.progreso && p.progreso.detalle) || [];
+    const pct = detalle.length
+      ? Math.round((detalle.reduce((s, d) => s + Math.min(1, (Number(d.actual) || 0) / Math.max(1, Number(d.necesarios) || 1)), 0) / detalle.length) * 100)
+      : null;
+    return {
+      nivel: p.nivel_actual,
+      nombre: (p.nivel_info && p.nivel_info.nombre) || "",
+      emoji: (p.nivel_info && p.nivel_info.emoji) || "",
+      maximo: !!p.nivel_maximo,
+      siguiente: p.siguiente_nivel || null,
+      siguiente_nombre: (p.siguiente_nivel_info && p.siguiente_nivel_info.nombre) || null,
+      cumple: p.progreso ? !!p.progreso.cumple_requisitos : null,
+      pct,
+      requisitos: detalle.map((d) => ({ tipo: d.tipo, actual: Number(d.actual) || 0, necesarios: Number(d.necesarios) || 0, cumple: !!d.cumple })),
+    };
+  }, null);
+
+  // ----- Fotógrafos: partidos sin fotos y partidos con más visitas con fotos suyas -----
+  const pSinFotos = !esFoto ? Promise.resolve(null) : seguro(async () => {
+    const desde = sumaDias(hoy, -14);
+    const filas = await todas(
+      `SELECT r.id, r.equipo_local, r.equipo_visitante, r.fecha_partido, r.estado, r.jornada, r.escudo_local_url, r.escudo_visitante_url
+         FROM results r
+        WHERE r.estado = 'finalizado' AND r.fecha_partido >= ?1
+          AND NOT EXISTS (SELECT 1 FROM match_gallery g WHERE g.result_id = r.id)
+        ORDER BY r.fecha_partido DESC LIMIT 200`, desde);
+    // Si tiene club asignado se le enseñan antes los suyos; si no, los de toda la redacción.
+    const propios = equipos.length ? filas.filter(esEquipo) : filas;
+    return { equipos, solo_club: equipos.length > 0, total: propios.length, items: propios.slice(0, 6).map(partidoPublico) };
+  }, null);
+  const pFotosTop = !esFoto ? Promise.resolve(null) : seguro(async () => {
+    const filas = await todas(
+      `SELECT r.id, r.equipo_local, r.equipo_visitante, r.fecha_partido, r.estado, r.jornada, r.escudo_local_url, r.escudo_visitante_url,
+              COUNT(DISTINCT g.id) AS fotos
+         FROM match_gallery g JOIN results r ON r.id = g.result_id
+        WHERE g.vinculado_por_id = ?1
+        GROUP BY r.id, r.equipo_local, r.equipo_visitante, r.fecha_partido, r.estado, r.jornada, r.escudo_local_url, r.escudo_visitante_url
+        ORDER BY r.fecha_partido DESC LIMIT 60`, uid);
+    if (!filas.length) return [];
+    const ids = filas.map((f) => Number(f.id));
+    const vis = await seguro(() => todas(
+      `SELECT result_id, COUNT(*) AS n FROM result_views WHERE result_id IN (${ids.map(() => "?").join(",")}) GROUP BY result_id`, ...ids), []);
+    const porId = new Map(vis.map((v) => [Number(v.result_id), Number(v.n) || 0]));
+    return filas
+      .map((f) => ({ ...partidoPublico(f), fotos: Number(f.fotos) || 0, visitas: porId.get(Number(f.id)) || 0 }))
+      .sort((a, b) => b.visitas - a.visitas || b.fecha.localeCompare(a.fecha))
+      .slice(0, 5);
+  }, null);
+
+  const [recientes, anuncio, equipo, revision, acreditaciones, solicitudes, ranking, sinCubrir, progreso, sinFotos, fotosTop] = await Promise.all([
+    pRecientes, pAnuncio, pEquipo, pRevision, pAcreditaciones, pSolicitudes, pRanking, pSinCubrir, pProgreso, pSinFotos, pFotosTop,
+  ]);
+
+  return {
+    generado: hoy,
+    mes: mesActual,
+    rol: usuario.rol,
+    nivel,
+    revisa,
+    noticias_recientes: recientes,
+    anuncio,
+    equipo,
+    revision,
+    acreditaciones,
+    solicitudes,
+    ranking,
+    sin_cubrir: sinCubrir,
+    progreso_nivel: progreso,
+    partidos_sin_fotos: sinFotos,
+    fotos_top: fotosTop,
+  };
+}
+
+// ---------- Resumen de estadísticas de TODAS las cuentas (tabla de Usuarios, solo Responsables) ----------
+// GET /api/users/estadisticas-resumen -> por usuario: publicaciones totales, evolución de los últimos
+// ESTADISTICAS_RESUMEN_MESES meses (publicaciones y archivos subidos), visitas de ese periodo, archivos subidos en
+// total y actividad de los últimos 30 días. Todo agregado en la base de datos (una fila por persona o por mes), sin leer
+// artículos uno a uno. Cada bloque es independiente: si falla uno, sale vacío y el resto sigue. Solo lectura.
+const ESTADISTICAS_RESUMEN_MESES = 6;
+async function construirResumenEstadisticasUsuarios(env) {
+  const seguro = async (fn, vacio) => { try { return await fn(); } catch { return vacio; } };
+  const hoy = resumenMesFechaMadrid();
+  const meses = [];
+  let m = hoy.slice(0, 7);
+  for (let i = 0; i < ESTADISTICAS_RESUMEN_MESES; i++) { meses.unshift(m); m = resumenMesAnterior(m); }
+  const desde = resumenMesInicioUtc(`${meses[0]}-01`);
+  const desde30 = new Date(Date.parse(`${hoy}T00:00:00Z`) - 29 * 86400000).toISOString().slice(0, 10);
+  const todas = async (sql, ...binds) => ((await env.DB.prepare(sql).bind(...binds).all()).results) || [];
+
+  const [pub, pubTotal, vis, media, mediaTotal, act] = await Promise.all([
+    seguro(() => todas(
+      `SELECT uid, mes, SUM(n) AS n FROM (
+         SELECT autor_id AS uid, substr(fecha_publicacion, 1, 7) AS mes, COUNT(*) AS n FROM articles
+          WHERE publicado = 1 AND autor_id IS NOT NULL AND fecha_publicacion >= ?1 GROUP BY autor_id, substr(fecha_publicacion, 1, 7)
+         UNION ALL
+         SELECT coautor_id AS uid, substr(fecha_publicacion, 1, 7) AS mes, COUNT(*) AS n FROM articles
+          WHERE publicado = 1 AND coautor_id IS NOT NULL AND (autor_id IS NULL OR coautor_id <> autor_id) AND fecha_publicacion >= ?1
+          GROUP BY coautor_id, substr(fecha_publicacion, 1, 7)
+       ) t GROUP BY uid, mes`, desde), []),
+    seguro(() => todas(
+      `SELECT uid, COUNT(*) AS n FROM (
+         SELECT autor_id AS uid FROM articles WHERE publicado = 1 AND autor_id IS NOT NULL
+         UNION ALL
+         SELECT coautor_id AS uid FROM articles WHERE publicado = 1 AND coautor_id IS NOT NULL AND (autor_id IS NULL OR coautor_id <> autor_id)
+       ) t GROUP BY uid`), []),
+    seguro(() => todas(
+      `SELECT a.autor_id AS autor_id, a.coautor_id AS coautor_id, COUNT(*) AS n FROM article_views v
+         JOIN articles a ON a.id = v.article_id
+        WHERE a.publicado = 1 AND v.created_at >= ?1 GROUP BY a.autor_id, a.coautor_id`, desde), []),
+    seguro(() => todas(
+      `SELECT autor_id AS uid, substr(created_at, 1, 7) AS mes, COUNT(*) AS n FROM media
+        WHERE autor_id IS NOT NULL AND created_at >= ?1 GROUP BY autor_id, substr(created_at, 1, 7)`, desde), []),
+    seguro(() => todas("SELECT autor_id AS uid, COUNT(*) AS n FROM media WHERE autor_id IS NOT NULL GROUP BY autor_id"), []),
+    seguro(() => todas(
+      `SELECT usuario_id AS uid, COUNT(*) AS acciones, COUNT(DISTINCT substr(created_at, 1, 10)) AS dias, MAX(created_at) AS ultima
+         FROM activity_log WHERE usuario_id IS NOT NULL AND created_at >= ?1 GROUP BY usuario_id`, desde30), []),
+  ]);
+
+  const usuarios = {};
+  const de = (uid) => {
+    const k = String(Number(uid));
+    if (!usuarios[k]) usuarios[k] = {
+      publicaciones: 0, serie_publicaciones: meses.map(() => 0), serie_contenido: meses.map(() => 0),
+      visitas_periodo: 0, contenido: 0, acciones_30d: 0, dias_30d: 0, ultima_actividad: null,
+    };
+    return usuarios[k];
+  };
+  for (const f of pub) { const i = meses.indexOf(String(f.mes || "")); if (i >= 0) de(f.uid).serie_publicaciones[i] += Number(f.n) || 0; }
+  for (const f of pubTotal) de(f.uid).publicaciones += Number(f.n) || 0;
+  for (const f of vis) {
+    const n = Number(f.n) || 0;
+    if (f.autor_id != null) de(f.autor_id).visitas_periodo += n;
+    if (f.coautor_id != null && Number(f.coautor_id) !== Number(f.autor_id)) de(f.coautor_id).visitas_periodo += n;
+  }
+  for (const f of media) { const i = meses.indexOf(String(f.mes || "")); if (i >= 0) de(f.uid).serie_contenido[i] += Number(f.n) || 0; }
+  for (const f of mediaTotal) de(f.uid).contenido += Number(f.n) || 0;
+  for (const f of act) {
+    const u = de(f.uid);
+    u.acciones_30d = Number(f.acciones) || 0;
+    u.dias_30d = Number(f.dias) || 0;
+    u.ultima_actividad = f.ultima ? String(f.ultima).slice(0, 19) : null;
+  }
+  return { generado: hoy, meses, usuarios };
+}
+
 // ---------- Reconocimiento público del mes ("Redactor/a del mes" y "Foto del mes") ----------
 // Se apoya en los mismos datos que el resumen mensual (publicaciones, visitas, galerías de partido).
 // El sistema PROPONE candidatos a final de mes y un admin CONFIRMA a quién se reconoce: nada se
@@ -7912,8 +11587,9 @@ async function reconocimientoAvisar(env, mes, hidratado, yaAvisados) {
 // (Fotógrafo de referencia). Se guarda en la MISMA columna users.nivel (1 = F1, 2 = F2),
 // así que no hace falta migración: todo fotógrafo existente es F1 por defecto.
 //
-// A diferencia de la redacción, NO hay cifras mínimas (ni de partidos ni de fotografías):
-// la disponibilidad y las oportunidades de cobertura varían de una persona a otra. El
+// Las cifras para optar a F2 son bajas a propósito (NIVELES_FOTO_REQUISITOS: partidos con galería y
+// fotos subidas a galerías): la disponibilidad y las oportunidades de cobertura varían de una
+// persona a otra, así que cumplirlas solo da derecho a que la dirección valore el ascenso. El
 // ascenso es una valoración global de unos criterios cualitativos (NIVELES_FOTO_CRITERIOS),
 // propuesta por el responsable de fotografía si existe y SIEMPRE autorizada por dirección
 // (aquí: un admin, vía PUT /api/users/:id/nivel). La pérdida de nivel solo se valora ante
@@ -7923,6 +11599,14 @@ async function reconocimientoAvisar(env, mes, hidratado, yaAvisados) {
 // siempre 1 para un fotógrafo, y no garantiza coordinación, acreditaciones, partidos
 // concretos ni publicación de todo el material entregado.
 const NIVEL_MAXIMO_FOTOGRAFO = 2;
+
+// Cifras mínimas para OPTAR a cada nivel de fotografía. Las claves coinciden con "actividad" de
+// GET /api/me/nivel: partidos = partidos distintos con galería hecha por la persona; fotos = fotos
+// vinculadas por ella a galerías de partido. Cumplirlas no sube el nivel (lo decide la dirección).
+const NIVELES_FOTO_REQUISITOS = {
+  1: null, // F1: nivel inicial, no requiere nada.
+  2: { partidos: 5, fotos: 100 },
+};
 
 const NIVELES_FOTO_INFO = {
   1: {
@@ -7962,6 +11646,311 @@ const NIVELES_FOTO_CRITERIOS = [
   { id: "profesionalidad", nombre: "Profesionalidad", descripcion: "Comunicación, respeto a las normas y coordinación con el resto del equipo." },
   { id: "evolucion", nombre: "Evolución", descripcion: "Capacidad para incorporar indicaciones y mejorar el trabajo." },
 ];
+
+// Los DOS pases (redacción N1–N4 y fotografía F1–F2) en formato de solo consulta: así "Mi progreso"
+// puede enseñar ambos a cualquier persona, sea del equipo que sea. No lleva datos personales.
+function construirPasesNiveles() {
+  return {
+    redaccion: Object.keys(NIVELES_INFO).map((n) => ({
+      nivel: Number(n),
+      ...NIVELES_INFO[n],
+      requisitos: NIVELES_REQUISITOS[n] || null,
+    })),
+    fotografia: Object.keys(NIVELES_FOTO_INFO).map((n) => ({
+      nivel: Number(n),
+      ...NIVELES_FOTO_INFO[n],
+      requisitos: NIVELES_FOTO_REQUISITOS[n] || null,
+    })),
+    criterios_fotografia: NIVELES_FOTO_CRITERIOS,
+  };
+}
+
+// ---------- Responsabilidades > Redacción / Fotografía: control de niveles ----------
+// Vista de los Responsables para decidir ascensos. Por cada persona del área (redactores o fotógrafos
+// activos que aún no están en el nivel máximo) se calcula, SIEMPRE al momento y con las mismas cifras que
+// "Mi progreso" (NIVELES_REQUISITOS / NIVELES_FOTO_REQUISITOS), cuánto lleva de cada requisito del
+// siguiente nivel, qué porcentaje del total y si ya los cumple. Cumplirlos no sube el nivel: lo decide un
+// Responsable desde la tarjeta («Subir de nivel» o «Ahora no», con nota opcional). «Ahora no» queda
+// registrado en nivel_valoraciones (quién, cuándo y por qué) para no perder el criterio de la dirección.
+//   GET  /api/responsabilidades/niveles?area=redaccion|fotografia
+//   POST /api/responsabilidades/niveles/decision  { usuario_id, decision: "subir" | "aplazar", nota? }
+// Solo Worker principal (D1) y solo Responsables.
+const NIVELES_RESP_AREAS = {
+  redaccion: { rol: "redactor", titulo: "Redacción" },
+  fotografia: { rol: "fotografo", titulo: "Fotografía" },
+};
+const NIVELES_RESP_CERCANOS_MAX = 5;
+let NIVEL_VALORACIONES_TABLA_LISTA = false;
+
+async function asegurarTablaNivelValoraciones(env) {
+  if (NIVEL_VALORACIONES_TABLA_LISTA) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS nivel_valoraciones (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       usuario_id INTEGER NOT NULL,
+       nivel_objetivo INTEGER NOT NULL,
+       decision TEXT NOT NULL,
+       nota TEXT,
+       decidido_por_id INTEGER,
+       decidido_por_nombre TEXT NOT NULL,
+       created_at TEXT NOT NULL DEFAULT (datetime('now'))
+     )`
+  ).run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_nivel_valoraciones_usuario ON nivel_valoraciones(usuario_id, nivel_objetivo)").run();
+  NIVEL_VALORACIONES_TABLA_LISTA = true;
+}
+
+// Fotos y partidos distintos con galería hecha por cada fotógrafo (la misma fuente que /api/me/nivel).
+async function actividadFotografosResp(env) {
+  const mapa = new Map();
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT vinculado_por_id AS id, COUNT(*) AS fotos, COUNT(DISTINCT result_id) AS partidos
+         FROM match_gallery WHERE vinculado_por_id IS NOT NULL GROUP BY vinculado_por_id`
+    ).all();
+    for (const f of results || []) mapa.set(Number(f.id), { partidos: Number(f.partidos) || 0, fotos: Number(f.fotos) || 0 });
+  } catch { /* sin galerías: todos a 0 */ }
+  return mapa;
+}
+
+// Progreso hacia el siguiente nivel + porcentaje medio y lo que falta en total (para ordenar «los más cerca»).
+function evaluarProgresoNivelResp(conteo, requisitos) {
+  const base = calcularProgresoNivel(conteo, requisitos);
+  let suma = 0;
+  let faltan = 0;
+  for (const d of base.detalle) {
+    suma += d.necesarios > 0 ? Math.min(1, d.actual / d.necesarios) : 1;
+    faltan += Math.max(0, d.necesarios - d.actual);
+  }
+  const porcentaje = base.detalle.length ? Math.round((suma / base.detalle.length) * 100) : 100;
+  return { cumple: base.cumple, detalle: base.detalle, porcentaje: base.cumple ? 100 : Math.min(99, porcentaje), faltan };
+}
+
+function infoNivelResp(area, nivel) {
+  if (area === "fotografia") {
+    const i = NIVELES_FOTO_INFO[nivel] || NIVELES_FOTO_INFO[1];
+    return { nivel, etiqueta: i.etiqueta, nombre: i.nombre, emoji: i.emoji };
+  }
+  const i = NIVELES_INFO[nivel] || NIVELES_INFO[1];
+  return { nivel, etiqueta: `N${nivel}`, nombre: i.nombre, emoji: i.emoji };
+}
+
+async function respuestaNivelesResp(env, area) {
+  const cfg = NIVELES_RESP_AREAS[area];
+  await asegurarTablaNivelValoraciones(env);
+  const maximo = area === "fotografia" ? NIVEL_MAXIMO_FOTOGRAFO : NIVEL_MAXIMO;
+  const { results: usuarios } = await env.DB.prepare(
+    "SELECT id, nombre, email, nivel, nivel_nota, rol FROM users WHERE rol = ? AND activo = 1 ORDER BY nombre LIMIT 500"
+  ).bind(cfg.rol).all();
+  const lista = usuarios || [];
+
+  const conteosRed = area === "redaccion" ? await contarPublicacionesPorTipoDeVarios(env, lista.map((u) => u.id)) : null;
+  const actividadFoto = area === "fotografia" ? await actividadFotografosResp(env) : null;
+
+  const valoraciones = new Map();
+  try {
+    const { results } = await env.DB.prepare(
+      "SELECT usuario_id, nivel_objetivo, decision, nota, decidido_por_nombre, created_at FROM nivel_valoraciones ORDER BY id DESC LIMIT 3000"
+    ).all();
+    for (const v of results || []) {
+      const k = `${v.usuario_id}:${v.nivel_objetivo}`;
+      if (!valoraciones.has(k)) valoraciones.set(k, v);
+    }
+  } catch { /* sin valoraciones todavía */ }
+  const desde = new Map();
+  try {
+    const { results } = await env.DB.prepare("SELECT usuario_id, MAX(created_at) AS f FROM nivel_historial GROUP BY usuario_id").all();
+    for (const r of results || []) desde.set(Number(r.usuario_id), r.f);
+  } catch { /* sin historial */ }
+
+  const personas = [];
+  const enMaximo = [];
+  for (const u of lista) {
+    const actual = Math.min(maximo, Math.max(1, Number(u.nivel) || 1));
+    if (actual >= maximo) { const i = infoNivelResp(area, actual); enMaximo.push({ id: u.id, nombre: u.nombre, etiqueta: i.etiqueta, nivel_nombre: i.nombre, emoji: i.emoji }); continue; }
+    const siguiente = actual + 1;
+    const requisitos = area === "fotografia" ? NIVELES_FOTO_REQUISITOS[siguiente] : NIVELES_REQUISITOS[siguiente];
+    const conteo = area === "fotografia"
+      ? (actividadFoto.get(Number(u.id)) || { partidos: 0, fotos: 0 })
+      : (conteosRed.get(u.id) || {});
+    const ev = evaluarProgresoNivelResp(conteo, requisitos);
+    const v = valoraciones.get(`${u.id}:${siguiente}`) || null;
+    personas.push({
+      id: u.id,
+      nombre: u.nombre,
+      email: u.email || null,
+      actual: infoNivelResp(area, actual),
+      siguiente: infoNivelResp(area, siguiente),
+      nivel_nota: u.nivel_nota || null,
+      en_nivel_desde: desde.get(Number(u.id)) || null,
+      cumple: ev.cumple,
+      porcentaje: ev.porcentaje,
+      faltan: ev.faltan,
+      requisitos: ev.detalle,
+      valoracion: v ? { decision: v.decision, nota: v.nota || null, por: v.decidido_por_nombre, fecha: v.created_at } : null,
+    });
+  }
+  // Primero los que ya cumplen y esperan decisión (los ya valorados con «ahora no» detrás), luego por cercanía.
+  personas.sort((a, b) =>
+    (Number(b.cumple) - Number(a.cumple)) ||
+    (Number(!!a.valoracion) - Number(!!b.valoracion)) ||
+    (b.porcentaje - a.porcentaje) || (a.faltan - b.faltan) ||
+    String(a.nombre).localeCompare(String(b.nombre), "es"));
+  const cercanos = personas
+    .filter((p) => !p.cumple && p.porcentaje > 0)
+    .sort((a, b) => (a.faltan - b.faltan) || (b.porcentaje - a.porcentaje) || String(a.nombre).localeCompare(String(b.nombre), "es"))
+    .slice(0, NIVELES_RESP_CERCANOS_MAX)
+    .map((p) => p.id);
+  return {
+    area,
+    titulo: cfg.titulo,
+    resumen: {
+      total: lista.length,
+      listos: personas.filter((p) => p.cumple).length,
+      cercanos: cercanos.length,
+      en_maximo: enMaximo.length,
+    },
+    personas,
+    cercanos,
+    en_maximo: enMaximo,
+    generado: new Date().toISOString(),
+  };
+}
+
+// ---------- Avisos de niveles: push + correo a los Responsables cuando alguien cumple los requisitos ----------
+// Una pasada (cada 10 min como mucho, desde el cron) mira redacción y fotografía con respuestaNivelesResp y, por cada
+// persona que YA cumple los requisitos del siguiente nivel, avisa UNA sola vez a los Responsables. Se agrupa todo en un
+// único aviso por pasada («3 personas cumplen los requisitos»), así la primera vez no llegan decenas de mensajes.
+//  - Una vez por persona y nivel objetivo: se «reclama» en nivel_avisos ANTES de enviar. Si no llegó ni un push ni un
+//    correo a nadie, se libera para reintentar en la siguiente pasada.
+//  - A quien ya se valoró con «Ahora no» no se le avisa.
+//  - Push: categoría «niveles» de la campanita (solo Responsables; la reciben por defecto salvo que la apaguen).
+//  - Correo: a cada Responsable con email, salvo quien lo desactive (settings «niveles_avisos_email_off:<id>»).
+// Solo corre en el Worker principal (D1). Apagable con NIVELES_AVISOS_DESACTIVADO=1.
+const NIVELES_AVISOS_INTERVALO_MS = 10 * 60 * 1000;
+const NIVELES_AVISOS_KV = "niveles_avisos:ultimo_ms";
+const NIVELES_AVISOS_URL = `${SITIO_URL}/admin/panel.html?ir=funcionalidades.responsabilidades`;
+let NIVELES_AVISOS_ULTIMO_MS = 0;
+let NIVEL_AVISOS_TABLA_LISTA = false;
+
+async function asegurarTablaNivelAvisos(env) {
+  if (NIVEL_AVISOS_TABLA_LISTA) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS nivel_avisos (
+       usuario_id INTEGER NOT NULL,
+       nivel_objetivo INTEGER NOT NULL,
+       avisado_at TEXT NOT NULL DEFAULT (datetime('now')),
+       PRIMARY KEY (usuario_id, nivel_objetivo)
+     )`
+  ).run();
+  NIVEL_AVISOS_TABLA_LISTA = true;
+}
+
+async function nivelesAvisosEmailActivo(env, uid) {
+  try {
+    const f = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(`niveles_avisos_email_off:${uid}`).first();
+    return !(f && String(f.value) === "1");
+  } catch { return true; }
+}
+
+function listaNombresResp(personas, max = 6) {
+  const nombres = personas.slice(0, max).map((p) => `${p.nombre} (${p.actual.etiqueta} → ${p.siguiente.etiqueta})`);
+  return nombres.join(", ") + (personas.length > max ? ` y ${personas.length - max} más` : "");
+}
+
+async function enviarAvisoNivelesCorreo(env, destinatario, listos, cercanos) {
+  const total = listos.length;
+  const redaccion = listos.filter((x) => x.area === "redaccion").map((x) => x.p);
+  const fotografia = listos.filter((x) => x.area === "fotografia").map((x) => x.p);
+  const titulo = total === 1 ? "1 persona cumple los requisitos para subir de nivel" : `${total} personas cumplen los requisitos para subir de nivel`;
+  const url = NIVELES_AVISOS_URL;
+  const texto = [
+    titulo, "",
+    redaccion.length ? `Redacción: ${listaNombresResp(redaccion)}` : "",
+    fotografia.length ? `Fotografía: ${listaNombresResp(fotografia)}` : "",
+    cercanos.length ? `Los que más cerca están: ${listaNombresResp(cercanos, 3)}` : "",
+    "", `Revisar y decidir: ${url}`,
+    "", "Cumplir los requisitos no sube el nivel: lo decide un Responsable desde Funcionalidades > Responsabilidades.",
+  ].filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n");
+  const html = plantillaEmail({
+    etiqueta: "Niveles",
+    titulo,
+    preheader: titulo,
+    parrafo: "Estas personas ya han llegado a las cifras del siguiente nivel. Cumplirlas no lo sube solo: tú decides si suben ahora o más adelante.",
+    filas: [
+      { etiqueta: "Redacción", valor: redaccion.length ? listaNombresResp(redaccion) : "" },
+      { etiqueta: "Fotografía", valor: fotografia.length ? listaNombresResp(fotografia) : "" },
+      { etiqueta: "Más cerca", valor: cercanos.length ? listaNombresResp(cercanos, 3) : "" },
+    ],
+    boton: { texto: "Revisar y decidir", url },
+    pieHtml: "Aviso automático de ELOTROFÚTBOLTV para los Responsables. Puedes desactivarlo en Funcionalidades > Responsabilidades > Redacción o Fotografía.",
+  });
+  return enviarEmailNotificacion(env, { asunto: `${titulo} · ElOtroFútbol`, texto, html }, { destinatario });
+}
+
+// Devuelve cuántas personas se han avisado en esta pasada.
+async function avisarNivelesListosSiToca(env, { forzar = false } = {}) {
+  if (env.NIVELES_AVISOS_DESACTIVADO === "1" || env.NIVELES_AVISOS_DESACTIVADO === 1) return 0;
+  const ahora = Date.now();
+  if (!forzar) {
+    if (ahora - NIVELES_AVISOS_ULTIMO_MS < NIVELES_AVISOS_INTERVALO_MS) return 0;
+    NIVELES_AVISOS_ULTIMO_MS = ahora;
+  }
+  const reclamados = [];
+  try {
+    if (!forzar && env.ELOTROFUTBOL_KV) {
+      const previo = Number(await env.ELOTROFUTBOL_KV.get(NIVELES_AVISOS_KV)) || 0;
+      if (ahora - previo < NIVELES_AVISOS_INTERVALO_MS) return 0;
+      await env.ELOTROFUTBOL_KV.put(NIVELES_AVISOS_KV, String(ahora), { expirationTtl: 3600 });
+    }
+    await asegurarTablaNivelAvisos(env);
+    const listos = [];
+    const cercanos = [];
+    for (const area of Object.keys(NIVELES_RESP_AREAS)) {
+      const d = await respuestaNivelesResp(env, area);
+      for (const p of d.personas) {
+        if (!p.cumple || p.valoracion) continue;
+        const r = await env.DB.prepare("INSERT OR IGNORE INTO nivel_avisos (usuario_id, nivel_objetivo) VALUES (?, ?)").bind(p.id, p.siguiente.nivel).run();
+        if (r && r.meta && Number(r.meta.changes) > 0) { reclamados.push([p.id, p.siguiente.nivel]); listos.push({ area, p }); }
+      }
+      const por = new Map(d.personas.map((p) => [p.id, p]));
+      for (const id of d.cercanos) if (por.get(id)) cercanos.push(por.get(id));
+    }
+    if (!listos.length) return 0;
+
+    const { results: admins } = await env.DB.prepare("SELECT id, email FROM users WHERE rol = 'admin' AND activo = 1").all();
+    const ids = (admins || []).map((a) => a.id);
+    let entregados = 0;
+    if (ids.length) {
+      const redaccion = listos.filter((x) => x.area === "redaccion").map((x) => x.p);
+      const fotografia = listos.filter((x) => x.area === "fotografia").map((x) => x.p);
+      const total = listos.length;
+      const cuerpo = [redaccion.length ? `Redacción: ${listaNombresResp(redaccion, 3)}` : "", fotografia.length ? `Fotografía: ${listaNombresResp(fotografia, 3)}` : ""].filter(Boolean).join(" · ");
+      const push = await staffPushEnviar(env, "niveles", {
+        titulo: total === 1 ? "1 persona cumple los requisitos para subir de nivel" : `${total} personas cumplen los requisitos para subir de nivel`,
+        cuerpo,
+        url: `${NIVELES_AVISOS_URL}&resp=${redaccion.length ? "respRedaccion" : "respFotografia"}`,
+        tag: "niveles",
+      }, { soloUids: ids, ttl: 24 * 3600 });
+      entregados += Number(push && push.enviados) || 0;
+      for (const a of admins) {
+        const email = String(a.email || "").trim();
+        if (!email || !(await nivelesAvisosEmailActivo(env, a.id))) continue;
+        if (await enviarAvisoNivelesCorreo(env, email, listos, cercanos.filter((c) => !c.cumple))) entregados++;
+      }
+    }
+    if (!entregados) {
+      // Nadie lo recibió (sin dispositivos ni correos): se libera para reintentar en la siguiente pasada.
+      for (const [uid, nivel] of reclamados) await env.DB.prepare("DELETE FROM nivel_avisos WHERE usuario_id = ? AND nivel_objetivo = ?").bind(uid, nivel).run().catch(() => {});
+      return 0;
+    }
+    return listos.length;
+  } catch (err) {
+    console.error("Avisos de niveles:", err && err.message);
+    for (const [uid, nivel] of reclamados) { try { await env.DB.prepare("DELETE FROM nivel_avisos WHERE usuario_id = ? AND nivel_objetivo = ?").bind(uid, nivel).run(); } catch { /* sin liberar */ } }
+    return 0;
+  }
+}
 
 // ---------- RACHAS SEMANALES ----------
 // "Semanas seguidas con actividad" de un colaborador (redactor o fotógrafo). Una semana (lunes a
@@ -8098,9 +12087,9 @@ async function calcularRachaSemanal(env, usuario) {
 // Roles: redactor = las tres; fotógrafo = solo fotos_10 (no escribe crónicas ni cubre en directo);
 // admin = ninguna (como con las rachas, no tiene que demostrar nada).
 const INSIGNIAS_HITOS = [
-  { id: "primera_cronica", nombre: "Primera crónica", emoji: "📝", descripcion: "Publica tu primera crónica de un partido.", objetivo: 1, roles: ["redactor"] },
-  { id: "fotos_10", nombre: "10 fotos publicadas", emoji: "📷", descripcion: "Sube 10 fotos a galerías de partido visibles en la web.", objetivo: 10, roles: ["redactor", "fotografo"] },
-  { id: "primer_directo", nombre: "Primer directo", emoji: "🔴", descripcion: "Cubre tu primer partido en directo con el minuto a minuto.", objetivo: 1, roles: ["redactor"] },
+  { id: "primera_cronica", nombre: "Primera crónica", emoji: "📝", descripcion: "Publica tu primera crónica de un partido.", objetivo: 1, roles: ["redactor"], ir: "noticias.nueva", accion: "Escribir una crónica" },
+  { id: "fotos_10", nombre: "10 fotos publicadas", emoji: "📷", descripcion: "Sube 10 fotos a galerías de partido visibles en la web.", objetivo: 10, roles: ["redactor", "fotografo"], ir: "contenido.galeriaPartido", accion: "Subir fotos a una galería" },
+  { id: "primer_directo", nombre: "Primer directo", emoji: "🔴", descripcion: "Cubre tu primer partido en directo con el minuto a minuto.", objetivo: 1, roles: ["redactor"], ir: "resultados.listaResultados", accion: "Abrir un partido" },
 ];
 // Un partido "en directo" admite eventos desde que arranca el cronómetro hasta ~4 h después
 // (90' + descanso + prórroga + descuentos con margen). Pequeña tolerancia por delante por si el
@@ -8140,7 +12129,7 @@ function evaluarInsignias(rol, medidas, guardadas, ahoraTexto) {
     const actual = ya ? h.objetivo : Math.min(h.objetivo, medido);
     const conseguida = ya || actual >= h.objetivo;
     if (conseguida && !ya) nuevas[h.id] = ahoraTexto;
-    lista.push({ id: h.id, nombre: h.nombre, emoji: h.emoji, descripcion: h.descripcion, objetivo: h.objetivo, actual, conseguida });
+    lista.push({ id: h.id, nombre: h.nombre, emoji: h.emoji, descripcion: h.descripcion, objetivo: h.objetivo, actual, conseguida, ir: h.ir || null, accion: h.accion || null, fecha: ya ? String(guardadas[h.id]).slice(0, 10) : null });
   }
   return { lista, nuevas };
 }
@@ -8177,7 +12166,11 @@ async function contarFotosPublicadasInsignias(env, uid) {
 // partido (activity_log, accion crear_evento_partido) y lo compara con el arranque del cronómetro.
 // La ventana se evalúa en JS (no en SQL) para no depender de aritmética de fechas, que SQLite y
 // PostgreSQL escriben distinto. Se consideran como máximo sus 60 primeros partidos.
+// 10 min de caché por usuario: recorría todo su historial en activity_log en cada cálculo de insignias.
 async function haCubiertoPartidoEnDirecto(env, uid) {
+  return memoCorta(`directo:${uid}`, 600000, () => haCubiertoPartidoEnDirectoSinCache(env, uid));
+}
+async function haCubiertoPartidoEnDirectoSinCache(env, uid) {
   try {
     const { results: primeros } = await env.DB.prepare(
       `SELECT entidad_id AS rid, MIN(created_at) AS primero FROM activity_log
@@ -8457,6 +12450,17 @@ const HORARIO_FIJO = {
   },
 };
 
+// Las previas y las crónicas de COMPETICIONES (Copa del Rey y Copa Federación)
+// NO siguen este horario: se pueden subir y compartir en redes cualquier día.
+// El horario de previas (jueves y viernes) y el de crónicas solo valen para las
+// de liga. Para exentar otra categoría basta con añadirla aquí. (El nombre de la
+// función se mantiene por compatibilidad: ahora cubre previas y crónicas.)
+const CATEGORIAS_PREVIA_SIN_HORARIO = ["copa_del_rey", "copa_federacion"];
+const TIPOS_EXENTOS_DE_HORARIO_EN_COPAS = ["previa", "cronica"];
+function previaExentaDeHorario(tipo, categoria) {
+  return TIPOS_EXENTOS_DE_HORARIO_EN_COPAS.includes(tipo || "noticia") && CATEGORIAS_PREVIA_SIN_HORARIO.includes(categoria);
+}
+
 // ---------- CALENDARIO DE CONTENIDO EDITABLE (Funcionalidades > Información > Horario) ----------
 // Lo editan los admins desde el panel y se guarda entero como JSON en settings
 // bajo la clave 'calendario_contenido'. Forma:
@@ -8573,10 +12577,11 @@ async function esCronicaDeJornadaAnterior(env, resultadoId, hoyYmd) {
 }
 
 // true si publicar este artículo AHORA cae fuera del horario configurado.
-async function estaFueraDeCalendario(env, { tipo, resultado_id, fecha }) {
+async function estaFueraDeCalendario(env, { tipo, resultado_id, fecha, categoria }) {
   const horario = await obtenerHorarioPublicacion(env);
   if (!horario.activo) return false;
   const tipoArticulo = tipo || "noticia";
+  if (previaExentaDeHorario(tipoArticulo, categoria)) return false;
   const hoy = hoyEnMadrid(fecha || new Date());
   let tipoHorario = tipoArticulo;
   if (tipoArticulo === "cronica") {
@@ -8670,6 +12675,9 @@ async function aplicarFueraCalendarioEnLectura(env, articulos) {
     try { ctx = await cargarContextoJornadas(env, idsCronicas); } catch (err) { console.error("horario_publicacion (jornadas):", err); }
   }
   return articulos.map((a) => {
+    // Previa o crónica de competición (copas): nunca está fuera de horario, aunque
+    // quedara marcada antes de existir esta excepción.
+    if (previaExentaDeHorario(a.tipo, a.categoria)) return a.fuera_calendario ? { ...a, fuera_calendario: 0 } : a;
     if (a.fuera_calendario) return a;
     if (!a.publicado && !a.programado_para) return a; // borrador: aún no se publica
     const fecha = fechaSqlADate(a.publicado ? a.fecha_publicacion : a.programado_para);
@@ -8698,13 +12706,13 @@ const EDIT_GRANT_MINUTOS = 120;
 // autor, o si tiene una solicitud aprobada y todavía dentro de la
 // ventana de tiempo concedida para esa entidad exacta.
 async function puedeEditarEntidad(env, payload, tipoEntidad, autorId) {
-  if (payload.rol === "admin") return true;
+  if (esAdminOGestor(payload)) return true;
   if (autorId && autorId === payload.uid) return true;
   return false; // el permiso temporal por solicitud se comprueba aparte con id de entidad
 }
 
 async function tienePermisoTemporal(env, payload, tipoEntidad, entidadId) {
-  if (payload.rol === "admin") return true;
+  if (esAdminOGestor(payload)) return true;
   const permiso = await env.DB.prepare(
     `SELECT id FROM edit_requests
      WHERE tipo_entidad = ? AND entidad_id = ? AND solicitante_id = ? AND estado = 'aprobada'
@@ -8725,7 +12733,7 @@ async function tienePermisoTemporal(env, payload, tipoEntidad, entidadId) {
 // contenido de cualquiera sin tener que pedir permiso, ver documento
 // de niveles), o permiso temporal concedido por una solicitud aprobada.
 async function puedeEditar(env, payload, tipoEntidad, entidadId, autorId, coautorId) {
-  if (payload.rol === "admin") return true;
+  if (esAdminOGestor(payload)) return true;
   if (tipoEntidad === "resultado") return true;
   if (autorId && autorId === payload.uid) return true;
   if (coautorId && coautorId === payload.uid) return true;
@@ -8736,12 +12744,121 @@ async function puedeEditar(env, payload, tipoEntidad, entidadId, autorId, coauto
   return tienePermisoTemporal(env, payload, tipoEntidad, entidadId);
 }
 
+// ============================================================
+// BLOQUEO DE EDICIÓN SIMULTÁNEA DE NOTICIAS
+// Cuando alguien abre una noticia para editarla en el panel, se "reserva"
+// con un bloqueo corto (BLOQUEO_NOTICIA_TTL_MS) que el navegador renueva
+// cada pocos segundos mientras el formulario sigue abierto. Si otra persona
+// (o la misma en otra pestaña) intenta abrirla o guardarla mientras el
+// bloqueo está vigente, recibe un 423 con el nombre de quien la tiene.
+//   - Si el navegador se cierra o pierde la conexión, el bloqueo caduca solo
+//     (no hay que limpiar nada a mano).
+//   - Un Responsable (admin / gestor de contenido) puede "tomar el control".
+//   - Es cooperativo: si la tabla no existe o falla la base de datos, NUNCA
+//     se impide guardar (ver bloqueoNoticiaAjeno).
+// Tabla creada en caliente con DDL portable (D1/SQLite y PostgreSQL). Las
+// fechas se guardan como ISO-8601 en TEXT: comparan bien como cadenas.
+// ============================================================
+const BLOQUEO_NOTICIA_TTL_MS = 90 * 1000;
+let BLOQUEOS_NOTICIA_TABLA_LISTA = false;
+async function asegurarTablaBloqueosNoticia(env) {
+  if (BLOQUEOS_NOTICIA_TABLA_LISTA) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS article_edit_locks (
+       article_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, user_name TEXT NOT NULL DEFAULT '',
+       session_id TEXT NOT NULL, acquired_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, expires_at TEXT NOT NULL)`
+  ).run();
+  BLOQUEOS_NOTICIA_TABLA_LISTA = true;
+}
+
+function sesionEdicionLimpia(valor) {
+  const s = String(valor == null ? "" : valor).trim();
+  return /^[A-Za-z0-9_-]{8,64}$/.test(s) ? s : "";
+}
+
+// Devuelve la fila del bloqueo si sigue vigente (no caducada), o null.
+async function leerBloqueoNoticiaVigente(env, articuloId) {
+  await asegurarTablaBloqueosNoticia(env);
+  const fila = await env.DB.prepare(
+    "SELECT article_id, user_id, user_name, session_id, acquired_at, heartbeat_at, expires_at FROM article_edit_locks WHERE article_id = ?"
+  ).bind(articuloId).first();
+  if (!fila) return null;
+  return String(fila.expires_at) > new Date().toISOString() ? fila : null;
+}
+
+function bloqueoNoticiaParaCliente(fila, sesion) {
+  if (!fila) return null;
+  return {
+    usuario_id: Number(fila.user_id),
+    usuario_nombre: fila.user_name || "Otra persona",
+    desde: fila.acquired_at,
+    ultimo_latido: fila.heartbeat_at,
+    caduca: fila.expires_at,
+    es_mio: !!sesion && fila.session_id === sesion,
+  };
+}
+
+// Reserva (o renueva) el bloqueo de forma atómica: solo se escribe si no
+// existe, ya caducó, o es de esta misma sesión. Con forzar=true (solo
+// Responsables) se toma aunque lo tenga otra persona.
+async function adquirirBloqueoNoticia(env, articuloId, payload, sesion, forzar) {
+  await asegurarTablaBloqueosNoticia(env);
+  const ahora = new Date();
+  const ahoraISO = ahora.toISOString();
+  const expiraISO = new Date(ahora.getTime() + BLOQUEO_NOTICIA_TTL_MS).toISOString();
+  const nombre = String(payload.nombre || payload.email || "Redacción").slice(0, 120);
+  const condicion = forzar ? "" : "WHERE article_edit_locks.session_id = excluded.session_id OR article_edit_locks.expires_at < ?";
+  const params = [articuloId, payload.uid, nombre, sesion, ahoraISO, ahoraISO, expiraISO];
+  if (!forzar) params.push(ahoraISO);
+  await env.DB.prepare(
+    `INSERT INTO article_edit_locks (article_id, user_id, user_name, session_id, acquired_at, heartbeat_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (article_id) DO UPDATE SET
+       user_id = excluded.user_id, user_name = excluded.user_name, session_id = excluded.session_id,
+       acquired_at = CASE WHEN article_edit_locks.session_id = excluded.session_id THEN article_edit_locks.acquired_at ELSE excluded.acquired_at END,
+       heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at
+     ${condicion}`
+  ).bind(...params).run();
+  // Se relee para saber quién se ha quedado realmente con el bloqueo.
+  const fila = await env.DB.prepare(
+    "SELECT article_id, user_id, user_name, session_id, acquired_at, heartbeat_at, expires_at FROM article_edit_locks WHERE article_id = ?"
+  ).bind(articuloId).first();
+  // Limpieza oportunista de bloqueos caducados (tabla minúscula).
+  try { await env.DB.prepare("DELETE FROM article_edit_locks WHERE expires_at < ?").bind(ahoraISO).run(); } catch (_) { /* no crítico */ }
+  return fila && fila.session_id === sesion ? { ok: true, fila } : { ok: false, fila };
+}
+
+async function liberarBloqueoNoticia(env, articuloId, sesion, forzar) {
+  await asegurarTablaBloqueosNoticia(env);
+  if (forzar) {
+    await env.DB.prepare("DELETE FROM article_edit_locks WHERE article_id = ?").bind(articuloId).run();
+  } else if (sesion) {
+    await env.DB.prepare("DELETE FROM article_edit_locks WHERE article_id = ? AND session_id = ?").bind(articuloId, sesion).run();
+  }
+}
+
+// ¿Está la noticia bloqueada por OTRA sesión? Devuelve la fila o null.
+// Sin sesión (clientes antiguos) solo cuenta como ajeno el bloqueo de otra
+// persona. Ante cualquier fallo de base de datos devuelve null: el bloqueo
+// nunca debe impedir guardar una noticia.
+async function bloqueoNoticiaAjeno(env, articuloId, payload, sesion) {
+  try {
+    const fila = await leerBloqueoNoticiaVigente(env, articuloId);
+    if (!fila) return null;
+    if (sesion) return fila.session_id === sesion ? null : fila;
+    return Number(fila.user_id) === Number(payload.uid) ? null : fila;
+  } catch (err) {
+    console.error("[bloqueo-noticia] no se pudo comprobar:", err && err.message);
+    return null;
+  }
+}
+
 // Borrar un partido es más grave que tomar el relevo en directo (que sí
 // puede hacer cualquier redactor, ver puedeEditar): solo el autor, un admin
 // o quien tenga una solicitud de edición aprobada y vigente. Un partido sin
 // autor (importado/creado por el sistema) solo lo borra un admin.
 async function puedeBorrarResultado(env, payload, resultadoId, autorId) {
-  if (payload.rol === "admin") return true;
+  if (esAdminOGestor(payload)) return true;
   if (autorId && autorId === payload.uid) return true;
   return tienePermisoTemporal(env, payload, "resultado", resultadoId);
 }
@@ -8824,6 +12941,200 @@ async function iniciarCronometroPartido(env, resultadoId, minutoInicial = 0, opc
   if (minutos === 0 || opciones.segundaParte) await limpiarAnadidoSeguir(env, resultadoId);
 }
 
+/**
+ * RECHAZO AUTOMÁTICO DE ACREDITACIONES SIN RESPUESTA
+ *
+ * Si empieza el partido y la solicitud sigue sin resolverse (estado "pendiente" o
+ * "solicitada": nadie la ha aprobado, rechazado ni cancelado), se pasa sola a
+ * "rechazada". NO se envía ningún correo al solicitante: es solo un cierre de la bandeja.
+ *
+ *   - Cuándo: al llegar la hora de inicio del partido (hora de Madrid, con el cambio
+ *     de hora ya corregido). Se busca el partido en "results" por equipo + fecha
+ *     (o + jornada si la solicitud no tiene fecha). Cuenta como empezado si está
+ *     en juego / finalizado / colgado, o si ya pasó su hora ("programado") o su nueva
+ *     hora ("retrasado"). Aplazados y suspendidos no se tocan.
+ *   - Sin partido localizado: solo si la fecha de la solicitud ya es de un día anterior.
+ *   - Queda constancia: revisado_por = "Sistema (automático)", una nota y el registro
+ *     de actividad. El panel lo ve como cualquier otro cambio de estado.
+ *   - Si alguien la resuelve a la vez, gana esa persona (el UPDATE solo aplica si el
+ *     estado sigue siendo el leído).
+ *   - Corre en los dos Workers: al no enviar correos no hay duplicados, y el UPDATE es
+ *     idempotente. Pasada cada ACRED_AUTORECHAZO_INTERVALO_MS como mucho; se apaga con la
+ *     variable ACRED_AUTORECHAZO_DESACTIVADO=1.
+ */
+const ACRED_AUTORECHAZO_INTERVALO_MS = 3 * 60 * 1000;
+const ACRED_AUTORECHAZO_POR = "Sistema (automático)";
+const ACRED_AUTORECHAZO_NOTA = "Rechazada automáticamente: el partido empezó sin respuesta del club.";
+const ACRED_AUTORECHAZO_MAX_POR_PASADA = 100;
+let ACRED_AUTORECHAZO_ULTIMO_MS = 0;
+
+function acredClaveEquipo(nombre) {
+  const canonico = canonicoClubPorAlias(nombre) || nombre;
+  return syncClaveEquipo(canonico || "");
+}
+function acredMismoEquipo(a, b) {
+  const x = acredClaveEquipo(a), y = acredClaveEquipo(b);
+  return !!x && !!y && x === y;
+}
+
+// Partido (de la lista cargada) al que corresponde una solicitud, o null si no se sabe seguro.
+function acredPartidoDeSolicitud(a, partidos) {
+  const propios = (partidos || []).filter((p) => acredMismoEquipo(a.equipo, p.equipo_local) || acredMismoEquipo(a.equipo, p.equipo_visitante));
+  if (!propios.length) return null;
+  let candidatos;
+  const fechaA = String(a.fecha_partido || "").slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(fechaA)) {
+    candidatos = propios.filter((p) => String(p.fecha_partido || "").slice(0, 10) === fechaA);
+  } else {
+    const m = /(?:jornada|j\.?)\s*(\d{1,2})\b/i.exec(String(a.jornada_partido || ""));
+    if (!m) return null;
+    candidatos = propios.filter((p) => Number(p.jornada) === Number(m[1]));
+  }
+  if (candidatos.length > 1) {
+    const texto = syncClaveEquipo(a.jornada_partido || "");
+    const porRival = candidatos.filter((p) => {
+      const rival = acredMismoEquipo(a.equipo, p.equipo_local) ? p.equipo_visitante : p.equipo_local;
+      const k = acredClaveEquipo(rival);
+      return !!k && texto.includes(k);
+    });
+    return porRival.length === 1 ? porRival[0] : null;
+  }
+  return candidatos.length === 1 ? candidatos[0] : null;
+}
+
+// Fecha ("AAAA-MM-DD" o "AAAA-MM-DDTHH:MM", hora de Madrid) escrita en el texto libre de "Jornada y
+// partido" (p. ej. "Alcantarilla CF - Los Garres. Domingo 1 de noviembre a las 18. Jornada 9."), o
+// null si no hay una fecha clara. Sin año en el texto se usa el de la solicitud (el más cercano).
+const ACRED_MESES_TEXTO = { enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6, julio: 7, agosto: 8, septiembre: 9, setiembre: 9, octubre: 10, noviembre: 11, diciembre: 12 };
+function acredFechaDeTexto(a) {
+  const t = String(a.jornada_partido || "").toLowerCase();
+  const m = /\b(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)(?:\s+de\s+(\d{4}))?/.exec(t);
+  if (!m) return null;
+  const dia = Number(m[1]), mes = ACRED_MESES_TEXTO[m[2]];
+  const creada = String(a.created_at || "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(creada)) return null;
+  const pad = (n) => String(n).padStart(2, "0");
+  const ymd = (anio) => `${anio}-${pad(mes)}-${pad(dia)}`;
+  let anio = m[3] ? Number(m[3]) : Number(creada.slice(0, 4));
+  if (!m[3]) {
+    const limite = new Date(new Date(creada + "T00:00:00Z").getTime() - 60 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+    if (ymd(anio) < limite) anio += 1; // pedida en diciembre para un partido de enero, etc.
+  }
+  const d = new Date(Date.UTC(anio, mes - 1, dia));
+  if (d.getUTCMonth() !== mes - 1 || d.getUTCDate() !== dia) return null; // fecha imposible (31 de abril...)
+  const h = /\ba\s+las\s+(\d{1,2})(?:[:.h](\d{2}))?/.exec(t.slice(m.index + m[0].length));
+  if (h && Number(h[1]) <= 23 && Number(h[2] || 0) <= 59) return `${ymd(anio)}T${pad(Number(h[1]))}:${pad(Number(h[2] || 0))}`;
+  return ymd(anio);
+}
+
+// true = el partido ya ha empezado; false = todavía no (o no se juega: aplazado, suspendido...).
+function acredPartidoYaEmpezado(p, ahoraMs, hoy) {
+  const estado = String(p.estado || "").toLowerCase();
+  if (estado === "en_juego" || estado === "finalizado" || estado === "colgado") return true;
+  let fecha;
+  if (estado === "programado") fecha = String(p.fecha_partido || "");
+  else if (estado === "retrasado") fecha = String(p.fecha_partido_retrasado || "");
+  else return false;
+  if (fecha.length === 16) {
+    const utc = fechaPartidoAUtcSqlite(fecha);
+    const ms = utc ? msDesdeFechaBD(utc) : null;
+    return ms !== null && ahoraMs >= ms;
+  }
+  const dia = fecha.slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(dia) && dia < hoy; // sin hora: solo cuando el día ya pasó
+}
+
+// Una pasada. Devuelve cuántas solicitudes se han rechazado.
+async function rechazarAcreditacionesSinRespuestaSiToca(env, { forzar = false } = {}) {
+  if (env.ACRED_AUTORECHAZO_DESACTIVADO === "1" || env.ACRED_AUTORECHAZO_DESACTIVADO === 1) return 0;
+  const ahora = Date.now();
+  if (!forzar && ahora - ACRED_AUTORECHAZO_ULTIMO_MS < ACRED_AUTORECHAZO_INTERVALO_MS) return 0;
+  ACRED_AUTORECHAZO_ULTIMO_MS = ahora;
+  let rechazadas = 0;
+  try {
+    const hoy = diaYHoraEnMadrid(new Date(ahora)).dia;
+    const ayer = diaYHoraEnMadrid(new Date(ahora - 24 * 3600 * 1000)).dia;
+    const { results: abiertas } = await env.DB.prepare(
+      `SELECT id, nombre, equipo, jornada_partido, fecha_partido, estado, nota_admin, created_at
+         FROM acreditaciones WHERE estado IN ('pendiente', 'solicitada')`
+    ).all();
+    // Con fecha futura no puede haber empezado: se descartan sin más.
+    const candidatas = (abiertas || []).filter((a) => {
+      const f = String(a.fecha_partido || "").slice(0, 10);
+      return !(/^\d{4}-\d{2}-\d{2}$/.test(f) && f > hoy);
+    });
+    if (!candidatas.length) return 0;
+
+    const dias = new Set([hoy, ayer]);
+    candidatas.forEach((a) => { const f = String(a.fecha_partido || "").slice(0, 10); if (/^\d{4}-\d{2}-\d{2}$/.test(f)) dias.add(f); });
+    const lista = [...dias].slice(0, 40);
+    const { results: partidosDias } = await env.DB.prepare(
+      `SELECT id, jornada, equipo_local, equipo_visitante, estado, fecha_partido, fecha_partido_retrasado
+         FROM results WHERE substr(fecha_partido, 1, 10) IN (${lista.map(() => "?").join(",")})`
+    ).bind(...lista).all();
+    // Solicitudes SIN fecha: se localiza el partido por jornada + equipo, y ese partido puede ser de
+    // hace días, así que se cargan también los de esas jornadas (hasta hoy).
+    const jornadas = new Set();
+    candidatas.forEach((a) => {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(String(a.fecha_partido || "").slice(0, 10))) return;
+      const m = /(?:jornada|j\.?)\s*(\d{1,2})\b/i.exec(String(a.jornada_partido || ""));
+      if (m) jornadas.add(Number(m[1]));
+    });
+    let partidos = partidosDias || [];
+    if (jornadas.size) {
+      const js = [...jornadas].slice(0, 40);
+      const { results: porJornada } = await env.DB.prepare(
+        `SELECT id, jornada, equipo_local, equipo_visitante, estado, fecha_partido, fecha_partido_retrasado
+           FROM results WHERE jornada IN (${js.map(() => "?").join(",")}) AND substr(fecha_partido, 1, 10) <= ? LIMIT 4000`
+      ).bind(...js, hoy).all();
+      const vistos = new Set(partidos.map((p) => p.id));
+      partidos = partidos.concat((porJornada || []).filter((p) => !vistos.has(p.id)));
+    }
+
+    for (const a of candidatas) {
+      if (rechazadas >= ACRED_AUTORECHAZO_MAX_POR_PASADA) break;
+      try {
+        const p = acredPartidoDeSolicitud(a, partidos || []);
+        const f = String(a.fecha_partido || "").slice(0, 10);
+        let empezado = false;
+        if (p) empezado = acredPartidoYaEmpezado(p, ahora, hoy);
+        else if (/^\d{4}-\d{2}-\d{2}$/.test(f)) empezado = f < hoy;
+        else {
+          // Ni partido localizado ni fecha en el formulario: se intenta leer del propio texto
+          // («Domingo 1 de noviembre a las 18»). Con hora, cuando llega; sin hora, al día siguiente.
+          const ft = acredFechaDeTexto(a);
+          if (ft && ft.length === 16) {
+            const utc = fechaPartidoAUtcSqlite(ft);
+            const ms = utc ? msDesdeFechaBD(utc) : null;
+            empezado = ms !== null && ahora >= ms;
+          } else if (ft) empezado = ft < hoy;
+        }
+        if (!empezado) continue;
+
+        const nota = a.nota_admin ? `${String(a.nota_admin).trim()} · ${ACRED_AUTORECHAZO_NOTA}` : ACRED_AUTORECHAZO_NOTA;
+        const r = await env.DB.prepare(
+          `UPDATE acreditaciones
+              SET estado = 'rechazada', nota_admin = ?, revisado_por = ?, revisado_at = datetime('now'), updated_at = datetime('now')
+            WHERE id = ? AND estado = ?`
+        ).bind(nota, ACRED_AUTORECHAZO_POR, a.id, a.estado).run();
+        if (r && r.meta && r.meta.changes === 0) continue; // otra persona la resolvió justo ahora
+        rechazadas++;
+        await registrarActividad(env, null, { uid: null, nombre: ACRED_AUTORECHAZO_POR, rol: "sistema" }, {
+          accion: "acreditacion_rechazada_auto", entidad: "acreditacion", entidad_id: a.id,
+          descripcion: `Acreditación de ${a.nombre} rechazada automáticamente: el partido empezó sin respuesta (sin correo)`,
+          detalle: { estado_anterior: a.estado, estado: "rechazada", automatico: true, correo: "no_enviado" },
+        });
+      } catch (err) {
+        console.log("Rechazo automático de acreditación: error con la solicitud", a && a.id, err && err.message);
+      }
+    }
+  } catch (err) {
+    console.log("Rechazo automático de acreditaciones:", err && err.message);
+    try { await enviarAlerta(env, "cron:acreditaciones-autorechazo", "Falla el rechazo automático de acreditaciones", String(err && err.stack ? err.stack : err.message)); } catch (e) { /* sin alerta */ }
+  }
+  return rechazadas;
+}
+
 // Revisa cada minuto (mismo cron que ya revisaba artículos programados)
 // los partidos "programado" cuya fecha_partido ya haya llegado, y los
 // pasa a "en_juego" arrancando el cronómetro desde 0 en ese instante.
@@ -8902,9 +13213,12 @@ async function iniciarPartidosProgramadosCuyaHoraHaLlegado(env) {
   }
   const candidatos = [...candidatosProgramados, ...candidatosRetrasados];
   const ahoraSqlite = aSqliteDatetimeUTC(new Date());
+  // Solo se arrancan los partidos cuya hora llegó hace poco (ver ARRANQUE_AUTOMATICO_VENTANA_MS):
+  // una fecha de hace días o meses es una fecha mal puesta, no un partido que haya que empezar.
+  const desdeSqlite = aSqliteDatetimeUTC(new Date(Date.now() - ARRANQUE_AUTOMATICO_VENTANA_MS));
   const pendientes = candidatos.filter((p) => {
     const inicioUtc = fechaPartidoAUtcSqlite(p.fecha_partido);
-    return inicioUtc !== null && inicioUtc <= ahoraSqlite;
+    return inicioUtc !== null && inicioUtc <= ahoraSqlite && inicioUtc >= desdeSqlite;
   });
   for (const partido of pendientes) {
     try {
@@ -8929,6 +13243,90 @@ async function iniciarPartidosProgramadosCuyaHoraHaLlegado(env) {
       console.error(`[arranque automático] fallo arrancando el partido ${partido.id}:`, err.message);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// ARRANQUE AUTOMÁTICO: VENTANA DE RECUPERACIÓN + AUTORREPARACIÓN
+//
+// Causa del bug "Este partido ya se ha jugado, pero todavía no se ha cubierto"
+// en partidos que aún no se han jugado (p. ej. Segunda RFEF, jornada 21 del
+// 24-ene-2027): un partido se guardó con una fecha equivocada ya pasada (p. ej.
+// importación rápida con el año en curso en un partido de enero), el cron lo
+// arrancó solo (en_juego) y 150 min después lo cerró como "finalizado no
+// cubierto". Luego la fecha se corrigió (a mano o por el relleno automático),
+// pero el estado se quedó atascado en "finalizado" aunque el partido sea futuro.
+//
+// Dos medidas, las mismas en los dos Workers:
+//  1) El cron solo arranca solo los partidos cuya hora llegó hace como mucho
+//     ARRANQUE_AUTOMATICO_VENTANA_MS. Un partido "programado" con fecha de hace
+//     días/meses es una fecha mal puesta, no un partido que haya que empezar.
+//  2) repararPartidosFalsamenteJugados devuelve a "programado" los partidos que
+//     el cron arrancó/cerró solo y cuya fecha real (ya corregida) es futura, y
+//     limpia lo que dejó (cronómetro, marcador provisional, eventos automáticos
+//     y porras resueltas con ese marcador). No toca nada que tenga cobertura real.
+// ---------------------------------------------------------------------------
+const ARRANQUE_AUTOMATICO_VENTANA_MS = 6 * 60 * 60 * 1000;
+const REPARAR_FALSOS_JUGADOS_INTERVALO_MS = 10 * 60 * 1000;
+const REPARAR_FALSOS_JUGADOS_MARGEN_MS = 3 * 60 * 60 * 1000;
+const REPARAR_FALSOS_JUGADOS_MAX_POR_PASADA = 200;
+const TIPOS_EVENTO_SOLO_AUTOMATICOS = ["inicio_partido", "descanso", "fin_descanso", "fin_partido"];
+let REPARAR_FALSOS_JUGADOS_ULTIMO_MS = 0;
+
+// Devuelve cuántos partidos ha reparado. "forzar" se salta el intervalo entre pasadas.
+async function repararPartidosFalsamenteJugados(env, { forzar = false } = {}) {
+  const ahora = Date.now();
+  if (!forzar && ahora - REPARAR_FALSOS_JUGADOS_ULTIMO_MS < REPARAR_FALSOS_JUGADOS_INTERVALO_MS) return 0;
+  REPARAR_FALSOS_JUGADOS_ULTIMO_MS = ahora;
+  let reparados = 0;
+  try {
+    // fecha_partido es hora de Madrid (UTC+1/+2) como texto. Si su texto supera "ahora UTC + 3 h",
+    // el partido empieza como mínimo 1 h en el futuro: imposible que ya se haya jugado.
+    const limiteLocal = new Date(ahora + REPARAR_FALSOS_JUGADOS_MARGEN_MS).toISOString().slice(0, 16);
+    const { results: candidatos = [] } = await env.DB.prepare(
+      `SELECT id FROM results
+       WHERE (estado IN ('en_juego', 'colgado') OR (estado = 'finalizado' AND (finalizado_no_cubierto = 1 OR (COALESCE(goles_local, 0) = 0 AND COALESCE(goles_visitante, 0) = 0))))
+         AND fecha_partido IS NOT NULL AND length(fecha_partido) >= 10 AND fecha_partido > ?
+         AND (fecha_partido_retrasado IS NULL OR fecha_partido_retrasado = '' OR fecha_partido_retrasado > ?)
+       LIMIT ${REPARAR_FALSOS_JUGADOS_MAX_POR_PASADA}`
+    ).bind(limiteLocal, limiteLocal).all();
+    for (const { id } of candidatos) {
+      try {
+        // Solo eventos automáticos del cron: si hay goles, tarjetas, etc. alguien lo cubrió de verdad.
+        const { results: eventos = [] } = await env.DB.prepare(
+          "SELECT tipo, equipo FROM match_events WHERE resultado_id = ?"
+        ).bind(id).all();
+        const cubiertoDeVerdad = eventos.some((e) => !(TIPOS_EVENTO_SOLO_AUTOMATICOS.includes(e.tipo) && (e.equipo === "ninguno" || !e.equipo)));
+        if (cubiertoDeVerdad) continue;
+
+        const base = `UPDATE results SET estado = 'programado', goles_local = NULL, goles_visitante = NULL,
+             inicio_cronometro_at = NULL, cronometro_pausado_en = NULL, ajuste_cronometro_minutos = 0,
+             aviso_desatendido_mitad = NULL, finalizado_no_cubierto = 0`;
+        const guarda = ` WHERE id = ? AND (estado IN ('en_juego', 'colgado') OR (estado = 'finalizado' AND (finalizado_no_cubierto = 1 OR (COALESCE(goles_local, 0) = 0 AND COALESCE(goles_visitante, 0) = 0))))`;
+        let res;
+        try {
+          res = await env.DB.prepare(`${base}, penaltis_local = NULL, penaltis_visitante = NULL, anadido_minutos = NULL, anadido_parte = NULL${guarda}`).bind(id).run();
+        } catch (e) {
+          res = await env.DB.prepare(base + guarda).bind(id).run(); // BD sin alguna columna opcional
+        }
+        const cambios = res && res.meta && res.meta.changes !== undefined ? Number(res.meta.changes) : 1;
+        if (!cambios) continue; // alguien lo tocó a la vez: gana esa persona
+        await env.DB.prepare(
+          `DELETE FROM match_events WHERE resultado_id = ? AND tipo IN ('inicio_partido', 'descanso', 'fin_descanso', 'fin_partido')`
+        ).bind(id).run();
+        try {
+          await env.DB.prepare("UPDATE porras SET resultado_acierto = 'pendiente', puntos_obtenidos = NULL WHERE resultado_id = ? AND resultado_acierto != 'pendiente'").bind(id).run();
+        } catch (e) { /* sin tabla de porras en esta BD */ }
+        try { await invalidarCacheArticuloPartido(env, id); } catch (e) { /* caché opcional */ }
+        reparados++;
+        console.log(`[reparar falsos jugados] partido ${id} devuelto a 'programado' (su fecha es futura)`);
+      } catch (err) {
+        console.error(`[reparar falsos jugados] fallo con el partido ${id}:`, err && err.message);
+      }
+    }
+  } catch (err) {
+    console.error("[reparar falsos jugados]", err && err.message);
+  }
+  return reparados;
 }
 
 // Minuto a partir del cual se pita el descanso solo, si nadie lo ha
@@ -9387,6 +13785,9 @@ const NOMBRE_COMPETICION_AVISO = {
   hypermotion: "LaLiga Hypermotion",
   primera_federacion: "Primera Federación",
   segunda_federacion: "Segunda Federación",
+  tercera_federacion: "Tercera Federación",
+  copa_del_rey: "Copa del Rey",
+  copa_federacion: "Copa Federación",
 };
 
 // Si se ha registrado un evento (gol, tarjeta, cambio...) hace menos de
@@ -9572,7 +13973,7 @@ async function validarAvisosDesatendidos(env, cola) {
       tipo,
       motivoCorto,
       partido: `${p.equipo_local} - ${p.equipo_visitante}`,
-      competicion: NOMBRE_COMPETICION_AVISO[p.competicion] || p.competicion || "",
+      competicion: NOMBRE_COMPETICION_AVISO[p.competicion] || String(p.competicion || "").replace(/[_-]+/g, " "),
       jornada: p.jornada,
       redactor: p.autor_nombre || aviso.redactor || null,
     });
@@ -9817,7 +14218,7 @@ async function publicarArticulosProgramados(env) {
       `UPDATE articles SET publicado = 1, programado_para = NULL, slug_congelado = 1, fecha_publicacion = datetime('now'), updated_at = datetime('now') WHERE id = ?`
     ).bind(articulo.id).run();
     // El horario se evalúa en el momento real de publicación, no cuando se programó.
-    await marcarFueraDeCalendario(env, articulo.id, { tipo: articulo.tipo, resultado_id: articulo.resultado_id });
+    await marcarFueraDeCalendario(env, articulo.id, { tipo: articulo.tipo, resultado_id: articulo.resultado_id, categoria: articulo.categoria });
     // Aviso push a quien lo tenga activado (nunca lanza ni bloquea la publicacion).
     await notificarPushArticulo(env, articulo);
     await notificarStaffArticulo(env, articulo, { excluirUid: articulo.autor_id || null, sinRevisionUid: articulo.autor_id || null });
@@ -10813,15 +15214,18 @@ async function borrarDatosAnaliticas(env, { todo, dias }) {
  * RECORDATORIOS DE INACTIVIDAD DE REDACTORES
  * ================================================================
  * Un redactor activo (users.rol = 'redactor', activo = 1, con email) que
- * pasa 30 días sin subir nada recibe un correo de recordatorio:
+ * pasa 35 días sin subir nada recibe un correo de recordatorio. Los fotógrafos
+ * (users.rol = 'fotografo') entran en el MISMO ciclo, pero su referencia no son
+ * las noticias sino las GALERÍAS DE PARTIDO que cuelgan (match_gallery: fotos
+ * suyas o vinculadas por ellos; sin ninguna, la fecha de alta de la cuenta):
  *
  *   - Referencia de inactividad: la fecha de su última noticia (cualquier
  *     tipo, borrador o publicada, ver articles.fecha_publicacion) o, si
  *     nunca ha subido nada, la fecha de creación de su cuenta. Una noticia
  *     en la que figura como segundo autor (coautor_id) cuenta igual que si
  *     fuera suya.
- *   - Aviso 1 al cumplirse 30 días desde esa referencia.
- *   - Avisos 2, 3, 4 y 5: uno cada 5 días desde el aviso anterior.
+ *   - Aviso 1 al cumplirse 35 días desde esa referencia.
+ *   - Avisos 2, 3, 4 y 5: uno cada 30 días (un aviso al mes) desde el aviso anterior.
  *   - El aviso 5 lleva además el texto de incumplimiento de las normas
  *     del medio (apartado 3.6, "Compromiso", de la guía del medio).
  *   - 5 días después del aviso 5, si sigue sin subir nada, se manda UN
@@ -10838,8 +15242,8 @@ async function borrarDatosAnaliticas(env, { todo, dias }) {
  * Postgres. Una vez al día (a partir de las 10:00 hora de Madrid) se
  * hace una sola pasada; el resto de ticks del cron salen sin tocar D1.
  */
-const INACTIVIDAD_DIAS_HASTA_PRIMER_AVISO = 30;
-const INACTIVIDAD_DIAS_ENTRE_AVISOS = 5;
+const INACTIVIDAD_DIAS_HASTA_PRIMER_AVISO = 35;
+const INACTIVIDAD_DIAS_ENTRE_AVISOS = 30; // un aviso al mes
 const INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO = 5;
 const INACTIVIDAD_DIAS_HASTA_AVISAR_ADMINS = 5;
 const INACTIVIDAD_HORA_MADRID = 10;
@@ -10880,7 +15284,7 @@ function diasNaturalesMadridEntre(msAntes, msDespues) {
   return Math.round((dia(msDespues) - dia(msAntes)) / INACTIVIDAD_DIA_MS);
 }
 
-function construirEmailRecordatorioInactividad({ nombre, diasSinSubir, numeroAviso }) {
+function construirEmailRecordatorioInactividad({ nombre, diasSinSubir, numeroAviso, rol }) {
   const enlacePanel = `${SITIO_URL}/admin/login.html`;
   const saludo = nombre ? `Hola ${nombre},` : "Hola,";
   const despedida = ["Un abrazo,", "El equipo de El Otro Fútbol"];
@@ -10918,6 +15322,15 @@ function construirEmailRecordatorioInactividad({ nombre, diasSinSubir, numeroAvi
       "Si estás en una etapa con poco tiempo, cuéntanoslo y lo entendemos perfectamente.",
       `Puedes entrar al panel cuando quieras: ${enlacePanel}`,
     ];
+  }
+
+  // Fotógrafos: lo que se les pide es colgar galerías de partido, no noticias.
+  if (rol === "fotografo") {
+    parrafos = parrafos.map((t) => t
+      .replace("ninguna noticia tuya", "ninguna galería de partido tuya")
+      .replace("que no subes ninguna noticia a El Otro Fútbol", "que no cuelgas ninguna galería de partido en El Otro Fútbol")
+      .replace("desde tu última noticia", "desde tu última galería de partido")
+      .replace("verte publicar de nuevo", "volver a ver tus galerías en el medio"));
   }
 
   // Nota final: quien recibe el correo puede creer que lo escribe una persona
@@ -11180,6 +15593,419 @@ async function enviarRecordatoriosGaleriaSiToca(env) {
   }
 }
 
+/*
+ * ================================================================
+ * FOTOGRAFÍA (Funcionalidades > Responsabilidades > Fotografía)
+ * ================================================================
+ * Lista, para el Responsable, a los fotógrafos con la acreditación APROBADA y el estado de la galería
+ * de cada partido que cubren: ¿está PUBLICADA o no?
+ *
+ *   - Quién: solicitudes de acreditación en estado 'aprobada' cuyo tipo es de fotógrafo (mismo criterio
+ *     que el recordatorio de galería: esAcreditacionFotografo).
+ *   - Partido: la solicitud no guarda el id del partido, así que se empareja igual que en el recordatorio
+ *     (partidoDeAcreditacionGaleria: equipo + fecha_partido o "Jornada N"). Si no se puede saber con
+ *     seguridad no se adivina: la tarjeta sale como «partido sin identificar».
+ *   - Galería PUBLICADA = el partido tiene al menos un contenido con visibilidad 'publico' en match_gallery
+ *     (el mismo criterio que la portada pública /galerias). Si hay contenido pero todo es privado, sale
+ *     «sin publicar»; si no hay nada, «no subida»; si el partido aún no se ha jugado, «pendiente».
+ *   - Si el fotógrafo tiene cuenta en la web (mismo correo) se cuentan además SUS fotos en ese partido.
+ * Solo lectura: no escribe nada ni envía correos. Ventana: partidos de los últimos 180 días y los
+ * próximos 45 (para ver también lo que está por venir).
+ */
+const FOTOGRAFIA_RESP_ATRAS_DIAS = 180;
+const FOTOGRAFIA_RESP_ADELANTE_DIAS = 45;
+
+async function respuestaFotografiaResp(env) {
+  const { results: filas } = await consultaConAlternativas(env, [
+    `SELECT id, nombre, email, equipo, tipo_evento, tipo_acreditacion, funciones, jornada_partido, fecha_partido, revisado_at, created_at
+       FROM acreditaciones
+      WHERE estado = 'aprobada'
+        AND (LOWER(tipo_acreditacion) LIKE '%fot%graf%' OR LOWER(tipo_acreditacion) LIKE '%c_sped%')
+      ORDER BY created_at DESC, id DESC LIMIT 1000`,
+    // Migración v2 sin aplicar (sin fecha_partido): se empareja solo por «Jornada N».
+    `SELECT id, nombre, email, equipo, tipo_evento, tipo_acreditacion, funciones, jornada_partido, revisado_at, created_at
+       FROM acreditaciones
+      WHERE estado = 'aprobada'
+        AND (LOWER(tipo_acreditacion) LIKE '%fot%graf%' OR LOWER(tipo_acreditacion) LIKE '%c_sped%')
+      ORDER BY created_at DESC, id DESC LIMIT 1000`,
+  ]);
+  const acreditaciones = (filas || []).filter((a) => esAcreditacionFotografo(a.tipo_acreditacion));
+  const vacio = { fotografos: [], resumen: { total: 0, publicada: 0, sin_publicar: 0, no_subida: 0, pendiente: 0, sin_partido: 0 }, generado: new Date().toISOString() };
+  if (!acreditaciones.length) return vacio;
+
+  const ahora = Date.now();
+  const desde = diaYHoraEnMadrid(new Date(ahora - FOTOGRAFIA_RESP_ATRAS_DIAS * 86400000)).dia;
+  const hasta = diaYHoraEnMadrid(new Date(ahora + FOTOGRAFIA_RESP_ADELANTE_DIAS * 86400000)).dia;
+  const donde = "WHERE substr(fecha_partido, 1, 10) >= ? AND substr(fecha_partido, 1, 10) <= ? ORDER BY fecha_partido ASC LIMIT 6000";
+  const { results: partidos } = await consultaConAlternativas(env, [
+    `SELECT id, competicion, jornada, equipo_local, equipo_visitante, escudo_local_url, escudo_visitante_url, goles_local, goles_visitante, fecha_partido, estado, slug FROM results ${donde}`,
+    `SELECT id, competicion, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido, estado, slug FROM results ${donde}`,
+    `SELECT id, competicion, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido, estado FROM results ${donde}`,
+  ], [desde, hasta]);
+
+  const emparejadas = acreditaciones.map((a) => ({ a, p: partidoDeAcreditacionGaleria(a, partidos || []) }));
+  // Una solicitud antigua sin partido identificable es ruido (temporadas pasadas): no se enseña.
+  const corteCreacion = new Date(ahora - FOTOGRAFIA_RESP_ATRAS_DIAS * 86400000).toISOString().slice(0, 10);
+  const visibles = emparejadas.filter((e) => e.p || String(e.a.created_at || "").slice(0, 10) >= corteCreacion);
+
+  const trozos = (lista, n) => { const t = []; for (let i = 0; i < lista.length; i += n) t.push(lista.slice(i, i + n)); return t; };
+
+  // Cuentas de la web por correo (para contar las fotos de cada fotógrafo).
+  const cuentas = new Map();
+  const correos = [...new Set(visibles.map((e) => String(e.a.email || "").trim().toLowerCase()).filter(Boolean))];
+  for (const grupo of trozos(correos, 80)) {
+    const marcasCorreo = grupo.map(() => "?").join(",");
+    // avatar_url / avatar_foco: la foto de perfil que se enseña en la tarjeta (si la migración del foco no está, sin él).
+    const { results: us } = await consultaConAlternativas(env, [
+      `SELECT id, nombre, email, avatar_url, avatar_foco FROM users WHERE activo = 1 AND LOWER(email) IN (${marcasCorreo})`,
+      `SELECT id, nombre, email, avatar_url FROM users WHERE activo = 1 AND LOWER(email) IN (${marcasCorreo})`,
+      `SELECT id, nombre, email FROM users WHERE activo = 1 AND LOWER(email) IN (${marcasCorreo})`,
+    ], grupo);
+    for (const u of us || []) cuentas.set(String(u.email).trim().toLowerCase(), { id: Number(u.id), nombre: u.nombre, avatar_url: u.avatar_url || null, avatar_foco: u.avatar_foco || null });
+  }
+
+  // Contenido de la galería de cada partido: total, públicas y las de cada autor.
+  const galerias = new Map();
+  const idsPartido = [...new Set(visibles.filter((e) => e.p).map((e) => Number(e.p.id)))];
+  for (const grupo of trozos(idsPartido, 80)) {
+    const marcas = grupo.map(() => "?").join(",");
+    const { results: gs } = await consultaConAlternativas(env, [
+      `SELECT mg.result_id AS rid, COALESCE(m.autor_id, mg.vinculado_por_id) AS uid, COALESCE(m.visibilidad, 'publico') AS vis, COUNT(*) AS n
+         FROM match_gallery mg JOIN media m ON m.id = mg.media_id
+        WHERE mg.result_id IN (${marcas})
+        GROUP BY mg.result_id, COALESCE(m.autor_id, mg.vinculado_por_id), COALESCE(m.visibilidad, 'publico')`,
+      // Columna «visibilidad» sin migrar: todo lo vinculado se considera público (como en /api/galerias/partidos).
+      `SELECT mg.result_id AS rid, COALESCE(m.autor_id, mg.vinculado_por_id) AS uid, 'publico' AS vis, COUNT(*) AS n
+         FROM match_gallery mg JOIN media m ON m.id = mg.media_id
+        WHERE mg.result_id IN (${marcas})
+        GROUP BY mg.result_id, COALESCE(m.autor_id, mg.vinculado_por_id)`,
+    ], grupo);
+    for (const g of gs || []) {
+      const rid = Number(g.rid);
+      if (!galerias.has(rid)) galerias.set(rid, { total: 0, publicas: 0, porAutor: new Map() });
+      const x = galerias.get(rid);
+      const n = Number(g.n) || 0;
+      const pub = String(g.vis) === "publico" ? n : 0;
+      x.total += n; x.publicas += pub;
+      if (g.uid !== null && g.uid !== undefined) {
+        const k = Number(g.uid);
+        const m = x.porAutor.get(k) || { total: 0, publicas: 0 };
+        m.total += n; m.publicas += pub;
+        x.porAutor.set(k, m);
+      }
+    }
+  }
+
+  // ¿Ya se tramitó el recordatorio automático de galería? Vive en recordatorios_galeria, tabla que solo
+  // existe en el Worker principal (D1): si no está (secundario) se devuelve null y el panel no enseña nada.
+  const recordatorios = new Map();
+  let recordatorioDisponible = false;
+  try {
+    for (const grupo of trozos(idsPartido, 80)) {
+      const { results: rs } = await env.DB.prepare(
+        `SELECT acreditacion_id AS aid, result_id AS rid, enviado_at FROM recordatorios_galeria WHERE result_id IN (${grupo.map(() => "?").join(",")})`
+      ).bind(...grupo).all();
+      for (const r of rs || []) recordatorios.set(`${Number(r.aid)}|${Number(r.rid)}`, r.enviado_at || "");
+    }
+    recordatorioDisponible = true;
+  } catch { /* sin tabla de recordatorios en este backend */ }
+
+  const resumen = { total: 0, publicada: 0, sin_publicar: 0, no_subida: 0, pendiente: 0, sin_partido: 0 };
+  const fotografos = visibles.map(({ a, p }) => {
+    const cuenta = cuentas.get(String(a.email || "").trim().toLowerCase()) || null;
+    const g = p ? (galerias.get(Number(p.id)) || { total: 0, publicas: 0, porAutor: new Map() }) : null;
+    const mias = g && cuenta ? (g.porAutor.get(cuenta.id) || { total: 0, publicas: 0 }) : null;
+    let estadoGaleria;
+    if (!p) estadoGaleria = "sin_partido";
+    else if (g.publicas > 0) estadoGaleria = "publicada";
+    else if (g.total > 0) estadoGaleria = "sin_publicar";
+    else if (String(p.estado) === "finalizado") estadoGaleria = "no_subida";
+    else estadoGaleria = "pendiente";
+    resumen.total++; resumen[estadoGaleria]++;
+    return {
+      id: Number(a.id),
+      nombre: a.nombre,
+      email: a.email,
+      equipo: a.equipo,
+      tipo_acreditacion: a.tipo_acreditacion,
+      tipo_evento: a.tipo_evento,
+      funciones: a.funciones,
+      jornada_partido: a.jornada_partido,
+      aprobada_at: a.revisado_at || null,
+      cuenta,
+      partido: p ? {
+        id: Number(p.id), competicion: p.competicion, jornada: p.jornada,
+        equipo_local: p.equipo_local, equipo_visitante: p.equipo_visitante,
+        escudo_local_url: p.escudo_local_url || null, escudo_visitante_url: p.escudo_visitante_url || null,
+        goles_local: p.goles_local, goles_visitante: p.goles_visitante,
+        fecha_partido: p.fecha_partido, estado: p.estado,
+      } : null,
+      galeria: {
+        estado: estadoGaleria,
+        total: g ? g.total : 0,
+        publicas: g ? g.publicas : 0,
+        mias: mias ? mias.total : null,
+        mias_publicas: mias ? mias.publicas : null,
+        url: p && p.slug && g && g.publicas > 0 ? `${SITIO_URL}/galeria/${p.slug}` : null,
+      },
+      // null = no disponible en este backend; { enviado_at: "" | fecha } = tramitado; { enviado_at: null } = aún no.
+      recordatorio: p && recordatorioDisponible
+        ? { enviado_at: recordatorios.has(`${Number(a.id)}|${Number(p.id)}`) ? (recordatorios.get(`${Number(a.id)}|${Number(p.id)}`) || "") : null }
+        : null,
+    };
+  });
+  return { fotografos, resumen, generado: new Date().toISOString() };
+}
+
+/*
+ * ================================================================
+ * EXCEPCIONALIDADES DE ACTIVIDAD
+ * ================================================================
+ * Un Responsable (admin) puede conceder a un redactor una "excepcionalidad de
+ * actividad": un periodo corto (3 días o 1 semana) de tiempo extra de
+ * inactividad por una causa justificable (estudios, fallecimiento de un
+ * familiar, salud, etc.). Efectos:
+ *
+ *   - Mientras está en vigor NO se le manda ningún aviso de inactividad ni se
+ *     avisa a los admins de su posible expulsión.
+ *   - Los días de excepcionalidad ya transcurridos NO cuentan como días sin
+ *     subir nada (se suman al margen de 35 días del primer aviso), y los
+ *     avisos que ya tuviera se espaciarán de nuevo desde el último día de la
+ *     excepcionalidad.
+ *   - Al concederla sale un correo automático al colaborador comunicándoselo.
+ *   - Si sube algo, el ciclo de inactividad se reinicia igualmente (las
+ *     excepcionalidades antiguas ya no pesan).
+ *
+ * Fechas en días de calendario de Madrid ("YYYY-MM-DD"): `desde` y `hasta`
+ * (ambos incluidos; hasta = desde + dias - 1). Tabla excepciones_actividad
+ * (worker/migracion_excepcionalidades_actividad.sql en D1 y
+ * worker-secondary/db/migrations/085_excepcionalidades_actividad.sql en
+ * Postgres). Como recordatorios_inactividad, NO se sincroniza entre backends.
+ */
+const EXCEPCION_DURACIONES_DIAS = [3, 7];
+const LUTO_HORAS = 48; // lazo negro en el logo del panel tras una excepcionalidad por fallecimiento de un familiar
+// Solo la causa «fallecimiento de un familiar» admite duración INDEFINIDA: sin fecha de fin (hasta = 9999-12-31,
+// dias = 0). Dura hasta que un Responsable la finaliza; al finalizarla se cierra en ese día y sus días cuentan como extra.
+const EXCEPCION_HASTA_INDEFINIDA = "9999-12-31";
+const EXCEPCION_CAUSAS_INDEFINIDAS = ["fallecimiento_familiar"];
+const EXCEPCION_MAX_ANTELACION_DIAS = 30;
+const EXCEPCION_NOTA_MAX = 300;
+const EXCEPCION_CAUSAS = {
+  estudios: {
+    etiqueta: "Estudios",
+    frase: "por tus estudios (exámenes, trabajos o entregas)",
+    cierre: "Mucho ánimo con ellos: el medio seguirá aquí cuando vuelvas.",
+  },
+  fallecimiento_familiar: {
+    etiqueta: "Fallecimiento de un familiar",
+    frase: "por el fallecimiento de un familiar",
+    cierre: "Sentimos muchísimo tu pérdida. Te mandamos un fuerte abrazo: ahora lo único importante es que estés con los tuyos.",
+  },
+  salud: {
+    etiqueta: "Salud (enfermedad o lesión)",
+    frase: "por motivos de salud",
+    cierre: "Cuídate mucho y recupérate con calma: aquí no hay ninguna prisa.",
+  },
+  familiar: {
+    etiqueta: "Motivos familiares",
+    frase: "por motivos familiares",
+    cierre: "Atiende a lo que necesites con tranquilidad: aquí no hay ninguna prisa.",
+  },
+  laboral: {
+    etiqueta: "Trabajo",
+    frase: "por motivos laborales",
+    cierre: "Cuando se calme la carga de trabajo, aquí estaremos.",
+  },
+  viaje: {
+    etiqueta: "Viaje o vacaciones",
+    frase: "por un viaje o unas vacaciones",
+    cierre: "¡Que lo disfrutes mucho!",
+  },
+  otra: {
+    etiqueta: "Otra causa justificada",
+    frase: "por una causa justificada",
+    cierre: "Si necesitas algo de nuestra parte, dínoslo sin problema.",
+  },
+};
+
+function causasExcepcionParaPanel() {
+  return Object.entries(EXCEPCION_CAUSAS).map(([id, c]) => ({ id, etiqueta: c.etiqueta }));
+}
+
+// "YYYY-MM-DD" + n días (aritmética de calendario, sin husos horarios).
+function sumarDiasAFechaISO(fechaISO, n) {
+  const ms = Date.parse(`${fechaISO}T00:00:00Z`);
+  if (Number.isNaN(ms)) return null;
+  return new Date(ms + n * INACTIVIDAD_DIA_MS).toISOString().slice(0, 10);
+}
+const fechaISOValida = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`)) && new Date(`${v}T00:00:00Z`).toISOString().slice(0, 10) === v;
+
+function formatearFechaExcepcion(fechaISO) {
+  const ms = Date.parse(`${fechaISO}T12:00:00Z`);
+  if (Number.isNaN(ms)) return fechaISO;
+  return new Intl.DateTimeFormat("es-ES", { timeZone: "UTC", weekday: "long", day: "numeric", month: "long" }).format(new Date(ms));
+}
+
+function filaExcepcionParaPanel(f, hoy) {
+  const causa = EXCEPCION_CAUSAS[f.causa];
+  const cancelada = !!f.cancelada_at;
+  let estado = "finalizada";
+  if (cancelada) estado = "cancelada";
+  else if (f.desde > hoy) estado = "programada";
+  else if (f.hasta >= hoy) estado = "vigente";
+  return {
+    id: Number(f.id),
+    user_id: Number(f.user_id),
+    causa: f.causa,
+    causa_etiqueta: causa ? causa.etiqueta : f.causa,
+    nota: f.nota || "",
+    dias: Number(f.dias),
+    indefinida: f.hasta === EXCEPCION_HASTA_INDEFINIDA,
+    desde: f.desde,
+    hasta: f.hasta,
+    estado,
+    concedida_por: f.concedida_por_nombre || "",
+    concedida_at: f.created_at || null,
+    correo_enviado: !!f.correo_enviado_at,
+    cancelada_at: f.cancelada_at || null,
+  };
+}
+
+// Todas las excepcionalidades (no canceladas) por usuario, para la pasada diaria de avisos. Nunca lanza.
+async function cargarExcepcionesActividadPorUsuario(env) {
+  const mapa = new Map();
+  try {
+    const { results } = await env.DB.prepare(
+      "SELECT user_id, dias, desde, hasta FROM excepciones_actividad WHERE cancelada_at IS NULL"
+    ).all();
+    for (const f of results || []) {
+      const uid = Number(f.user_id);
+      if (!mapa.has(uid)) mapa.set(uid, []);
+      mapa.get(uid).push({ dias: Number(f.dias) || 0, desde: String(f.desde), hasta: String(f.hasta) });
+    }
+  } catch (err) {
+    console.log("Excepcionalidades de actividad no disponibles todavía (¿migración sin ejecutar?):", err && err.message);
+  }
+  return mapa;
+}
+
+// Aplica las excepcionalidades al cálculo de un redactor. Devuelve:
+//   enVigor    true si hoy cae dentro de una excepcionalidad (no se avisa)
+//   extraDias  días de excepcionalidad ya transcurridos desde la referencia (no cuentan como inactividad)
+//   finUltimaMs instante (UTC) en que terminó la última excepcionalidad que cuenta, o null
+function efectoExcepcionesActividad(excepciones, hoyISO, refMs) {
+  let enVigor = false;
+  let extraDias = 0;
+  let finUltimaMs = null;
+  for (const e of excepciones || []) {
+    if (e.desde <= hoyISO && hoyISO <= e.hasta) { enVigor = true; continue; }
+    if (e.hasta >= hoyISO) continue; // todavía no ha empezado
+    const finMs = Date.parse(`${e.hasta}T00:00:00Z`) + INACTIVIDAD_DIA_MS;
+    if (finMs <= refMs) continue; // terminó antes de su última actividad: ya no pesa
+    extraDias += e.dias;
+    if (finUltimaMs === null || finMs > finUltimaMs) finUltimaMs = finMs;
+  }
+  return { enVigor, extraDias, finUltimaMs };
+}
+
+function construirEmailExcepcionActividad({ nombre, causaId, dias, desde, hasta, nota, concedidaPor }) {
+  const causa = EXCEPCION_CAUSAS[causaId] || EXCEPCION_CAUSAS.otra;
+  const enlacePanel = `${SITIO_URL}/admin/login.html`;
+  const saludo = nombre ? `Hola ${nombre},` : "Hola,";
+  // Fallecimiento de un familiar: un mensaje corto y cercano, sin tabla de causa/duración/periodo, sin botón
+  // ni cifras de «margen». Lo único práctico (no hay que subir nada ni habrá avisos) va dicho con calma.
+  if (causaId === "fallecimiento_familiar") {
+    const parrafosLuto = [
+      "Nos ha llegado la noticia del fallecimiento de tu familiar y no queríamos dejar pasar ni un momento sin escribirte. Lo sentimos muchísimo, de corazón.",
+      "No hay palabras que hagan más ligero un momento así, pero queremos que sepas que no lo estás viviendo en soledad: tienes aquí a un equipo que te aprecia y que está pensando en ti y en los tuyos.",
+      "Del medio no te preocupes por absolutamente nada. No tienes que subir nada, no tienes que avisar de nada y no recibirás ningún aviso de nuestra parte. Todo lo pendiente puede esperar.",
+      ...(nota ? [`Un mensaje de la administración: ${nota}`] : []),
+      "Tómate todo el tiempo que necesites: para estar con tu familia, para despedirte, para llorar o simplemente para descansar. Cada persona vive estos momentos a su manera, y ninguna manera es incorrecta.",
+      "Y cuando te sientas con fuerzas para volver, sea dentro de unos días o de unas semanas, aquí estaremos con los brazos abiertos. Si en cualquier momento necesitas hablar o que te echemos una mano en lo que sea, solo tienes que decírnoslo.",
+    ];
+    const despedidaLuto = ["Te mandamos un abrazo enorme,", "Todo el equipo de El Otro Fútbol"];
+    const pieLuto = "Si en cualquier momento necesitas algo, el canal correcto para escribirnos es WhatsApp.";
+    const textoLuto = [saludo, "", ...parrafosLuto.flatMap((p) => [p, ""]), ...despedidaLuto, "", "--", pieLuto].join("\n");
+    const htmlLuto = plantillaEmail({
+      etiqueta: "Colaboradores",
+      titulo: "Estamos contigo",
+      tono: "luto",
+      lazoLuto: true,
+      preheader: "Sentimos muchísimo tu pérdida. Estamos contigo, para lo que necesites.",
+      bloqueHtml: [saludo, ...parrafosLuto].map((p) => `<p style="margin:0 0 14px;">${escapeHtmlEmail(p)}</p>`).join("") + `<p style="margin:18px 0 0;">${despedidaLuto.map(escapeHtmlEmail).join("<br>")}</p>`,
+      pieHtml: escapeHtmlEmail(pieLuto),
+    });
+    return { asunto: "Estamos contigo · ElOtroFútbol", texto: textoLuto, html: htmlLuto };
+  }
+  const indef = !dias || hasta === EXCEPCION_HASTA_INDEFINIDA;
+  const duracion = indef ? "Indefinida" : (dias === 7 ? "una semana (7 días)" : `${dias} días`);
+  const periodo = indef ? `desde el ${formatearFechaExcepcion(desde)}, sin fecha de fin` : `del ${formatearFechaExcepcion(desde)} al ${formatearFechaExcepcion(hasta)}`;
+  const asunto = "Te hemos concedido una excepcionalidad de actividad · ElOtroFútbol";
+  const parrafos = [
+    `Te escribimos para comunicarte que la administración de El Otro Fútbol te ha concedido una excepcionalidad de actividad ${causa.frase}.`,
+    indef
+      ? `A partir del ${formatearFechaExcepcion(desde)} no hace falta que subas nada durante todo el tiempo que necesites, y no recibirás ningún aviso de inactividad. No hay fecha de fin: tómate el tiempo que haga falta.`
+      : `Durante ${duracion} (${periodo}) no hace falta que subas nada y no recibirás ningún aviso de inactividad. Además, esos días no cuentan como tiempo sin colaborar.`,
+    ...(nota ? [`Nota de la administración: ${nota}`] : []),
+    causa.cierre,
+    "Cuando quieras y puedas, te esperamos de vuelta por el panel.",
+  ];
+  const despedida = ["Un abrazo,", "El equipo de El Otro Fútbol"];
+  const notaWhatsApp = "Si necesitas cualquier cosa, el canal correcto para escribirnos es WhatsApp.";
+  const texto = [saludo, "", ...parrafos.flatMap((p) => [p, ""]), ...despedida, "", `Panel: ${enlacePanel}`, "", "--", notaWhatsApp].join("\n");
+  const cuerpoHtml = [saludo, ...parrafos]
+    .map((p) => `<p style="margin:0 0 14px;">${escapeHtmlEmail(p)}</p>`)
+    .join("") + `<p style="margin:18px 0 0;">${despedida.map(escapeHtmlEmail).join("<br>")}</p>`;
+  const html = plantillaEmail({
+    etiqueta: "Colaboradores",
+    titulo: "Excepcionalidad de actividad concedida",
+    tono: "marca",
+    preheader: indef ? "Tienes todo el tiempo que necesites, sin necesidad de subir nada." : `Tienes ${duracion} de margen sin necesidad de subir nada.`,
+    filas: [
+      { etiqueta: "Causa", valor: causa.etiqueta },
+      { etiqueta: "Duración", valor: duracion },
+      { etiqueta: "Periodo", valor: periodo },
+    ],
+    bloqueHtml: cuerpoHtml,
+    boton: { texto: "Entrar al panel", url: enlacePanel },
+    pieHtml: escapeHtmlEmail(notaWhatsApp),
+  });
+  return { asunto, texto, html };
+}
+
+async function listarExcepcionesActividadUsuario(env, userId) {
+  const hoy = diaYHoraEnMadrid(new Date()).dia;
+  const { results } = await env.DB.prepare(
+    `SELECT id, user_id, causa, nota, dias, desde, hasta, concedida_por_nombre, correo_enviado_at, cancelada_at, created_at
+       FROM excepciones_actividad WHERE user_id = ? ORDER BY desde DESC, id DESC LIMIT 30`
+  ).bind(userId).all();
+  return (results || []).map((f) => filaExcepcionParaPanel(f, hoy));
+}
+
+// Para GET /api/users: por usuario, la vigente (o la próxima) y cuántas lleva. Nunca lanza.
+async function cargarExcepcionesUsuariosParaListado(env) {
+  const mapa = new Map();
+  try {
+    const hoy = diaYHoraEnMadrid(new Date()).dia;
+    const { results } = await env.DB.prepare(
+      `SELECT id, user_id, causa, nota, dias, desde, hasta, concedida_por_nombre, correo_enviado_at, cancelada_at, created_at
+         FROM excepciones_actividad WHERE cancelada_at IS NULL ORDER BY desde DESC, id DESC`
+    ).all();
+    for (const f of results || []) {
+      const uid = Number(f.user_id);
+      const fila = filaExcepcionParaPanel(f, hoy);
+      const previo = mapa.get(uid) || { vigente: null, programada: null, total: 0 };
+      previo.total++;
+      if (fila.estado === "vigente" && !previo.vigente) previo.vigente = fila;
+      if (fila.estado === "programada") previo.programada = fila; // la más cercana (orden desc: la última pisa)
+      mapa.set(uid, previo);
+    }
+  } catch (err) {
+    console.log("Excepcionalidades no disponibles para el listado de usuarios:", err && err.message);
+  }
+  return mapa;
+}
+
 async function enviarRecordatoriosInactividadSiToca(env) {
   const ahora = new Date();
   const { dia, hora } = diaYHoraEnMadrid(ahora);
@@ -11203,33 +16029,43 @@ async function enviarRecordatoriosInactividadSiToca(env) {
     INACTIVIDAD_ULTIMO_DIA_EN_MEMORIA = dia;
 
     const { results: redactores } = await env.DB.prepare(
-      `SELECT u.id, u.nombre, u.email, u.created_at,
+      `SELECT u.id, u.nombre, u.email, u.created_at, u.rol,
               (SELECT MAX(t.f) FROM (SELECT a.fecha_publicacion AS f FROM articles a WHERE a.autor_id = u.id
                                  UNION ALL
                                  SELECT c.fecha_publicacion FROM articles c WHERE c.coautor_id = u.id) t) AS ultima_noticia,
+              (SELECT MAX(mg.created_at) FROM match_gallery mg JOIN media m ON m.id = mg.media_id
+                WHERE u.rol = 'fotografo' AND (m.autor_id = u.id OR mg.vinculado_por_id = u.id)) AS ultima_galeria,
               r.ref_actividad, r.avisos_enviados, r.ultimo_aviso_at, r.admins_avisados_at
        FROM users u
        LEFT JOIN recordatorios_inactividad r ON r.user_id = u.id
-       WHERE u.rol = 'redactor' AND u.activo = 1`
+       WHERE u.rol IN ('redactor', 'fotografo') AND u.activo = 1`
     ).all();
 
     const paraAdmins = [];
     let correosEnviados = 0;
+    const excepcionesPorUsuario = await cargarExcepcionesActividadPorUsuario(env); // excepcionalidades de actividad
 
     for (const u of redactores || []) {
       const email = (u.email || "").trim();
       if (!email) continue; // sin correo no se le puede avisar (se pide en su primer login)
 
-      const refMs = Math.max(msDesdeFechaBD(u.created_at) ?? 0, msDesdeFechaBD(u.ultima_noticia) ?? 0);
+      // Redactores: última noticia. Fotógrafos: última galería de partido colgada.
+      const ultimaActividad = u.rol === "fotografo" ? u.ultima_galeria : u.ultima_noticia;
+      const refMs = Math.max(msDesdeFechaBD(u.created_at) ?? 0, msDesdeFechaBD(ultimaActividad) ?? 0);
       if (!refMs) continue;
 
       // ¿Ha subido algo desde que empezó el ciclo actual? Entonces se reinicia.
       const refGuardadaMs = msDesdeFechaBD(u.ref_actividad);
       const hayCicloPrevio = refGuardadaMs !== null && refMs <= refGuardadaMs;
       const avisos = hayCicloPrevio ? (u.avisos_enviados || 0) : 0;
-      const ultimoAvisoMs = hayCicloPrevio ? msDesdeFechaBD(u.ultimo_aviso_at) : null;
+      const ultimoAvisoReal = hayCicloPrevio ? msDesdeFechaBD(u.ultimo_aviso_at) : null;
       const adminsAvisados = hayCicloPrevio && !!u.admins_avisados_at;
-      const diasSinSubir = Math.floor((ahora.getTime() - refMs) / INACTIVIDAD_DIA_MS);
+      // Excepcionalidad de actividad: en vigor no se avisa; las ya pasadas restan días de inactividad y
+      // hacen que los avisos se espacien de nuevo desde su último día.
+      const efectoExc = efectoExcepcionesActividad(excepcionesPorUsuario.get(Number(u.id)), dia, refMs);
+      if (efectoExc.enVigor) continue;
+      const ultimoAvisoMs = ultimoAvisoReal !== null && efectoExc.finUltimaMs !== null ? Math.max(ultimoAvisoReal, efectoExc.finUltimaMs) : ultimoAvisoReal;
+      const diasSinSubir = Math.max(0, Math.floor((ahora.getTime() - refMs) / INACTIVIDAD_DIA_MS) - efectoExc.extraDias);
 
       if (avisos === 0) {
         if (diasSinSubir < INACTIVIDAD_DIAS_HASTA_PRIMER_AVISO) continue;
@@ -11239,7 +16075,7 @@ async function enviarRecordatoriosInactividadSiToca(env) {
         // Ya tiene los 5 avisos: 5 días después del último, se avisa a los admins (una sola vez).
         if (adminsAvisados || !ultimoAvisoMs) continue;
         if (diasNaturalesMadridEntre(ultimoAvisoMs, ahora.getTime()) >= INACTIVIDAD_DIAS_HASTA_AVISAR_ADMINS) {
-          paraAdmins.push({ id: u.id, nombre: u.nombre, email, diasSinSubir, refIso: new Date(refMs).toISOString() });
+          paraAdmins.push({ id: u.id, nombre: u.nombre, email, rol: u.rol, diasSinSubir, refIso: new Date(refMs).toISOString() });
         }
         continue;
       }
@@ -11249,7 +16085,7 @@ async function enviarRecordatoriosInactividadSiToca(env) {
       const numeroAviso = avisos + 1;
       const enviado = await enviarEmailNotificacion(
         env,
-        construirEmailRecordatorioInactividad({ nombre: u.nombre, diasSinSubir, numeroAviso }),
+        construirEmailRecordatorioInactividad({ nombre: u.nombre, diasSinSubir, numeroAviso, rol: u.rol }),
         { destinatario: email }
       );
       if (!enviado) continue; // el estado no avanza: se reintenta en la próxima pasada
@@ -11288,20 +16124,20 @@ async function avisarAdminsDeExpulsion(env, usuarios, ahora) {
   if (!destinatarios.length) destinatarios.push(EMAIL_NOTIFICACIONES);
 
   const lineas = usuarios.map(
-    (u) => `- ${u.nombre} (${u.email}): ${u.diasSinSubir} días sin subir nada; ${INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO} avisos enviados y otros ${INACTIVIDAD_DIAS_HASTA_AVISAR_ADMINS} días sin respuesta.`
+    (u) => `- ${u.nombre}${u.rol === "fotografo" ? " [fotógrafo]" : ""} (${u.email}): ${u.diasSinSubir} días sin subir ${u.rol === "fotografo" ? "ninguna galería" : "nada"}; ${INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO} avisos enviados y otros ${INACTIVIDAD_DIAS_HASTA_AVISAR_ADMINS} días sin respuesta.`
   );
   const asunto = usuarios.length === 1
     ? `Se debe expulsar a ${usuarios[0].nombre} por inactividad`
-    : `Se debe expulsar a ${usuarios.length} redactores por inactividad`;
+    : `Se debe expulsar a ${usuarios.length} colaboradores por inactividad`;
   const texto = [
-    "Los siguientes redactores han incumplido las normativas del medio (apartado 3.6, Compromiso, de la guía del medio): han recibido los 5 avisos de inactividad y siguen sin subir ninguna noticia.",
+    "Los siguientes colaboradores han incumplido las normativas del medio (apartado 3.6, Compromiso, de la guía del medio): han recibido los 5 avisos de inactividad y siguen sin subir nada (noticias, en el caso de los redactores; galerías de partido, en el de los fotógrafos).",
     "",
     ...lineas,
     "",
     "Se tiene que expulsar a estos usuarios. La expulsión no es automática: hay que hacerla desde el panel de Usuarios.",
   ].join("\n");
-  const html = `<p>Los siguientes redactores han incumplido las normativas del medio (apartado 3.6, Compromiso, de la guía del medio): han recibido los ${INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO} avisos de inactividad y siguen sin subir ninguna noticia.</p><ul>` +
-    usuarios.map((u) => `<li><strong>${escapeHtmlEmail(u.nombre)}</strong> (${escapeHtmlEmail(u.email)}): ${u.diasSinSubir} días sin subir nada.</li>`).join("") +
+  const html = `<p>Los siguientes colaboradores han incumplido las normativas del medio (apartado 3.6, Compromiso, de la guía del medio): han recibido los ${INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO} avisos de inactividad y siguen sin subir nada (noticias, en el caso de los redactores; galerías de partido, en el de los fotógrafos).</p><ul>` +
+    usuarios.map((u) => `<li><strong>${escapeHtmlEmail(u.nombre)}</strong>${u.rol === "fotografo" ? " (fotógrafo)" : ""} (${escapeHtmlEmail(u.email)}): ${u.diasSinSubir} días sin subir ${u.rol === "fotografo" ? "ninguna galería" : "nada"}.</li>`).join("") +
     `</ul><p><strong>Se tiene que expulsar a estos usuarios.</strong> La expulsión no es automática: hay que hacerla desde el panel de Usuarios.</p>`;
 
   let algunoEnviado = false;
@@ -11365,7 +16201,7 @@ async function registrarHistorialAviso(env, { userId, cicloPrevio, numeroAviso, 
 async function cargarEstadoInactividadUsuarios(env, usuarios) {
   const mapa = new Map();
   try {
-    const [estados, ultimas] = await Promise.all([
+    const [estados, ultimas, galerias] = await Promise.all([
       env.DB.prepare(
         "SELECT user_id, ref_actividad, avisos_enviados, ultimo_aviso_at, admins_avisados_at FROM recordatorios_inactividad"
       ).all(),
@@ -11375,6 +16211,13 @@ async function cargarEstadoInactividadUsuarios(env, usuarios) {
           + "UNION ALL SELECT coautor_id, fecha_publicacion FROM articles WHERE coautor_id IS NOT NULL"
           + ") t GROUP BY t.uid"
       ).all(),
+      // Fotógrafos: su última galería de partido (fotos suyas vinculadas a un partido, o vinculadas por ellos).
+      env.DB.prepare(
+        "SELECT t.uid AS autor_id, MAX(t.f) AS ultima_galeria FROM ("
+          + "SELECT m.autor_id AS uid, mg.created_at AS f FROM match_gallery mg JOIN media m ON m.id = mg.media_id WHERE m.autor_id IS NOT NULL "
+          + "UNION ALL SELECT vinculado_por_id, created_at FROM match_gallery WHERE vinculado_por_id IS NOT NULL"
+          + ") t GROUP BY t.uid"
+      ).all().catch((err) => { console.log("Galerías de fotógrafos no disponibles para el estado de inactividad:", err && err.message); return { results: [] }; }),
     ]);
     // El historial va en una consulta aparte: si la columna aún no existe, el
     // resto del estado sigue funcionando.
@@ -11387,18 +16230,27 @@ async function cargarEstadoInactividadUsuarios(env, usuarios) {
     }
     const estadoPorUsuario = new Map((estados.results || []).map((f) => [Number(f.user_id), f]));
     const ultimaPorUsuario = new Map((ultimas.results || []).map((f) => [Number(f.autor_id), f.ultima_noticia]));
+    const galeriaPorUsuario = new Map((galerias.results || []).map((f) => [Number(f.autor_id), f.ultima_galeria]));
     const ahoraMs = Date.now();
+    // Excepcionalidades de actividad: en vigor no se avisa, y las ya pasadas no cuentan como días sin subir
+    // (mismo cálculo que la pasada diaria, para que el panel no anuncie un aviso que no va a salir).
+    const excepcionesPorUsuario = await cargarExcepcionesActividadPorUsuario(env);
+    const hoyExc = diaYHoraEnMadrid(new Date(ahoraMs)).dia;
 
     for (const u of usuarios) {
-      if (u.rol !== "redactor") continue; // admins y fotógrafos no entran en el ciclo
-      const ultimaNoticia = ultimaPorUsuario.get(Number(u.id)) || null;
+      if (u.rol !== "redactor" && u.rol !== "fotografo") continue; // los admins no entran en el ciclo
+      // Redactores: última noticia. Fotógrafos: última galería de partido (se devuelve también como ultima_noticia).
+      const ultimaNoticia = (u.rol === "fotografo" ? galeriaPorUsuario : ultimaPorUsuario).get(Number(u.id)) || null;
       const refMs = Math.max(msDesdeFechaBD(u.created_at) ?? 0, msDesdeFechaBD(ultimaNoticia) ?? 0);
       const f = estadoPorUsuario.get(Number(u.id));
       const refGuardadaMs = f ? msDesdeFechaBD(f.ref_actividad) : null;
       const hayCicloVigente = !!f && refGuardadaMs !== null && refMs > 0 && refMs <= refGuardadaMs;
+      const efectoExc = refMs ? efectoExcepcionesActividad(excepcionesPorUsuario.get(Number(u.id)), hoyExc, refMs) : { enVigor: false, extraDias: 0 };
       mapa.set(Number(u.id), {
-        dias_sin_subir: refMs ? Math.max(0, Math.floor((ahoraMs - refMs) / INACTIVIDAD_DIA_MS)) : null,
+        excepcion_en_vigor: efectoExc.enVigor, // true = no se le manda ningún aviso de inactividad
+        dias_sin_subir: refMs ? Math.max(0, Math.floor((ahoraMs - refMs) / INACTIVIDAD_DIA_MS) - efectoExc.extraDias) : null,
         ultima_noticia: ultimaNoticia,
+        referencia_tipo: u.rol === "fotografo" ? "galeria" : "noticia",
         referencia_at: refMs ? new Date(refMs).toISOString() : null, // última noticia o, si no hay, alta de la cuenta
         avisos_enviados: hayCicloVigente ? (Number(f.avisos_enviados) || 0) : 0,
         avisos_maximo: INACTIVIDAD_AVISOS_HASTA_INCUMPLIMIENTO,
@@ -12341,10 +17193,24 @@ const STAFF_PUSH_CATEGORIAS = {
   ediciones: "Ediciones pendientes de mi respuesta",
   comentarios: "Comentarios",
   anuncios: "Anuncios",
+  reuniones: "Reuniones (avisos antes de empezar)",
+  niveles: "Niveles: personas que cumplen los requisitos (solo Responsables)",
 };
+// Categorías que solo existen para los Responsables (rol admin): ni se listan ni se guardan para el resto.
+const STAFF_PUSH_CATEGORIAS_SOLO_ADMIN = new Set(["niveles"]);
 const STAFF_PUSH_NIVEL_MINIMO = 4;
 const STAFF_PUSH_MAX_DISPOSITIVOS = 10;
 const STAFF_PUSH_SQL_ELEGIBLE = `u.activo = 1 AND (u.rol = 'admin' OR (u.rol = 'redactor' AND u.nivel >= ${STAFF_PUSH_NIVEL_MINIMO}))`;
+
+// Categorías que se reciben POR DEFECTO: las recibe todo el equipo con algún dispositivo activado
+// salvo quien las haya apagado a propósito (queda una fila "no:<categoría>" en staff_push_prefs).
+// Las demás categorías son opt-in: solo las recibe quien las tiene marcadas.
+// Por qué existe: "reuniones" se añadió después de la campanita, y con opt-in puro quien ya había
+// guardado sus preferencias no la tenía marcada y nunca recibía los avisos, mientras que quien se
+// apuntaba de nuevo (que sale con todo marcado) sí. Toda categoría NUEVA que deba llegar a quien ya
+// usa la campanita se añade aquí.
+const STAFF_PUSH_CATEGORIAS_POR_DEFECTO = new Set(["reuniones", "niveles"]);
+const STAFF_PUSH_PREFIJO_NO = "no:";
 
 // Admin o redactor de Nivel 4, mirando siempre la base (no el JWT) para que un
 // ascenso o descenso valga al momento.
@@ -12356,6 +17222,24 @@ async function staffPushPuede(env, payload) {
   return u.rol === "redactor" && (Number(u.nivel) || 1) >= STAFF_PUSH_NIVEL_MINIMO;
 }
 
+// ¿Es la cuenta un participante del calendario de reuniones? Enlace guardado (user_id) o, en los
+// antiguos, el mismo nombre. Estas cuentas pueden usar la campanita, pero SOLO la categoría "reuniones".
+async function staffPushEsParticipante(env, uid) {
+  try {
+    if (!uid) return false;
+    const u = await env.DB.prepare("SELECT activo FROM users WHERE id = ?").bind(uid).first();
+    if (!u || Number(u.activo) !== 1) return false;
+    await asegurarTablasReunions(env); // garantiza tablas y columna user_id (instalaciones anteriores)
+    const f = await env.DB.prepare(
+      `SELECT 1 AS x FROM reunions_persones r
+        WHERE r.user_id = ?
+           OR (r.user_id IS NULL AND LOWER(TRIM(r.nom)) = (SELECT LOWER(TRIM(nombre)) FROM users WHERE id = ?))
+        LIMIT 1`
+    ).bind(uid, uid).first();
+    return !!f;
+  } catch { return false; } // la tabla aún no existe: no hay participantes
+}
+
 function staffPushCategoriasValidas(lista) {
   if (!Array.isArray(lista)) return [];
   return [...new Set(lista.filter((c) => typeof c === "string" && Object.prototype.hasOwnProperty.call(STAFF_PUSH_CATEGORIAS, c)))];
@@ -12363,7 +17247,22 @@ function staffPushCategoriasValidas(lista) {
 
 async function staffPushCategoriasActivas(env, uid) {
   const { results } = await env.DB.prepare("SELECT categoria FROM staff_push_prefs WHERE user_id = ?").bind(uid).all();
-  return staffPushCategoriasValidas((results || []).map((r) => r.categoria));
+  const filas = (results || []).map((r) => r.categoria);
+  const activas = new Set(staffPushCategoriasValidas(filas));
+  // Las categorías por defecto cuentan como activadas para quien ya usa la campanita (tiene
+  // preferencias guardadas o algún dispositivo), salvo que las haya apagado a propósito. A quien aún
+  // no la ha usado se le devuelve lo de siempre (nada marcado) y el panel le marca todo al activarla.
+  let yaLaUsa = filas.length > 0;
+  if (!yaLaUsa) {
+    const f = await env.DB.prepare("SELECT 1 AS x FROM staff_push_subscriptions WHERE user_id = ? LIMIT 1").bind(uid).first();
+    yaLaUsa = !!f;
+  }
+  if (yaLaUsa) {
+    for (const c of STAFF_PUSH_CATEGORIAS_POR_DEFECTO) {
+      if (!filas.includes(STAFF_PUSH_PREFIJO_NO + c)) activas.add(c);
+    }
+  }
+  return [...activas];
 }
 
 async function staffPushGuardarCategorias(env, uid, categorias) {
@@ -12373,6 +17272,14 @@ async function staffPushGuardarCategorias(env, uid, categorias) {
       "INSERT INTO staff_push_prefs (user_id, categoria) VALUES (?, ?) ON CONFLICT(user_id, categoria) DO NOTHING"
     ).bind(uid, c).run();
   }
+  // Una categoría "por defecto" que la persona deja sin marcar se apunta como apagada a propósito;
+  // sin esa marca se entendería que simplemente no la ha tocado y seguiría recibiéndola.
+  for (const c of STAFF_PUSH_CATEGORIAS_POR_DEFECTO) {
+    if (categorias.includes(c)) continue;
+    await env.DB.prepare(
+      "INSERT INTO staff_push_prefs (user_id, categoria) VALUES (?, ?) ON CONFLICT(user_id, categoria) DO NOTHING"
+    ).bind(uid, STAFF_PUSH_PREFIJO_NO + c).run();
+  }
 }
 
 // Envia un aviso a quien tenga activada la "categoria". Nunca lanza: un fallo
@@ -12380,13 +17287,24 @@ async function staffPushGuardarCategorias(env, uid, categorias) {
 //  - excluirUid: quien ha provocado el aviso (no se avisa a si mismo).
 //  - soloUids:   restringe a esas personas (p. ej. el autor de una noticia).
 //  - filtro:     funcion extra sobre cada destinatario ({ uid, email, rol, puede_gestionar_tienda }).
-async function staffPushEnviar(env, categoria, mensaje, { excluirUid = null, soloUids = null, filtro = null, ttl = 6 * 3600 } = {}) {
+async function staffPushEnviar(env, categoria, mensaje, { excluirUid = null, soloUids = null, filtro = null, ttl = 6 * 3600, cualquierCuenta = false } = {}) {
   try {
     if (!Object.prototype.hasOwnProperty.call(STAFF_PUSH_CATEGORIAS, categoria)) return { enviados: 0 };
+    // cualquierCuenta: solo para avisos dirigidos a personas concretas (p. ej. los convocados a una
+    // reunión). Sin lista de destinatarios no se admite: nunca se abre un aviso a todas las cuentas.
+    if (cualquierCuenta && !Array.isArray(soloUids)) return { enviados: 0 };
     if (Array.isArray(soloUids) && !soloUids.length) return { enviados: 0 };
     const claves = await pushCargarClaves(env);
     if (!claves) return { enviados: 0, desactivado: true };
-    const binds = [categoria];
+    // Categoría opt-in: hace falta tenerla marcada (JOIN). Categoría por defecto: la recibe todo el
+    // mundo salvo quien la apagó a propósito (NOT EXISTS de la marca "no:"). En ambos casos el primer
+    // marcador "?" del SQL es el de las preferencias, por eso va primero en binds.
+    const porDefecto = STAFF_PUSH_CATEGORIAS_POR_DEFECTO.has(categoria);
+    const binds = [porDefecto ? STAFF_PUSH_PREFIJO_NO + categoria : categoria];
+    const unirPrefs = porDefecto ? "" : "JOIN staff_push_prefs p ON p.user_id = u.id AND p.categoria = ?";
+    const soloSiNoApagada = porDefecto
+      ? " AND NOT EXISTS (SELECT 1 FROM staff_push_prefs x WHERE x.user_id = u.id AND x.categoria = ?)"
+      : "";
     let extra = "";
     if (excluirUid) { extra += " AND u.id <> ?"; binds.push(excluirUid); }
     if (Array.isArray(soloUids)) {
@@ -12397,13 +17315,13 @@ async function staffPushEnviar(env, categoria, mensaje, { excluirUid = null, sol
       `SELECT s.id, s.endpoint, s.p256dh, s.auth, u.id AS uid, u.email, u.rol, u.puede_gestionar_tienda
          FROM staff_push_subscriptions s
          JOIN users u ON u.id = s.user_id
-         JOIN staff_push_prefs p ON p.user_id = u.id AND p.categoria = ?
-        WHERE ${STAFF_PUSH_SQL_ELEGIBLE}${extra}
+         ${unirPrefs}
+        WHERE ${cualquierCuenta ? "u.activo = 1" : STAFF_PUSH_SQL_ELEGIBLE}${soloSiNoApagada}${extra}
         ORDER BY s.id LIMIT ?`
     ).bind(...binds, PUSH_MAX_DESTINATARIOS).all();
     let subs = results || [];
     if (typeof filtro === "function") subs = subs.filter((s) => { try { return filtro(s); } catch { return false; } });
-    if (!subs.length) return { enviados: 0 };
+    if (!subs.length) return { enviados: 0, destinatarios: 0 };
     const carga = {
       titulo: pushRecortar(mensaje.titulo, 100),
       cuerpo: pushRecortar(mensaje.cuerpo, 160),
@@ -12430,24 +17348,23 @@ async function staffPushEnviar(env, categoria, mensaje, { excluirUid = null, sol
     for (const id of caducadas) {
       try { await env.DB.prepare("DELETE FROM staff_push_subscriptions WHERE id = ?").bind(id).run(); } catch {}
     }
-    return { enviados, caducadas: caducadas.length };
+    return { enviados, destinatarios: subs.length, caducadas: caducadas.length };
   } catch (err) {
     console.error("Error enviando push de equipo:", err && err.message);
     return { enviados: 0, error: true };
   }
 }
 
-// ¿Quien publica lo hace SIN revisión de nadie Y sin poder subirla a redes? Solo un
-// redactor de Nivel 2: publica directo (ver obtenerNivelUsuario) y ningún Nivel 4 /
-// admin pasa por la noticia, así que nadie la lleva a redes si no se les avisa. El
-// Nivel 3 ya puede subir a redes (Instagram/TikTok), y el 4 y admin las organizan
-// ellos mismos: no necesitan el aviso.
+// ¿Quien publica lo hace SIN revisión de nadie Y sin poder subirla a redes? Hoy nadie: quien
+// publica sin revisión (Nivel 3+, NIVEL_PUBLICACION_DIRECTA) también puede subir a redes
+// (NIVEL_REDES_MINIMO), así que no hace falta avisar. Si algún día se separan los dos
+// umbrales, este aviso vuelve a activarse solo para el tramo intermedio.
 async function autorPublicaSinRevision(env, uid) {
   try {
     if (!uid) return false;
     const u = await env.DB.prepare("SELECT rol, nivel FROM users WHERE id = ?").bind(uid).first();
     const nivel = Number(u && u.nivel) || 1;
-    return !!u && u.rol === "redactor" && nivel === 2;
+    return !!u && u.rol === "redactor" && nivel >= NIVEL_PUBLICACION_DIRECTA && nivel < NIVEL_REDES_MINIMO;
   } catch { return false; }
 }
 
@@ -12458,8 +17375,8 @@ async function notificarStaffArticulo(env, art, { excluirUid = null, borrador = 
     if (!art || !art.titulo) return;
     const tipoLabel = { noticia: "Noticia", previa: "Previa", cronica: "Crónica", analisis: "Análisis", opinion: "Opinión", entrevista: "Entrevista", uno_por_uno: "1x1 de jugadores", rdp_previa: "Rueda de prensa previa", rdp_post: "Rueda de prensa posterior" }[art.tipo] || "Artículo";
     const firma = art.coautor_nombre ? `${art.autor_nombre} y ${art.coautor_nombre}` : (art.autor_nombre || "");
-    // Publicada por alguien de Nivel 2 (sin revisión): se pide expresamente que un
-    // Nivel 4 la suba a redes, porque si no nadie lo hace.
+    // Publicada sin revisión por alguien que aún no puede subir a redes (ver
+    // autorPublicaSinRevision): se pide que un Nivel 4 la suba, porque si no nadie lo hace.
     const sinRevision = !borrador && sinRevisionUid ? await autorPublicaSinRevision(env, sinRevisionUid) : false;
     await staffPushEnviar(env, "noticias", {
       titulo: borrador ? `${tipoLabel}: borrador terminado` : (sinRevision ? `${tipoLabel} publicada sin revisión` : `${tipoLabel} publicada`),
@@ -12500,13 +17417,17 @@ async function manejarRutasStaffPush(request, env, path, method, url) {
 
   const payload = await requireAuth(request, env);
   if (!payload) return json({ error: "No autorizado" }, 401);
-  if (!(await staffPushPuede(env, payload))) {
-    return json({ error: "Las notificaciones push del equipo son solo para administradores y redactores de Nivel 4" }, 403);
+  const puedeTodo = await staffPushPuede(env, payload);
+  const soloReuniones = !puedeTodo && await staffPushEsParticipante(env, payload.uid);
+  if (!puedeTodo && !soloReuniones) {
+    return json({ error: "Las notificaciones push del equipo son solo para Responsables, redactores de Nivel 4 y participantes de las reuniones" }, 403);
   }
+  // Un participante solo ve y guarda "reuniones": el resto de avisos no le corresponden.
+  const permitidas = (lista) => (soloReuniones ? lista.filter((c) => c === "reuniones") : lista.filter((c) => payload.rol === "admin" || !STAFF_PUSH_CATEGORIAS_SOLO_ADMIN.has(c)));
 
   if (path === "/api/staff-push/estado" && method === "GET") {
     const endpoint = url ? url.searchParams.get("endpoint") : null;
-    const categorias = await staffPushCategoriasActivas(env, payload.uid);
+    const categorias = permitidas(await staffPushCategoriasActivas(env, payload.uid));
     let dispositivo = false;
     if (endpoint && endpoint.length <= 700) {
       const f = await env.DB.prepare("SELECT id FROM staff_push_subscriptions WHERE endpoint = ? AND user_id = ?").bind(endpoint, payload.uid).first();
@@ -12515,7 +17436,7 @@ async function manejarRutasStaffPush(request, env, path, method, url) {
     const yo = await env.DB.prepare("SELECT puede_gestionar_tienda FROM users WHERE id = ?").bind(payload.uid).first();
     const { results: n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM staff_push_subscriptions WHERE user_id = ?").bind(payload.uid).all();
     return json({
-      categorias: Object.entries(STAFF_PUSH_CATEGORIAS).map(([id, etiqueta]) => ({ id, etiqueta })),
+      categorias: Object.entries(STAFF_PUSH_CATEGORIAS).filter(([id]) => (!soloReuniones || id === "reuniones") && (payload.rol === "admin" || !STAFF_PUSH_CATEGORIAS_SOLO_ADMIN.has(id))).map(([id, etiqueta]) => ({ id, etiqueta })),
       activas: categorias,
       dispositivo_suscrito: dispositivo,
       dispositivos: Number(n && n[0] && n[0].n) || 0,
@@ -12526,9 +17447,9 @@ async function manejarRutasStaffPush(request, env, path, method, url) {
   if (path === "/api/staff-push/prefs" && method === "PUT") {
     const body = await request.json().catch(() => null);
     if (!body || !Array.isArray(body.categorias)) return json({ error: "Faltan las categorias" }, 400);
-    const categorias = staffPushCategoriasValidas(body.categorias);
+    const categorias = permitidas(staffPushCategoriasValidas(body.categorias));
     await staffPushGuardarCategorias(env, payload.uid, categorias);
-    return json({ ok: true, activas: categorias });
+    return json({ ok: true, activas: permitidas(await staffPushCategoriasActivas(env, payload.uid)) });
   }
 
   if (path === "/api/staff-push/suscribir" && method === "POST") {
@@ -12557,8 +17478,8 @@ async function manejarRutasStaffPush(request, env, path, method, url) {
     ).bind(payload.uid, endpoint, p256dh, auth, ua).run();
 
     // Si se mandan categorias (primera activacion), se guardan; si no, se conservan las que hubiera.
-    if (Array.isArray(body.categorias)) await staffPushGuardarCategorias(env, payload.uid, staffPushCategoriasValidas(body.categorias));
-    return json({ ok: true, activas: await staffPushCategoriasActivas(env, payload.uid) });
+    if (Array.isArray(body.categorias)) await staffPushGuardarCategorias(env, payload.uid, permitidas(staffPushCategoriasValidas(body.categorias)));
+    return json({ ok: true, activas: permitidas(await staffPushCategoriasActivas(env, payload.uid)) });
   }
 
   if (path === "/api/staff-push/baja" && method === "POST") {
@@ -12608,11 +17529,21 @@ export default {
   // Cloudflare Workers -- ver ese endpoint para el porqué completo.
   publicarArticulosProgramados,
   iniciarPartidosProgramadosCuyaHoraHaLlegado,
+  repararPartidosFalsamenteJugados,
   marcarPartidosColgados,
   revisarPartidosDesatendidos,
   enviarBoletinSemanalSiToca,
+  reunionsAvisarProximas,
+  reunionsConsumirVotos,
 
+  // Todas las respuestas pasan por anonimizarRespuesta (ver "Colaborador anónimo").
   async fetch(request, env, ctx) {
+    const oculto = await bloquearPerfilAnonimo(request, env);
+    if (oculto) return oculto;
+    return await anonimizarRespuesta(request, env, await this.fetchSinAnonimato(request, env, ctx));
+  },
+
+  async fetchSinAnonimato(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
@@ -12766,7 +17697,7 @@ export default {
             // Los tweets incrustados (tipo:"tweet") no son fotos: se
             // excluyen para no meter la URL de un tweet como si fuera una
             // imagen en el sitemap.
-            listaImagenes = [articulo.imagen_url, ...(Array.isArray(adicionales) ? adicionales.filter((v) => !(v && v.tipo === "tweet")) : [])]
+            listaImagenes = [articulo.imagen_url, ...(Array.isArray(adicionales) ? adicionales.filter((v) => !esItemNoFoto(v)) : [])]
               .filter(Boolean);
           } catch {
             listaImagenes = articulo.imagen_url ? [articulo.imagen_url] : [];
@@ -12836,7 +17767,7 @@ export default {
     if (path === "/sitemap-news.xml" && method === "GET") {
       try {
         const { results } = await env.DB.prepare(
-          `SELECT slug, titulo, categoria, imagen_url, fecha_publicacion FROM articles
+          `SELECT slug, titulo, categoria, imagen_url, imagenes, fecha_publicacion FROM articles
            WHERE publicado = 1${SQL_OCULTAR_SEGUNDO_DE_FUSION}
              AND fecha_publicacion >= datetime('now', '-48 hours')
            ORDER BY fecha_publicacion DESC
@@ -12878,7 +17809,7 @@ export default {
             // La foto de portada también en el sitemap de News: ayuda a que la
             // noticia salga con imagen en Top Stories y Google Discover.
             articulo.imagen_url
-              ? `    <image:image>\n      <image:loc>${escaparXml(imagenParaFeed(articulo.imagen_url))}</image:loc>\n    </image:image>`
+              ? `    <image:image>\n      <image:loc>${escaparXml(imagenParaFeed(articulo.imagen_url, focoDePortada(articulo)))}</image:loc>\n    </image:image>`
               : null,
             "  </url>",
           ].filter(Boolean).join("\n");
@@ -13011,6 +17942,64 @@ export default {
 
     /*
      * ============================================================
+     * SITEMAP DE PARTIDOS (CENTRO DE PARTIDO)
+     *
+     * GET /sitemap-partidos.xml
+     *
+     * Una URL por partido (/minuto-a-minuto?id=N). Hasta ahora esas páginas
+     * solo se enlazaban desde un modal que pinta JavaScript, así que los
+     * buscadores casi no tenían forma de descubrirlas. Entran los partidos
+     * en juego, los finalizados y cubiertos por la redacción y los
+     * programados de los próximos 30 días (y de ayer en adelante: un
+     * "programado" cuya hora pasó hace días es un partido que nunca se
+     * actualizó). Quedan fuera los aplazados, los sin fecha y los que
+     * terminaron sin cubrir (sin eventos: el worker del sitio los sirve
+     * noindex). Si la base de datos falla se responde 503 (y NO un sitemap
+     * vacío), igual que en /sitemap-jugadores.xml.
+     * ============================================================
+     */
+    if (path === "/sitemap-partidos.xml" && method === "GET") {
+      try {
+        const ahoraSm = Date.now();
+        const hastaSm = new Date(ahoraSm + 30 * 86400000).toISOString().slice(0, 10) + "T23:59";
+        const desdeSm = new Date(ahoraSm - 86400000).toISOString().slice(0, 10);
+        const { results: filasSm } = await env.DB.prepare(
+          `SELECT id, estado, fecha_partido, updated_at FROM results
+           WHERE finalizado_no_cubierto = 0
+             AND estado IN ('programado', 'en_juego', 'finalizado')
+             AND fecha_partido IS NOT NULL
+             AND fecha_partido <= ?
+             AND (estado <> 'programado' OR fecha_partido >= ?)
+           ORDER BY fecha_partido DESC
+           LIMIT 20000`
+        ).bind(hastaSm, desdeSm).all();
+        const urlsSm = (filasSm || []).map((f) => {
+          const lastmodSm = fechaParaSitemap(String(f.updated_at || "")) || fechaParaSitemap(String(f.fecha_partido || "").slice(0, 10));
+          const vivo = f.estado === "en_juego" || f.estado === "programado";
+          return [
+            "  <url>",
+            `    <loc>${escaparXml(`${SITIO_URL}/minuto-a-minuto?id=${f.id}`)}</loc>`,
+            lastmodSm ? `    <lastmod>${lastmodSm}</lastmod>` : null,
+            `    <changefreq>${vivo ? "hourly" : "weekly"}</changefreq>`,
+            `    <priority>${vivo ? "0.6" : "0.5"}</priority>`,
+            "  </url>",
+          ].filter(Boolean).join("\n");
+        }).join("\n");
+        const xmlSm = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urlsSm}\n</urlset>\n`;
+        return cors(new Response(xmlSm, {
+          status: 200,
+          headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "public, max-age=1800" },
+        }), ORIGEN_PETICION_ACTUAL);
+      } catch (err) {
+        return cors(new Response("Servicio temporalmente no disponible", {
+          status: 503,
+          headers: { "Content-Type": "text/plain; charset=UTF-8", "Retry-After": "300", "Cache-Control": "no-store" },
+        }), ORIGEN_PETICION_ACTUAL);
+      }
+    }
+
+    /*
+     * ============================================================
      * FEED RSS
      *
      * GET /rss.xml
@@ -13026,39 +18015,18 @@ export default {
     if (path === "/rss.xml" && method === "GET") {
       try {
         const { results } = await env.DB.prepare(
-          `SELECT slug, titulo, subtitulo, contenido, categoria, autor_nombre, imagen_url, fecha_publicacion, updated_at
+          `SELECT slug, titulo, subtitulo, contenido, categoria, autor_nombre, imagen_url, imagenes, fecha_publicacion, updated_at
            FROM articles
            WHERE publicado = 1${SQL_OCULTAR_SEGUNDO_DE_FUSION}
            ORDER BY fecha_publicacion DESC
            LIMIT 100`
         ).all();
 
-        const items = results.map((articulo) => {
-          const link = urlNoticia(articulo.categoria, articulo.slug);
-          const pubDate = fechaParaRss(articulo.fecha_publicacion);
-          const descripcion = articulo.subtitulo?.trim() || extractoTexto(articulo.contenido);
-          const imagenItem = imagenParaFeed(articulo.imagen_url);
-          return [
-            "  <item>",
-            `    <title>${escaparXml(articulo.titulo)}</title>`,
-            `    <link>${link}</link>`,
-            `    <guid isPermaLink="true">${link}</guid>`,
-            descripcion ? `    <description>${escaparXml(descripcion)}</description>` : null,
-            // Nombre legible ("Primera Federación"), no el identificador interno.
-            articulo.categoria ? `    <category>${escaparXml(categoriaLabelEmail(articulo.categoria))}</category>` : null,
-            // <author> en RSS 2.0 exige un correo ("a@b.com (Nombre)"); un nombre
-            // suelto lo invalida en los validadores. dc:creator es la forma estándar.
-            articulo.autor_nombre ? `    <dc:creator>${escaparXml(articulo.autor_nombre)}</dc:creator>` : null,
-            pubDate ? `    <pubDate>${pubDate}</pubDate>` : null,
-            imagenItem ? `    <media:content url="${escaparXml(imagenItem)}" medium="image" type="image/jpeg" width="1200" height="675"/>` : null,
-            imagenItem ? `    <media:thumbnail url="${escaparXml(imagenItem)}" width="1200" height="675"/>` : null,
-            "  </item>",
-          ].filter(Boolean).join("\n");
-        }).join("\n");
+        const items = itemsRss(results);
 
         const ultimaActualizacion = fechaParaRss(results[0]?.updated_at || results[0]?.fecha_publicacion) || new Date().toUTCString();
 
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:media="http://search.yahoo.com/mrss/">\n<channel>\n  <title>ELOTROFÚTBOLTV</title>\n  <link>https://elotrofutbol.media/</link>\n  <description>Últimas noticias de fútbol modesto: Primera Federación, Segunda Federación y más.</description>\n  <language>es</language>\n  <copyright>ELOTROFÚTBOLTV</copyright>\n  <ttl>15</ttl>\n  <lastBuildDate>${ultimaActualizacion}</lastBuildDate>\n  <image>\n    <url>https://elotrofutbol.media/img/logo.png</url>\n    <title>ELOTROFÚTBOLTV</title>\n    <link>https://elotrofutbol.media/</link>\n    <width>144</width>\n    <height>132</height>\n  </image>\n  <atom:link href="https://elotrofutbol.media/rss.xml" rel="self" type="application/rss+xml" />\n${items}\n</channel>\n</rss>\n`;
+        const xml = envolverRss({ ...CANAL_RSS_GLOBAL, ultimaActualizacion, items });
 
         return cors(new Response(xml, {
           status: 200,
@@ -13074,6 +18042,113 @@ export default {
           `<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0"><channel><title>ELOTROFÚTBOLTV</title><link>https://elotrofutbol.media</link><description>Últimas noticias de fútbol modesto.</description></channel></rss>\n`,
           { status: 200, headers: { "Content-Type": "application/rss+xml; charset=UTF-8", "Cache-Control": "no-store" } }
         ), ORIGEN_PETICION_ACTUAL);
+      }
+    }
+
+    /*
+     * ============================================================
+     * FEEDS RSS POR CATEGORÍA, CLUB, AUTOR Y ETIQUETA
+     *
+     * GET /rss/categoria/{categoria}.xml   p. ej. primera-federacion
+     * GET /rss/club/{club}.xml             slug del nombre, p. ej. real-oviedo
+     * GET /rss/autor/{id}.xml
+     * GET /rss/etiqueta/{slug}.xml         p. ej. ascenso-2026
+     *
+     * Mismo formato que /rss.xml (ver itemsRss / envolverRss) pero solo con
+     * las noticias del filtro, las 50 últimas. Sirven para agregadores y
+     * para que un club enlace desde su web las noticias que le afectan. Un
+     * filtro sin noticias o que no existe responde 404 (nunca un feed vacío
+     * con 200: un lector lo daría por bueno y no volvería a mirarlo).
+     * ============================================================
+     */
+    const rssFiltrado = path.match(/^\/rss\/(categoria|club|autor|etiqueta)\/([^/]+)\.xml$/);
+    if (rssFiltrado && method === "GET") {
+      try {
+        let segmento = rssFiltrado[2];
+        try { segmento = decodeURIComponent(segmento); } catch { /* se usa tal cual */ }
+        const noEncontrado = () => cors(new Response("Feed no encontrado", {
+          status: 404,
+          headers: { "Content-Type": "text/plain; charset=UTF-8", "Cache-Control": "public, max-age=300" },
+        }), ORIGEN_PETICION_ACTUAL);
+
+        const canal = await resolverCanalRss(env, rssFiltrado[1], segmento);
+        if (!canal) return noEncontrado();
+        const { results } = await env.DB.prepare(
+          `SELECT slug, titulo, subtitulo, contenido, categoria, autor_nombre, imagen_url, imagenes, fecha_publicacion, updated_at${canal.columnasExtra || ""}
+           FROM articles
+           WHERE publicado = 1${SQL_OCULTAR_SEGUNDO_DE_FUSION}${canal.where}
+           ORDER BY fecha_publicacion DESC
+           LIMIT 50`
+        ).bind(...canal.binds).all();
+        if (!results.length) return noEncontrado();
+
+        let nombre = canal.nombre;
+        if (!nombre && canal.tipo === "autor") nombre = results[0].autor_nombre || "Autor";
+        if (!nombre && canal.tipo === "etiqueta") nombre = agregarEtiquetas(results).find((e) => e.slug === canal.slug)?.nombre || canal.slug;
+        const descripcion = canal.tipo === "autor"
+          ? `Últimas publicaciones de ${nombre} en ELOTROFÚTBOLTV.`
+          : canal.tipo === "etiqueta"
+            ? `Noticias etiquetadas con «${nombre}» en ELOTROFÚTBOLTV.`
+            : `Últimas noticias de ${nombre} en ELOTROFÚTBOLTV.`;
+
+        const xml = envolverRss({
+          titulo: `${nombre} — ELOTROFÚTBOLTV`,
+          descripcion,
+          enlace: canal.enlace,
+          selfUrl: canal.selfUrl,
+          ultimaActualizacion: fechaParaRss(results[0].updated_at || results[0].fecha_publicacion) || new Date().toUTCString(),
+          items: itemsRss(results),
+        });
+        return cors(new Response(xml, {
+          status: 200,
+          headers: { "Content-Type": "application/rss+xml; charset=UTF-8", "Cache-Control": "public, max-age=900" },
+        }), ORIGEN_PETICION_ACTUAL);
+      } catch (err) {
+        // Un fallo de base de datos no es "feed vacío": 503 para que el sitio
+        // siga sirviendo la última copia buena y los lectores reintenten.
+        return cors(new Response("Servicio temporalmente no disponible", {
+          status: 503,
+          headers: { "Content-Type": "text/plain; charset=UTF-8", "Retry-After": "300", "Cache-Control": "no-store" },
+        }), ORIGEN_PETICION_ACTUAL);
+      }
+    }
+
+    /*
+     * ============================================================
+     * SITEMAP DE ETIQUETAS
+     *
+     * GET /sitemap-etiquetas.xml
+     *
+     * Una URL por etiqueta con MIN_NOTICIAS_ETIQUETA_INDEXABLE noticias o
+     * más (una página de etiqueta con una sola noticia sería casi un
+     * duplicado de esa noticia). Puede estar vacío: aún no hay etiquetas
+     * suficientes, y eso es válido.
+     * ============================================================
+     */
+    if (path === "/sitemap-etiquetas.xml" && method === "GET") {
+      try {
+        const lista = (await listarEtiquetas(env)).filter((e) => e.total >= MIN_NOTICIAS_ETIQUETA_INDEXABLE);
+        const urls = lista.map((e) => {
+          const lastmod = fechaParaSitemap(e.ultima);
+          return [
+            "  <url>",
+            `    <loc>${escaparXml(`${SITIO_URL}/etiqueta/${e.slug}`)}</loc>`,
+            lastmod ? `    <lastmod>${lastmod}</lastmod>` : null,
+            "    <changefreq>daily</changefreq>",
+            "    <priority>0.5</priority>",
+            "  </url>",
+          ].filter(Boolean).join("\n");
+        }).join("\n");
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>\n`;
+        return cors(new Response(xml, {
+          status: 200,
+          headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "public, max-age=3600" },
+        }), ORIGEN_PETICION_ACTUAL);
+      } catch (err) {
+        return cors(new Response("Servicio temporalmente no disponible", {
+          status: 503,
+          headers: { "Content-Type": "text/plain; charset=UTF-8", "Retry-After": "300", "Cache-Control": "no-store" },
+        }), ORIGEN_PETICION_ACTUAL);
       }
     }
 
@@ -13226,7 +18301,7 @@ export default {
     // ---------- Acreditaciones: formulario público (acreditacion.html) ----------
     // Cualquier persona con el enlace puede solicitar acreditación para
     // cubrir un partido, rueda de prensa o acto. No requiere sesión. Se
-    // guarda en la tabla "acreditaciones" y solo los administradores
+    // guarda en la tabla "acreditaciones" y solo los Responsables
     // pueden verla (pestaña Solicitudes > Formularios > Acreditaciones del panel).
     // Configuración pública del formulario (textos y listas editables desde el panel).
     if (path === "/api/acreditaciones/config" && method === "GET") {
@@ -13250,7 +18325,7 @@ export default {
       const body = await request.json().catch(() => ({}));
       // Según el modo: PIN correcto, sesión de colaborador válida o acceso libre.
       const acc = await comprobarAccesoAcreditacion(request, env, body && body.pin);
-      if (!acc.ok) return json({ error: acc.error, acceso: acc.modo }, acc.status);
+      if (!acc.ok) return json({ error: acc.error, acceso: acc.modo, motivo: acc.motivo || null, bloqueo: acc.bloqueo || null }, acc.status);
       return json({ ok: true, acceso: acc.modo, usuario: acc.usuario || null });
     }
 
@@ -13272,7 +18347,7 @@ export default {
       // Sin el acceso que exija el modo vigente (PIN, sesión de colaborador o libre)
       // no se acepta ninguna solicitud, aunque se salten la pantalla de acceso.
       const accPost = await comprobarAccesoAcreditacion(request, env, body.pin);
-      if (!accPost.ok) return json({ error: accPost.error, acceso: accPost.modo }, accPost.status);
+      if (!accPost.ok) return json({ error: accPost.error, acceso: accPost.modo, motivo: accPost.motivo || null, bloqueo: accPost.bloqueo || null }, accPost.status);
 
       const limpiar = (v, max) => (v ? String(v) : "").replace(/\s+/g, " ").trim().slice(0, max);
       const cfgAcred = await obtenerConfigAcreditacion(env);
@@ -13295,18 +18370,80 @@ export default {
         if (dni ? (dni.length < 5 || !/^[A-Z0-9]+$/.test(dni)) : P.dni.obligatoria) return json({ error: P.dni.error }, 400);
       }
       if (!equipo) return json({ error: P.equipo.error }, 400);
+      // LaLiga Hypermotion (fútbol profesional): no se cubre a pie de campo. Se rechaza aunque venga "forzar".
+      if (await equipoEsHypermotion(env, equipo)) {
+        return json({
+          error: "No cubrimos LaLiga Hypermotion a pie de campo: es fútbol profesional y LaLiga impone requisitos muy altos para acreditarse.",
+          categoria_no_cubierta: "hypermotion",
+          equipo,
+        }, 422);
+      }
       if (P.tipo_evento.activa && P.tipo_evento.obligatoria && !tipoEvento) return json({ error: P.tipo_evento.error }, 400);
       if (!TIPOS_ACREDITACION.includes(tipoAcreditacion)) return json({ error: P.tipo_acreditacion.error }, 400);
       if (P.funciones.activa && P.funciones.obligatoria && !funciones) return json({ error: P.funciones.error }, 400);
       if (P.jornada_partido.activa && P.jornada_partido.obligatoria && !jornadaPartido) return json({ error: P.jornada_partido.error }, 400);
       if (body.confirmo !== true) return json({ error: "Debes confirmar que los datos son correctos" }, 400);
 
+      // Anti-duplicados: la misma persona (correo) pidiendo lo mismo (equipo, evento, jornada/partido y tipo)
+      // no crea una segunda solicitud, ni se vuelve a avisar al equipo. Se ignoran mayúsculas y las ya
+      // rechazadas o canceladas (quien fue rechazada puede volver a pedirla). Se responde OK igualmente
+      // (un doble clic o un reenvío no debe enseñar un error a quien ya tiene su solicitud registrada).
+      const SQL_DUP_ACRED = `SELECT id FROM acreditaciones
+         WHERE LOWER(email) = ? AND LOWER(equipo) = ? AND LOWER(tipo_evento) = ? AND LOWER(jornada_partido) = ? AND LOWER(tipo_acreditacion) = ?
+           AND COALESCE(estado, 'pendiente') NOT IN ('rechazada', 'cancelada')
+         ORDER BY id ASC`;
+      const bindDupAcred = [email, equipo.toLowerCase(), tipoEvento.toLowerCase(), jornadaPartido.toLowerCase(), tipoAcreditacion.toLowerCase()];
+      let forzada = false;
       try {
-        await env.DB.prepare(
+        const yaExiste = await env.DB.prepare(SQL_DUP_ACRED).bind(...bindDupAcred).first();
+        if (yaExiste) return json({ ok: true, duplicada: true });
+
+        // Conflicto con OTRA persona: alguien con otro correo ya pidió esa misma función (tipo de acreditación)
+        // para el mismo equipo, evento y partido, y su solicitud sigue viva (ni rechazada ni cancelada). Los
+        // clubes casi nunca conceden dos acreditaciones iguales, así que se avisa antes de guardar. Quien
+        // insiste (forzar: true) la envía igualmente, y el equipo la recibe marcada como "forzada".
+        // Sin partido indicado (pregunta oculta) no hay nada que comparar. El texto libre se compara sin
+        // tildes, mayúsculas ni signos para que "J5: Celta B - Arosa" y "j5 celta b arosa" cuenten como lo mismo.
+        let conflicto = null;
+        if (jornadaPartido) {
+          const clave = (t) => String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+          const kTipo = clave(tipoAcreditacion), kEquipo = clave(equipo), kEvento = clave(tipoEvento), kJornada = clave(jornadaPartido);
+          const { results: previas } = await env.DB.prepare(
+            `SELECT id, nombre, equipo, tipo_evento, tipo_acreditacion, jornada_partido FROM acreditaciones
+              WHERE LOWER(email) <> ? AND COALESCE(estado, 'pendiente') NOT IN ('rechazada', 'cancelada')
+              ORDER BY id ASC LIMIT 3000`
+          ).bind(email).all();
+          conflicto = (previas || []).find((p) =>
+            clave(p.tipo_acreditacion) === kTipo && clave(p.equipo) === kEquipo &&
+            clave(p.tipo_evento) === kEvento && clave(p.jornada_partido) === kJornada) || null;
+        }
+        if (conflicto && body.forzar !== true) {
+          // 409: no se guarda nada. No se dice quién la pidió (dato de otra persona), solo que el hueco está ocupado.
+          return json({
+            error: "Otra persona ya ha solicitado esta misma acreditación para este partido.",
+            conflicto: true,
+            detalle: { equipo, tipo_acreditacion: tipoAcreditacion, jornada_partido: jornadaPartido },
+          }, 409);
+        }
+        const notaForzada = conflicto
+          ? `Solicitud FORZADA: ya existía otra igual (n.º ${conflicto.id}, ${String(conflicto.nombre || "").slice(0, 80)}) para esta misma función y partido. Normalmente el club no la concede.`
+          : null;
+        const ins = await env.DB.prepare(
           `INSERT INTO acreditaciones
-             (nombre, email, dni, equipo, tipo_evento, tipo_acreditacion, funciones, jornada_partido, confirmado)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`
-        ).bind(nombre, email, dni, equipo, tipoEvento, tipoAcreditacion, funciones, jornadaPartido).run();
+             (nombre, email, dni, equipo, tipo_evento, tipo_acreditacion, funciones, jornada_partido, confirmado, nota_admin)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
+        ).bind(nombre, email, dni, equipo, tipoEvento, tipoAcreditacion, funciones, jornadaPartido, notaForzada).run();
+        forzada = !!conflicto;
+        // Dos envíos simultáneos pueden pasar a la vez la comprobación de arriba: se queda solo la más antigua.
+        const nuevoId = ins && ins.meta ? ins.meta.last_row_id : null;
+        if (nuevoId) {
+          const iguales = await env.DB.prepare(SQL_DUP_ACRED).bind(...bindDupAcred).all();
+          const ids = ((iguales && iguales.results) || []).map((r) => r.id);
+          if (ids.length > 1 && Number(ids[0]) !== Number(nuevoId)) {
+            await env.DB.prepare("DELETE FROM acreditaciones WHERE id = ?").bind(nuevoId).run();
+            return json({ ok: true, duplicada: true });
+          }
+        }
       } catch (err) {
         console.error("[acreditaciones/crear]", err);
         return json({ error: "No se pudo enviar la solicitud. Inténtalo de nuevo en unos minutos." }, 500);
@@ -13315,14 +18452,15 @@ export default {
       // Aviso por correo al equipo: es un extra, si falla la solicitud ya está guardada.
       try {
         await enviarEmailNotificacion(env, {
-          asunto: `Nueva solicitud de acreditación: ${nombre} (${equipo})`,
+          asunto: `${forzada ? "[FORZADA] " : ""}Nueva solicitud de acreditación: ${nombre} (${equipo})`,
           texto: [
+            ...(forzada ? ["AVISO: solicitud FORZADA. Ya había otra solicitud igual (misma función, equipo y partido) y esta persona insistió. Probabilidades mínimas de que el club la acepte.", ""] : []),
             `Nombre: ${nombre}`, `Correo: ${email}`, `Equipo: ${equipo}`,
             `Evento: ${tipoEvento}`, `Acreditación: ${tipoAcreditacion}`,
             `Jornada y partido: ${jornadaPartido}`, "",
             "Puedes verla y gestionarla en el panel de administración (Solicitudes > Formularios > Acreditaciones).",
           ].join("\n"),
-          html: `<p>Nueva solicitud de acreditación recibida.</p>
+          html: `${forzada ? "<p><strong>⚠ Solicitud FORZADA:</strong> ya había otra solicitud igual (misma función, equipo y partido) y esta persona insistió. Probabilidades mínimas de que el club la acepte.</p>" : ""}<p>Nueva solicitud de acreditación recibida.</p>
 <p><strong>Nombre:</strong> ${escapeHtmlEmail(nombre)}<br>
 <strong>Correo:</strong> ${escapeHtmlEmail(email)}<br>
 <strong>Equipo:</strong> ${escapeHtmlEmail(equipo)}<br>
@@ -13335,11 +18473,17 @@ export default {
         console.error("[acreditaciones/aviso-email]", err);
       }
       ctx.waitUntil(staffPushEnviar(env, "acreditaciones", {
-        titulo: "Nueva solicitud de acreditación",
+        titulo: forzada ? "Solicitud de acreditación FORZADA" : "Nueva solicitud de acreditación",
         cuerpo: `${nombre} · ${equipo} · ${jornadaPartido}`,
         ir: "acreditaciones", tag: "acreditaciones",
       }));
       return json({ ok: true });
+    }
+
+    // ---------- Reuniones: calendario de disponibilidad (público: /reunions; admin: Responsables) ----------
+    if (path.startsWith("/api/reunions")) {
+      const respReunions = await manejarReunions(request, env, ctx, path, method);
+      if (respReunions) return respReunions;
     }
 
     // ---------- Formularios públicos (formulario.html?f=<slug>) ----------
@@ -13392,6 +18536,23 @@ export default {
           }
         }
       } catch (err) { console.error("[formularios/unicas]", err); }
+      // Formulario de incorporación: quien ya lo rellenó antes (mismo correo) no puede volver a enviarlo.
+      // Si su respuesta se borra (p. ej. al eliminar su usuario) puede volver a solicitarlo.
+      if (f.slug === FORMULARIO_INCORPORACION_SLUG) {
+        try {
+          const camposCorreoInc = campos.filter((c) => c.tipo === "email" && typeof v.datos[c.id] === "string");
+          const correosNuevos = camposCorreoInc.map((c) => String(v.datos[c.id]).trim().toLowerCase()).filter(Boolean);
+          if (correosNuevos.length) {
+            const idsCorreo = camposCorreoInc.map((c) => c.id);
+            const { results: previasInc } = await env.DB.prepare("SELECT datos FROM formularios_respuestas WHERE formulario_id = ?").bind(f.id).all();
+            const yaRespondio = (previasInc || []).some((r) => {
+              let d = {}; try { d = JSON.parse(String(r.datos || "{}")) || {}; } catch {}
+              return idsCorreo.some((id) => typeof d[id] === "string" && correosNuevos.includes(d[id].trim().toLowerCase()));
+            });
+            if (yaRespondio) return json({ error: "Ya has rellenado antes el formulario de incorporación con este correo, así que no puedes enviarlo otra vez. Si crees que es un error, contacta con el equipo de ElOtroFútbol." }, 409);
+          }
+        } catch (err) { console.error("[formularios/incorporacion-repetida]", err); }
+      }
       // Alta de usuario (campos con "alta_usuario"): se crea ANTES de guardar la respuesta y, si ésta falla, se deshace.
       let cuentaNueva = null, yaTeniaCuenta = false, usuarioCreado = null;
       const campoAlta = campos.find((c) => c.alta_usuario && typeof v.datos[c.id] === "string");
@@ -13815,6 +18976,11 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
   async scheduled(event, env, ctx) {
     ctx = ctxConAlertas(ctx, env, "cron");
     ctx.waitUntil(publicarArticulosProgramados(env));
+    // Papelera: una vez al día (03:17 UTC) se vacía lo que lleva más de PAPELERA_DIAS días.
+    {
+      const t = new Date(event?.scheduledTime || Date.now());
+      if (t.getUTCHours() === 3 && t.getUTCMinutes() === 17) ctx.waitUntil(papeleraVaciarCaducados(env));
+    }
     // Red de seguridad del índice de búsqueda (src/busqueda.js): cada 5 min
     // mientras haya backfill pendiente; después, una vez por hora.
     {
@@ -13822,6 +18988,15 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
       if (mm % 5 === 3) ctx.waitUntil(reconciliarIndiceBusqueda(env, { soloBackfill: mm !== 3 }));
     }
     ctx.waitUntil(iniciarPartidosProgramadosCuyaHoraHaLlegado(env));
+    // Partidos futuros que un arranque con fecha mal puesta dejó como "jugados": se devuelven a programado.
+    ctx.waitUntil(repararPartidosFalsamenteJugados(env));
+    // Acreditaciones sin respuesta cuyo partido ya ha empezado: se rechazan solas, sin correo
+    // (ver "RECHAZO AUTOMÁTICO DE ACREDITACIONES SIN RESPUESTA" arriba).
+    ctx.waitUntil(rechazarAcreditacionesSinRespuestaSiToca(env));
+    // Avisos push de reuniones: 30 min antes, 10 min antes y al empezar (ver "AVISOS PUSH DE REUNIONES").
+    ctx.waitUntil(reunionsAvisarProximas(env));
+    // Quien acaba de hacer una reunión no vuelve a salir convocado salvo que lo pida de nuevo.
+    ctx.waitUntil(reunionsConsumirVotos(env));
 
     // Reducción de CPU del cron (corre cada minuto, 1440 veces/día):
     // antes crearDescansoAutomaticoAlMinuto45, crearFinPartidoAutomaticoAlMinuto90,
@@ -13886,6 +19061,8 @@ ${medio ? `<p><strong>Medio/organización:</strong> ${escapeHtmlEmail(medio)}</p
     // Recordatorio a fotógrafos acreditados de subir la galería del partido
     // (ver "RECORDATORIO DE GALERÍA A FOTÓGRAFOS ACREDITADOS" arriba).
     ctx.waitUntil(enviarRecordatoriosGaleriaSiToca(env));
+    // Aviso a los Responsables cuando alguien cumple los requisitos de nivel (ver "Avisos de niveles" arriba).
+    ctx.waitUntil(avisarNivelesListosSiToca(env));
     // Partidazo de la jornada por liga (ver "PARTIDAZO DE LA JORNADA" arriba).
     // Se autolimita a una pasada cada PARTIDAZO_INTERVALO_MS.
     ctx.waitUntil(calcularPartidazosSiToca(env));
@@ -14851,11 +20028,17 @@ async function syncRutasAdmin(request, env, path, method, url) {
   // salen de Workers, asi que el Action descarga los eventos y los entrega aqui.
   // Se autentica con el secreto SYNC_INGEST_TOKEN (no con sesion de admin).
   if (path === "/api/admin/sync-partidos/ingestar") {
-    const token = String(env.SYNC_INGEST_TOKEN || "");
-    const dado = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
-    let iguales = token.length >= 16 && dado.length === token.length;
+    // trim(): al pegar un secret (en Cloudflare o en GitHub) es muy facil colar un
+    // salto de linea o un espacio al final y entonces nunca coincide.
+    const token = String(env.SYNC_INGEST_TOKEN || "").trim();
+    const dado = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
+    // Worker sin token valido: es un fallo de configuracion, no del Action.
+    if (token.length < 16) {
+      return json({ error: "SYNC_INGEST_TOKEN no esta configurado en este Worker (o tiene menos de 16 caracteres)" }, 503);
+    }
+    let iguales = dado.length === token.length;
     if (iguales) { let d = 0; for (let i = 0; i < token.length; i++) d |= token.charCodeAt(i) ^ dado.charCodeAt(i); iguales = d === 0; }
-    if (!iguales) return json({ error: "No autorizado" }, 401);
+    if (!iguales) return json({ error: "No autorizado", ayuda: "SYNC_INGEST_TOKEN de GitHub Actions y del Worker no coinciden" }, 401);
     const { config } = await syncLeerConfigYEstado(env);
     const temporada = config.temporada || syncTemporada();
     if (method === "GET") {
@@ -14899,7 +20082,7 @@ async function syncRutasAdmin(request, env, path, method, url) {
 
   const payload = await requireAuth(request, env);
   if (!payload) return json({ error: "No autorizado" }, 401);
-  if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar el relleno automatico" }, 403);
+  if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede gestionar el relleno automatico" }, 403);
 
   if (path === "/api/admin/sync-partidos" && method === "GET") {
     const { config, estado } = await syncLeerConfigYEstado(env);
@@ -16152,6 +21335,7 @@ const CACHE_PUBLICA_TTL_MS = {
   "/api/noticias-rapidas": 15000,
   "/api/polls/portada": 15000,
   "/api/settings": 60000,
+  "/api/eliminatorias": 60000, // se calcula con la liga entera de results: TTL más largo
   "/api/club-info": 60000,
   "/api/media/publica": 30000,
   "/api/galerias/partidos": 60000,
@@ -16216,6 +21400,32 @@ function escrituraSinEfectoPublico(pathname) {
     || pathname.startsWith("/api/readers/me/lecturas/");
 }
 
+// ---------- Reacciones a una noticia ("Útil" / "Me gusta") ----------
+// Tabla article_reactions (ver worker/migracion_reacciones_noticias.sql). Los
+// contadores se calculan con COUNT sobre un índice (article_id, tipo): una noticia
+// tiene como mucho unos miles de reacciones y la lectura pública se cachea 15 s.
+const TIPOS_REACCION_ARTICULO = ["util", "me_gusta"];
+async function contarReaccionesArticulo(env, articleId) {
+  const { results } = await env.DB.prepare(
+    "SELECT tipo, COUNT(*) AS n FROM article_reactions WHERE article_id = ? GROUP BY tipo"
+  ).bind(articleId).all();
+  const cuentas = { util: 0, me_gusta: 0 };
+  for (const fila of results || []) {
+    if (Object.prototype.hasOwnProperty.call(cuentas, fila.tipo)) cuentas[fila.tipo] = Number(fila.n) || 0;
+  }
+  return cuentas;
+}
+
+// Firma barata de una lista de eventos de partido (djb2 sobre el JSON). La usa
+// GET /api/results/:id/vivo para no reenviar los eventos si el cliente ya tiene
+// los mismos. No es criptográfica: solo sirve para saber "¿ha cambiado algo?".
+function firmaListaEventos(eventos) {
+  const texto = JSON.stringify(eventos || []);
+  let h = 5381;
+  for (let i = 0; i < texto.length; i++) h = ((h << 5) + h + texto.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36) + "." + texto.length;
+}
+
 function ttlCachePublica(request, url) {
   if (request.method !== "GET") return 0;
   if (request.headers.get("Authorization")) return 0;
@@ -16229,6 +21439,14 @@ function ttlCachePublica(request, url) {
   // Ficha de noticia: /api/articles/:slug (la version sin sesion solo
   // devuelve noticias publicadas; el borrador del autor exige Authorization).
   if (/^\/api\/articles\/[^/]+$/.test(p)) return 15000;
+  // Huella ligera de una noticia (aviso «noticia actualizada»): TTL corto para que el aviso llegue rápido.
+  if (/^\/api\/articles\/[^/]+\/version$/.test(p)) return 8000;
+  // Contadores de reacciones de una noticia (no dependen de quién pregunta: lo que
+  // ya ha marcado cada lector se guarda en su navegador).
+  if (/^\/api\/articles\/\d+\/reactions$/.test(p)) return 15000;
+  // Estado en vivo de un partido (marcador + eventos en una sola petición). 4 s: la
+  // clave incluye ?firma=, así que los lectores con los mismos eventos comparten respuesta.
+  if (/^\/api\/results\/\d+\/vivo$/.test(p)) return 4000;
   return 0;
 }
 
@@ -16298,6 +21516,9 @@ async function handlePrimary(request, env, ctx) {
   // failover), que es la inmensa mayoría.
   const origenWriteId = request.headers.get("X-Write-Id") || null;
   const method = request.method;
+  // Caché corta de listados públicos de noticias (ver "arts:" en GET /api/articles): cualquier
+  // escritura sobre artículos la vacía para que lo publicado se vea al momento.
+  if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS" && path.startsWith("/api/articles")) invalidarCacheCorta("arts:");
 
     try {
       // ================================================================
@@ -16454,11 +21675,146 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: "Todavía no has confirmado tu correo. Revisa tu bandeja de entrada.", sinVerificar: true }, 403);
         }
 
+        // 2FA activado por el propio lector: la contraseña correcta NO basta para tener sesión.
+        if (lector.totp_activo) {
+          return json({ requiere_2fa: true, desafio: await crearDesafio2faLector(env, lector) });
+        }
+
         const token = await crearSesionLector(env, request, lector);
         return json({
           token,
           reader: { id: lector.id, nombre: lector.nombre, email: lector.email, email_verificado: true },
         });
+      }
+
+      // ---------- Login de lector: segundo paso (código de la app o de recuperación) ----------
+      if (path === "/api/readers/login/2fa" && method === "POST") {
+        const cuerpo2fa = await request.json().catch(() => ({}));
+        await asegurarColumnas2faLector(env);
+        if (await limiteExcedido(request, env, "lector-login-2fa", 40, 900)) return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        const desafio2fa = await leerDesafio2faLector(env, cuerpo2fa.desafio);
+        if (!desafio2fa) return json({ error: "La verificación ha caducado. Vuelve a escribir tu correo y contraseña.", caducado: true }, 401);
+        const lector2fa = await env.DB.prepare("SELECT * FROM readers WHERE id = ? AND activo = 1").bind(desafio2fa.fa2r).first();
+        if (!lector2fa || !lector2fa.totp_activo || !lector2fa.email_verificado) {
+          return json({ error: "Vuelve a iniciar sesión.", caducado: true }, 401);
+        }
+        if (await limiteExcedido(request, env, "lector-login-2fa-user", 8, 900, String(lector2fa.id))) {
+          return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        }
+        // Tope de códigos fallidos por CUENTA (todas las IPs juntas).
+        if (await cuentaBloqueada(env, "lector-login-2fa-cuenta", lector2fa.id, 15, 900)) {
+          return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        }
+        const abrirSesion2faLector = async (extra = {}) => {
+          const tokenSesion = await crearSesionLector(env, request, lector2fa);
+          return json({
+            token: tokenSesion,
+            reader: { id: lector2fa.id, nombre: lector2fa.nombre, email: lector2fa.email, email_verificado: true },
+            ...extra,
+          });
+        };
+        const entrada2fa = String(cuerpo2fa.codigo || "").trim();
+        if (!entrada2fa || entrada2fa.length > 40) return json({ error: "Escribe el código." }, 400);
+        if (/^[\d\s]{6,8}$/.test(entrada2fa)) {
+          const secreto = await descifrarSecretoTotp(env, lector2fa.totp_secret);
+          const paso = secreto ? await totpVerificar(secreto, entrada2fa, lector2fa.totp_ultimo_paso) : null;
+          if (paso === null) {
+            await registrarFalloCuenta(env, "lector-login-2fa-cuenta", lector2fa.id, 900);
+            return json({ error: "Código incorrecto o ya utilizado. Espera al siguiente código de tu app e inténtalo de nuevo." }, 401);
+          }
+          await env.DB.prepare("UPDATE readers SET totp_ultimo_paso = ? WHERE id = ?").bind(paso, lector2fa.id).run();
+          return abrirSesion2faLector();
+        }
+        let hashesLector = [];
+        try { hashesLector = JSON.parse(lector2fa.totp_recovery || "[]"); } catch { hashesLector = []; }
+        const hashIntentoLector = await hashCodigoRecuperacion(entrada2fa);
+        const indiceLector = hashesLector.findIndex((h) => comparacionConstante(h, hashIntentoLector));
+        if (indiceLector < 0) {
+          await registrarFalloCuenta(env, "lector-login-2fa-cuenta", lector2fa.id, 900);
+          return json({ error: "Código incorrecto." }, 401);
+        }
+        hashesLector.splice(indiceLector, 1);
+        await env.DB.prepare("UPDATE readers SET totp_recovery = ? WHERE id = ?").bind(JSON.stringify(hashesLector), lector2fa.id).run();
+        return abrirSesion2faLector({ codigos_recuperacion_restantes: hashesLector.length });
+      }
+
+      // ---------- 2FA del lector con sesión: estado, activar y desactivar (Cuenta > Seguridad) ----------
+      if ((path === "/api/readers/me/2fa" && method === "GET") ||
+          (method === "POST" && (path === "/api/readers/me/2fa/setup" || path === "/api/readers/me/2fa/activar" || path === "/api/readers/me/2fa/desactivar"))) {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        await asegurarColumnas2faLector(env);
+        const yo = await env.DB.prepare("SELECT * FROM readers WHERE id = ? AND activo = 1").bind(payload.rid).first();
+        if (!yo) return json({ error: "Cuenta no encontrada" }, 404);
+        const tienePassword = Boolean(yo.password_hash && yo.salt);
+
+        if (path === "/api/readers/me/2fa") {
+          let restantes = 0;
+          try { restantes = JSON.parse(yo.totp_recovery || "[]").length; } catch { restantes = 0; }
+          return json({
+            disponible: tienePassword,
+            activo: Boolean(yo.totp_activo),
+            codigos_restantes: yo.totp_activo ? restantes : 0,
+          });
+        }
+        if (!tienePassword) {
+          return json({ error: "La verificación en dos pasos protege el acceso con contraseña, y tu cuenta no tiene una (entras con un proveedor externo, que ya tiene la suya)." }, 403);
+        }
+        if (await limiteExcedido(request, env, "lector-me-2fa", 10, 900, String(yo.id))) {
+          return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        }
+        const cuerpoMe2fa = await request.json().catch(() => ({}));
+        const passwordCorrecta = async () =>
+          typeof cuerpoMe2fa.password === "string" && cuerpoMe2fa.password.length > 0 && cuerpoMe2fa.password.length <= 1024 &&
+          comparacionConstante(await hashPassword(cuerpoMe2fa.password, yo.salt), yo.password_hash);
+
+        if (path === "/api/readers/me/2fa/setup") {
+          if (yo.totp_activo) return json({ error: "Ya tienes la verificación en dos pasos activada." }, 400);
+          if (!(await passwordCorrecta())) return json({ error: "La contraseña no es correcta." }, 403);
+          const secreto = generarSecretoTotp();
+          await env.DB.prepare("UPDATE readers SET totp_secret = ?, totp_activo = 0, totp_ultimo_paso = NULL, totp_recovery = NULL WHERE id = ?")
+            .bind(await cifrarSecretoTotp(env, secreto), yo.id).run();
+          return json({ secreto, otpauth: construirOtpauth(yo.email, secreto) });
+        }
+
+        if (path === "/api/readers/me/2fa/activar") {
+          if (yo.totp_activo) return json({ error: "Ya tienes la verificación en dos pasos activada." }, 400);
+          const secreto = await descifrarSecretoTotp(env, yo.totp_secret);
+          if (!secreto) return json({ error: "Primero escanea el código QR." }, 400);
+          const paso = await totpVerificar(secreto, cuerpoMe2fa.codigo, null);
+          if (paso === null) {
+            return json({ error: "El código no es correcto. Comprueba que la hora de tu móvil esté en automático e inténtalo con el código nuevo." }, 400);
+          }
+          const codigos = generarCodigosRecuperacion();
+          const hashes = await Promise.all(codigos.map(hashCodigoRecuperacion));
+          await env.DB.prepare("UPDATE readers SET totp_activo = 1, totp_ultimo_paso = ?, totp_recovery = ? WHERE id = ?")
+            .bind(paso, JSON.stringify(hashes), yo.id).run();
+          // Las demás sesiones abiertas se crearon sin 2FA: se cierran. La actual se mantiene.
+          await env.DB.prepare("UPDATE reader_sessions SET revoked_at = datetime('now') WHERE reader_id = ? AND id != ? AND revoked_at IS NULL")
+            .bind(yo.id, payload.sid || "").run();
+          return json({ ok: true, codigos_recuperacion: codigos });
+        }
+
+        // /api/readers/me/2fa/desactivar: contraseña + un código de la app o de recuperación
+        if (!yo.totp_activo) return json({ error: "No tienes la verificación en dos pasos activada." }, 400);
+        if (!(await passwordCorrecta())) return json({ error: "La contraseña no es correcta." }, 403);
+        const entradaDesactivar = String(cuerpoMe2fa.codigo || "").trim();
+        if (!entradaDesactivar || entradaDesactivar.length > 40) {
+          return json({ error: "Escribe un código de tu app o uno de recuperación." }, 400);
+        }
+        let codigoValido = false;
+        if (/^[\d\s]{6,8}$/.test(entradaDesactivar)) {
+          const secreto = await descifrarSecretoTotp(env, yo.totp_secret);
+          codigoValido = Boolean(secreto) && (await totpVerificar(secreto, entradaDesactivar, yo.totp_ultimo_paso)) !== null;
+        } else {
+          let guardados = [];
+          try { guardados = JSON.parse(yo.totp_recovery || "[]"); } catch { guardados = []; }
+          const hashIntento = await hashCodigoRecuperacion(entradaDesactivar);
+          codigoValido = guardados.some((h) => comparacionConstante(h, hashIntento));
+        }
+        if (!codigoValido) return json({ error: "Código incorrecto." }, 403);
+        await env.DB.prepare("UPDATE readers SET totp_secret = NULL, totp_activo = 0, totp_ultimo_paso = NULL, totp_recovery = NULL WHERE id = ?").bind(yo.id).run();
+        return json({ ok: true });
       }
 
       // ---------- Login/registro de lector con cuenta de Google ----------
@@ -16938,7 +22294,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/admin/mantenimiento/reparar-nombres-google" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ejecutar esto" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede ejecutar esto" }, 403);
 
         const { simular } = await request.json().catch(() => ({ simular: true }));
         const soloSimular = simular !== false;
@@ -16988,6 +22344,13 @@ async function handlePrimary(request, env, ctx) {
           await env.DB.prepare("UPDATE reader_sessions SET revoked_at = datetime('now') WHERE id = ?").bind(payload.sid).run();
         }
         return json({ ok: true });
+      }
+
+      // Guardadas, historial y sincronización: si faltan las tablas se crean antes de
+      // consultar (ver asegurarTablasLecturas). Un fallo aquí no tapa el error real.
+      if (path.startsWith("/api/readers/me/guardadas") || path.startsWith("/api/readers/me/historial") || path.startsWith("/api/readers/me/lecturas")) {
+        try { await asegurarTablasLecturas(env); }
+        catch (err) { console.error("[lecturas] no se pudieron asegurar las tablas:", err && err.message); }
       }
 
       // ---------- GUARDADAS PARA LEER LUEGO (cuenta del lector, punto 5) ----------
@@ -17161,10 +22524,121 @@ async function handlePrimary(request, env, ctx) {
         const payload = await requireReaderAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const lector = await env.DB.prepare(
-          "SELECT id, nombre, email, email_verificado, avatar_url, avisos_comentarios FROM readers WHERE id = ? AND activo = 1"
+          "SELECT id, nombre, email, email_verificado, avatar_url, avisos_comentarios, google_id, microsoft_id, discord_id, x_id FROM readers WHERE id = ? AND activo = 1"
         ).bind(payload.rid).first();
         if (!lector) return json({ error: "No autorizado" }, 401);
-        return json({ reader: { ...lector, email_verificado: !!lector.email_verificado, avisos_comentarios: !!lector.avisos_comentarios } });
+        // Los ids de los proveedores no salen del servidor: solo si la cuenta entra con uno (el
+        // borrado de cuenta pide el correo en vez de contraseña a esas cuentas).
+        const { google_id, microsoft_id, discord_id, x_id, ...publico } = lector;
+        return json({ reader: { ...publico, email_verificado: !!lector.email_verificado, avisos_comentarios: !!lector.avisos_comentarios,
+          acceso_externo: !!(google_id || microsoft_id || discord_id || x_id) } });
+      }
+
+      // ---------- DESCARGAR MIS DATOS (derechos de acceso y portabilidad) ----------
+      // GET /api/readers/me/exportar -> JSON con todo lo que la cuenta tiene guardado:
+      // perfil, comentarios (también los pendientes y los rechazados, con la IP con la que
+      // se enviaron), porras, noticias guardadas, historial, votos en encuestas, sesiones y
+      // suscripción al boletín. Nunca incluye la contraseña ni sus tokens.
+      if (path === "/api/readers/me/exportar" && method === "GET") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (await limiteExcedido(request, env, "lector-exportar", 5, 3600, String(payload.rid))) {
+          return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        }
+        const rid = payload.rid;
+        const lector = await env.DB.prepare("SELECT * FROM readers WHERE id = ? AND activo = 1").bind(rid).first();
+        if (!lector) return json({ error: "Cuenta no encontrada" }, 404);
+        const lista = async (sql, ...params) => {
+          try { return (await env.DB.prepare(sql).bind(...params).all()).results || []; }
+          catch { return []; } // tabla que aún no exista en este entorno
+        };
+        const [comentarios, porras, guardadas, historial, votos, sesiones, boletin] = await Promise.all([
+          lista(`SELECT c.id, c.article_id, a.titulo AS noticia, c.texto, c.estado, c.created_at, c.likes, c.dislikes,
+                        c.parent_id, c.ip
+                 FROM comments c LEFT JOIN articles a ON a.id = c.article_id
+                 WHERE c.reader_id = ? ORDER BY c.id`, rid),
+          lista(`SELECT p.resultado_id, r.equipo_local, r.equipo_visitante, r.fecha_partido,
+                        p.goles_local_predicho, p.goles_visitante_predicho, p.puntos_obtenidos, p.resultado_acierto, p.created_at
+                 FROM porras p LEFT JOIN results r ON r.id = p.resultado_id
+                 WHERE p.reader_id = ? ORDER BY p.id`, rid),
+          lista(`SELECT s.article_id, a.titulo, a.slug, s.created_at
+                 FROM reader_saved_articles s LEFT JOIN articles a ON a.id = s.article_id
+                 WHERE s.reader_id = ? ORDER BY s.created_at DESC`, rid),
+          lista(`SELECT h.article_id, a.titulo, a.slug, h.created_at
+                 FROM reader_reading_history h LEFT JOIN articles a ON a.id = h.article_id
+                 WHERE h.reader_id = ? ORDER BY h.created_at DESC`, rid),
+          lista(`SELECT v.poll_id, p.pregunta, o.texto AS opcion, v.created_at
+                 FROM poll_votes v LEFT JOIN polls p ON p.id = v.poll_id LEFT JOIN poll_options o ON o.id = v.option_id
+                 WHERE v.reader_id = ? ORDER BY v.id`, rid),
+          lista("SELECT user_agent, ip, created_at, last_seen_at, revoked_at FROM reader_sessions WHERE reader_id = ? ORDER BY created_at DESC", rid),
+          lista("SELECT activo, created_at, baja_at FROM newsletter_suscriptores WHERE lower(email) = lower(?)", lector.email),
+        ]);
+        return json({
+          exportado_el: new Date().toISOString(),
+          aviso: "Copia de los datos personales que ELOTROFÚTBOLTV guarda de tu cuenta de lector.",
+          perfil: {
+            id: lector.id, nombre: lector.nombre, email: lector.email,
+            email_verificado: !!lector.email_verificado, avatar_url: lector.avatar_url || null,
+            avisos_comentarios: !!lector.avisos_comentarios, creada_el: lector.created_at,
+            accesos_vinculados: ["google_id", "microsoft_id", "discord_id", "x_id"]
+              .filter((k) => lector[k]).map((k) => k.replace("_id", "")),
+          },
+          comentarios, porras, noticias_guardadas: guardadas, historial_de_lectura: historial,
+          votos_en_encuestas: votos, sesiones, boletin: boletin[0] || null,
+        });
+      }
+
+      // ---------- BORRAR MI CUENTA (derecho de supresión) ----------
+      // DELETE /api/readers/me  { password } o { confirmar_email }
+      // Pide la contraseña; las cuentas creadas con Google/Microsoft/Discord/X (que no tienen una
+      // que conozcan) pueden confirmar escribiendo su correo exacto. Un fallo de confirmación
+      // responde 400 y NO 401: el cliente cierra la sesión ante cualquier 401.
+      // Qué se borra: porras, guardadas, historial, votos de encuestas, sesiones, la suscripción al
+      // boletín con ese correo y la cuenta. Comentarios: se borran los que nadie ha respondido; los
+      // que ya tienen respuestas de otras personas se anonimizan (texto, nombre, correo e IP) para
+      // no llevarse por delante la conversación de los demás.
+      if (path === "/api/readers/me" && method === "DELETE") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (await limiteExcedido(request, env, "lector-borrar-cuenta", 5, 900, String(payload.rid))) {
+          return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        }
+        const cuerpo = await request.json().catch(() => ({}));
+        const lector = await env.DB.prepare("SELECT * FROM readers WHERE id = ?").bind(payload.rid).first();
+        if (!lector) return json({ error: "Cuenta no encontrada" }, 404);
+
+        const conAccesoExterno = !!(lector.google_id || lector.microsoft_id || lector.discord_id || lector.x_id);
+        let confirmado = false;
+        if (typeof cuerpo.password === "string" && cuerpo.password) {
+          if (cuerpo.password.length > 1024) return json({ error: "Datos no válidos" }, 400);
+          confirmado = comparacionConstante(await hashPassword(cuerpo.password, lector.salt), lector.password_hash);
+        }
+        if (!confirmado && conAccesoExterno && typeof cuerpo.confirmar_email === "string") {
+          confirmado = cuerpo.confirmar_email.trim().toLowerCase() === String(lector.email).trim().toLowerCase();
+        }
+        if (!confirmado) {
+          return json({ error: conAccesoExterno
+            ? "No se ha podido confirmar: escribe tu correo exacto (o tu contraseña, si tienes una)."
+            : "La contraseña no es correcta." }, 400);
+        }
+
+        const rid = lector.id;
+        await env.DB.batch([
+          env.DB.prepare(
+            `UPDATE comments SET texto = '[Comentario eliminado por su autor]', nombre = 'Cuenta eliminada', email = '', ip = NULL, reader_id = NULL
+             WHERE reader_id = ? AND EXISTS (
+               SELECT 1 FROM comments r WHERE r.parent_id = comments.id AND (r.reader_id IS NULL OR r.reader_id != ?))`
+          ).bind(rid, rid),
+          env.DB.prepare("DELETE FROM comments WHERE reader_id = ?").bind(rid),
+          env.DB.prepare("DELETE FROM poll_votes WHERE reader_id = ?").bind(rid),
+          env.DB.prepare("DELETE FROM porras WHERE reader_id = ?").bind(rid),
+          env.DB.prepare("DELETE FROM reader_saved_articles WHERE reader_id = ?").bind(rid),
+          env.DB.prepare("DELETE FROM reader_reading_history WHERE reader_id = ?").bind(rid),
+          env.DB.prepare("DELETE FROM reader_sessions WHERE reader_id = ?").bind(rid),
+          env.DB.prepare("DELETE FROM newsletter_suscriptores WHERE lower(email) = lower(?)").bind(lector.email),
+          env.DB.prepare("DELETE FROM readers WHERE id = ?").bind(rid),
+        ]);
+        return json({ ok: true });
       }
 
       // ---------- MIS SESIONES (dispositivos conectados) ----------
@@ -17711,7 +23185,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/debug/cron-partidos" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable" }, 403);
         const ahora = new Date();
         const ahoraSqlite = aSqliteDatetimeUTC(ahora);
         const { results: candidatos } = await env.DB.prepare(
@@ -17755,7 +23229,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/debug/cron-partidos/ejecutar" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable" }, 403);
         const antes = await env.DB.prepare(
           `SELECT id, equipo_local, equipo_visitante, fecha_partido, estado FROM results
            WHERE estado = 'programado' AND fecha_partido IS NOT NULL AND length(fecha_partido) = 16`
@@ -17788,7 +23262,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/debug/cron-partidos/limpiar-duplicados" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable" }, 403);
         const { results: duplicados } = await env.DB.prepare(
           `SELECT id, resultado_id FROM match_events WHERE tipo = 'inicio_partido' AND id NOT IN (
              SELECT MIN(id) FROM match_events WHERE tipo = 'inicio_partido' GROUP BY resultado_id
@@ -17812,7 +23286,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/debug/migrar-jornadas-calendario" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable" }, 403);
         if (!env.PGPOOL) return json({ error: "PGPOOL no disponible en este entorno" }, 400);
         try {
           const fs = await import("node:fs");
@@ -17833,6 +23307,24 @@ async function handlePrimary(request, env, ctx) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         return json({ user: payload });
+      }
+
+      // ---------- LAZO NEGRO EN EL LOGO DEL PANEL (solo para la persona afectada) ----------
+      // Si a esta persona se le concedió una excepcionalidad de actividad por el fallecimiento de un familiar,
+      // durante LUTO_HORAS el panel le muestra un lazo negro sobre el logo. Nadie más lo ve ni se entera: se
+      // calcula con su propia sesión y no se guarda nada aparte (sale de excepciones_actividad).
+      if (path === "/api/me/luto" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        let hasta = null;
+        try {
+          const fila = await env.DB.prepare(
+            "SELECT created_at FROM excepciones_actividad WHERE user_id = ? AND causa = 'fallecimiento_familiar' AND cancelada_at IS NULL ORDER BY id DESC LIMIT 1"
+          ).bind(payload.uid).first();
+          const creadaMs = fila ? msDesdeFechaBD(fila.created_at) : null;
+          if (creadaMs !== null && Date.now() < creadaMs + LUTO_HORAS * 3600 * 1000) hasta = new Date(creadaMs + LUTO_HORAS * 3600 * 1000).toISOString();
+        } catch (err) { /* sin tabla o sin datos: sin lazo */ }
+        return json({ luto: !!hasta, hasta });
       }
 
       // ---------- CAMBIO DE CONTRASEÑA PROPIA ----------
@@ -17993,14 +23485,32 @@ async function handlePrimary(request, env, ctx) {
           `SELECT id, user_agent, ip, created_at, last_seen_at FROM sessions
            WHERE user_id = ? AND revoked_at IS NULL ORDER BY last_seen_at DESC`
         ).bind(payload.uid).all();
-        const sesiones = results.map((s) => ({
-          id: s.id,
-          dispositivo: describirDispositivo(s.user_agent),
-          ip: s.ip || null,
-          created_at: s.created_at,
-          last_seen_at: s.last_seen_at,
-          actual: s.id === payload.sid,
-        }));
+        // Las filas de "sessions" no se borran al caducar el JWT (12 h), así
+        // que sin filtrar se acumulaban navegadores que ya no valen (y uno
+        // nuevo cada vez que el navegador cambiaba de versión/User-Agent).
+        // Se muestran solo las que siguen vivas (actividad en las últimas
+        // 24 h, o la actual) y, de esas, una por navegador+IP (la más reciente).
+        const limiteVivas = Date.now() - 24 * 60 * 60 * 1000;
+        const marcaTiempo = (v) => new Date(String(v || "").replace(" ", "T") + "Z").getTime() || 0;
+        const vistas = new Set();
+        const sesiones = [];
+        for (const s of results) { // ya vienen ordenadas por last_seen_at DESC
+          const actual = s.id === payload.sid;
+          if (!actual && marcaTiempo(s.last_seen_at) < limiteVivas) continue;
+          const dispositivo = describirDispositivo(s.user_agent);
+          const clave = `${dispositivo}|${s.ip || ""}`;
+          if (!actual && vistas.has(clave)) continue;
+          vistas.add(clave);
+          sesiones.push({
+            id: s.id,
+            dispositivo,
+            ip: s.ip || null,
+            created_at: s.created_at,
+            last_seen_at: s.last_seen_at,
+            actual,
+          });
+        }
+        sesiones.sort((a, b) => (b.actual ? 1 : 0) - (a.actual ? 1 : 0));
         return json({ sesiones });
       }
 
@@ -18093,7 +23603,29 @@ async function handlePrimary(request, env, ctx) {
         // muestre igual en todos los casos. Es de solo lectura aqui: la
         // propia persona lo ve pero no puede cambiarlo (ver PUT abajo).
         const equipos = parsearEquipos(user.equipo);
-        return json({ user: { ...user, avatar_foco: normalizarFoco(user.avatar_foco), equipo: equipos, redes_sociales: undefined, redes } });
+        // Campos ampliados del perfil (cargo, ciudad, artículo destacado). Van en una
+        // consulta aparte para que el perfil siga cargando si la migración
+        // (migracion_perfil_autores_v2.sql) aún no se ha ejecutado.
+        let extraPerfil = {};
+        try {
+          extraPerfil = (await env.DB.prepare("SELECT cargo, ciudad, articulo_destacado_id FROM users WHERE id = ?").bind(payload.uid).first()) || {};
+        } catch (e) { if (!esErrorColumnaFaltante(e)) throw e; }
+        // Noticias propias ya publicadas: opciones para elegir la destacada del perfil.
+        let articulosPropios = [];
+        try {
+          const { results: propios } = await env.DB.prepare(
+            "SELECT id, titulo, tipo FROM articles WHERE (autor_id = ? OR coautor_id = ?) AND publicado = 1 ORDER BY fecha_publicacion DESC LIMIT 60"
+          ).bind(payload.uid, payload.uid).all();
+          articulosPropios = propios || [];
+        } catch (e) { console.error("Perfil: no se pudieron listar las noticias propias:", e.message); }
+        return json({
+          user: {
+            ...user, avatar_foco: normalizarFoco(user.avatar_foco), equipo: equipos, redes_sociales: undefined, redes,
+            cargo: extraPerfil.cargo || "", ciudad: extraPerfil.ciudad || "",
+            articulo_destacado_id: extraPerfil.articulo_destacado_id || null,
+          },
+          articulos_propios: articulosPropios,
+        });
       }
 
       // ---------- EDITAR MI PERFIL (nombre / correo / bio / avatar / redes) ----------
@@ -18142,11 +23674,29 @@ async function handlePrimary(request, env, ctx) {
         const redesLimpias = {};
         if (body.redes && typeof body.redes === "object" && !Array.isArray(body.redes)) {
           for (const [key, val] of Object.entries(body.redes)) {
-            if (["twitter", "instagram", "tiktok", "youtube"].includes(key) && typeof val === "string" && val.trim() !== "") {
+            if (REDES_PERFIL_PERMITIDAS.includes(key) && typeof val === "string" && val.trim() !== "") {
               const urlRed = urlHttpsSegura(val);
               if (!urlRed) return json({ error: `El enlace de ${key} debe ser una URL https válida` }, 400);
               redesLimpias[key] = urlRed;
             }
+          }
+        }
+
+        // Campos ampliados. "undefined" = el cliente no los ha enviado (panel antiguo): no se tocan.
+        const textoCorto = (v) => (v === undefined ? undefined : (typeof v === "string" ? v.trim().replace(/\s+/g, " ").slice(0, 80) : ""));
+        const cargo = textoCorto(body.cargo);
+        const ciudad = textoCorto(body.ciudad);
+        let destacadoId;
+        if (body.articulo_destacado_id !== undefined) {
+          if (body.articulo_destacado_id === null || body.articulo_destacado_id === "") destacadoId = null;
+          else {
+            const n = Number(body.articulo_destacado_id);
+            if (!Number.isInteger(n) || n <= 0) return json({ error: "La noticia destacada no es válida" }, 400);
+            const propia = await env.DB.prepare(
+              "SELECT id FROM articles WHERE id = ? AND publicado = 1 AND (autor_id = ? OR coautor_id = ?)"
+            ).bind(n, payload.uid, payload.uid).first();
+            if (!propia) return json({ error: "Solo puedes destacar una noticia tuya que ya esté publicada" }, 400);
+            destacadoId = n;
           }
         }
 
@@ -18182,10 +23732,30 @@ async function handlePrimary(request, env, ctx) {
             .bind(nombre, email, bio, experiencia, avatarUrl, redesJson, user.id).run();
         }
 
+        if (cargo !== undefined || ciudad !== undefined || destacadoId !== undefined) {
+          try {
+            const previo = (await env.DB.prepare("SELECT cargo, ciudad, articulo_destacado_id FROM users WHERE id = ?").bind(user.id).first()) || {};
+            const nuevoCargo = cargo === undefined ? (previo.cargo || null) : (cargo || null);
+            const nuevaCiudad = ciudad === undefined ? (previo.ciudad || null) : (ciudad || null);
+            const nuevoDestacado = destacadoId === undefined ? (previo.articulo_destacado_id || null) : destacadoId;
+            await env.DB.prepare("UPDATE users SET cargo = ?, ciudad = ?, articulo_destacado_id = ? WHERE id = ?")
+              .bind(nuevoCargo, nuevaCiudad, nuevoDestacado, user.id).run();
+            if ((previo.cargo || null) !== nuevoCargo) cambios.push("cargo");
+            if ((previo.ciudad || null) !== nuevaCiudad) cambios.push("ciudad");
+            if ((previo.articulo_destacado_id || null) !== nuevoDestacado) cambios.push("noticia destacada");
+          } catch (err) {
+            if (!esErrorColumnaFaltante(err)) throw err;
+            console.error("No se pudieron guardar cargo/ciudad/destacada (falta migracion_perfil_autores_v2.sql):", err.message);
+          }
+        }
+
         // Mantenemos el mismo "sid": es la misma sesión de antes, solo
         // cambia el nombre incrustado en el JWT, así que no tiene sentido
         // crear una fila de sesión nueva por simplemente editar el perfil.
-        const token = await createJWT({ uid: user.id, username: user.username, nombre, rol: user.rol, sid: payload.sid }, env.JWT_SECRET);
+        // IMPORTANTE: se conserva "tfa" (segundo factor ya verificado en esta sesión). Los roles con 2FA
+        // obligatorio (Responsables) tienen sus tokens rechazados sin él (sesionSinSegundoFactor), así que
+        // al guardar el perfil el token nuevo daba 401 en la petición siguiente y devolvía a iniciar sesión.
+        const token = await createJWT({ uid: user.id, username: user.username, nombre, rol: user.rol, sid: payload.sid, ...(payload.tfa === true ? { tfa: true } : {}) }, env.JWT_SECRET);
         const descripcionCambios = cambios.length
           ? `${nombre} ha editado su perfil: ${cambios.join(", ")}`
           : `${nombre} ha guardado su perfil sin cambios`;
@@ -18242,7 +23812,7 @@ async function handlePrimary(request, env, ctx) {
           const nivelesFoto = Object.keys(NIVELES_FOTO_INFO).map((n) => ({
             nivel: Number(n),
             ...NIVELES_FOTO_INFO[n],
-            requisitos: null,
+            requisitos: NIVELES_FOTO_REQUISITOS[n] || null,
           }));
           // Dato informativo (NO es un requisito: no hay mínimos de partidos ni fotos).
           let actividad = { partidos: 0, fotos: 0 };
@@ -18254,7 +23824,7 @@ async function handlePrimary(request, env, ctx) {
           } catch { /* sin galerías: se queda en 0 */ }
           const racha = await calcularRachaSemanal(env, user);
           const insignias = await calcularInsignias(env, user, progreso.publicaciones);
-          return json({ ...progreso, niveles: nivelesFoto, actividad, racha, insignias });
+          return json({ ...progreso, niveles: nivelesFoto, actividad, racha, insignias, pases: construirPasesNiveles() });
         }
         const niveles = Object.keys(NIVELES_INFO).map((n) => ({
           nivel: Number(n),
@@ -18263,7 +23833,60 @@ async function handlePrimary(request, env, ctx) {
         }));
         const racha = user.rol === "admin" ? null : await calcularRachaSemanal(env, user);
         const insignias = await calcularInsignias(env, user, progreso.publicaciones);
-        return json({ ...progreso, niveles, racha, insignias });
+        return json({ ...progreso, niveles, racha, insignias, pases: construirPasesNiveles() });
+      }
+
+      // ---------- ESTADÍSTICAS PERSONALES DE LA CUENTA (ver construirEstadisticasCuenta) ----------
+      // La propia persona ve las suyas en Ajustes de cuenta > Estadísticas. Solo lectura.
+      if (path === "/api/me/estadisticas" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const user = await env.DB.prepare("SELECT id, nombre, rol, nivel, created_at FROM users WHERE id = ?").bind(payload.uid).first();
+        if (!user) return json({ error: "Usuario no encontrado" }, 404);
+        return json(await construirEstadisticasCuenta(env, user));
+      }
+
+      // ---------- RESUMEN DE INICIO DEL PANEL (ver construirResumenInicio) ----------
+      // Datos de la redacción para la pestaña «Inicio»; qué bloques salen depende del rol. Solo lectura.
+      if (path === "/api/me/resumen-inicio" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const user = await env.DB.prepare("SELECT id, nombre, rol, nivel, nivel_nota, equipo, created_at FROM users WHERE id = ?").bind(payload.uid).first();
+        if (!user) return json({ error: "Usuario no encontrado" }, 404);
+        return json(await construirResumenInicio(env, user));
+      }
+
+      // Anuncio fijado de Inicio (lo ve todo el equipo): solo un Responsable lo publica o lo retira.
+      // Texto vacío = retirar el anuncio. «caduca» (AAAA-MM-DD) es opcional: pasado ese día deja de mostrarse.
+      if (path === "/api/inicio/anuncio" && (method === "PUT" || method === "DELETE")) {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede fijar un anuncio" }, 403);
+        let body = {};
+        if (method === "PUT") { try { body = await request.json(); } catch { body = {}; } }
+        const texto = String(body.texto || "").trim();
+        if (method === "DELETE" || !texto) {
+          await env.DB.prepare("DELETE FROM settings WHERE key = ?").bind(INICIO_ANUNCIO_KEY).run();
+          return json({ anuncio: null });
+        }
+        if (texto.length > INICIO_ANUNCIO_MAX_TEXTO) return json({ error: `El texto no puede pasar de ${INICIO_ANUNCIO_MAX_TEXTO} caracteres` }, 400);
+        const titulo = String(body.titulo || "").trim();
+        if (titulo.length > INICIO_ANUNCIO_MAX_TITULO) return json({ error: `El título no puede pasar de ${INICIO_ANUNCIO_MAX_TITULO} caracteres` }, 400);
+        const caduca = body.caduca ? String(body.caduca) : null;
+        if (caduca && !/^\d{4}-\d{2}-\d{2}$/.test(caduca)) return json({ error: "La fecha de caducidad no es válida (AAAA-MM-DD)" }, 400);
+        const quien = await env.DB.prepare("SELECT nombre FROM users WHERE id = ?").bind(payload.uid).first();
+        await env.DB.prepare(
+          "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+        ).bind(INICIO_ANUNCIO_KEY, JSON.stringify({ titulo, texto, caduca, autor: (quien && quien.nombre) || "" })).run();
+        return json({ anuncio: await leerAnuncioInicio(env) });
+      }
+
+      // ---------- RESUMEN DE ESTADÍSTICAS DE TODAS LAS CUENTAS (solo Responsables; tabla de Usuarios) ----------
+      if (path === "/api/users/estadisticas-resumen" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede ver las estadísticas del equipo" }, 403);
+        return json(await construirResumenEstadisticasUsuarios(env));
       }
 
       // ---------- RUTA DE BIENVENIDA (14 días): ver calcularRutaBienvenida ----------
@@ -18373,7 +23996,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/reconocimientos/gestion" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar los reconocimientos" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede gestionar los reconocimientos" }, 403);
         const estado = resumenMesEstado(resumenMesFechaMadrid());
         const mes = url.searchParams.get("mes") || estado.ultimo_mes_disponible;
         if (!resumenMesValido(mes)) return json({ error: "Mes no válido (usa AAAA-MM)" }, 400);
@@ -18391,7 +24014,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/reconocimientos/gestion" && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar los reconocimientos" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede gestionar los reconocimientos" }, 403);
         let body = {};
         try { body = await request.json(); } catch { body = {}; }
         const estado = resumenMesEstado(resumenMesFechaMadrid());
@@ -18458,7 +24081,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/settings" && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede modificar las redes sociales" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede modificar las redes sociales" }, 403);
         const body = await request.json();
         if (!body.redes || typeof body.redes !== "object" || Array.isArray(body.redes)) {
           return json({ error: "Faltan las redes sociales" }, 400);
@@ -18485,6 +24108,39 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true, redes: redesLimpias });
       }
 
+      // ---------- ELIMINATORIAS Y PLAYOFFS (automáticos) ----------
+      // GET público. Los cuadros se generan solos con la clasificación y los partidos
+      // de results (ver ELIM_LIGAS); no hay nada que guardar ni editar.
+      if (path === "/api/eliminatorias" && method === "GET") {
+        if (url.searchParams.get("debug") === "1") {
+          // Solo recuentos (nada personal): qué lee el generador de cada liga y por qué sale o no el cuadro.
+          const diag = { ahora: new Date().toISOString(), ligas: {} };
+          try {
+            const ahora = new Date();
+            diag.temporada = elimTemporada(ahora);
+            const ligas = await elimLeerLigas(env, ahora);
+            for (const [comp, filas] of Object.entries(ligas)) {
+              const an = elimAnalizarLiga(filas, calcularClasificacionBoletin);
+              diag.ligas[comp] = {
+                filas: filas.length, fuera_de_liga: an.fuera.length,
+                grupos: an.grupos.map((g) => ({
+                  grupo: g.grupo, equipos_con_partido_jugado: g.tabla.length, ultima_jornada: g.ultima,
+                  completo: g.completo, empezada: g.empezada,
+                })),
+              };
+            }
+            diag.cuadros = elimGenerarCuadros(ligas, calcularClasificacionBoletin, ahora).map((c) => c.id);
+          } catch (err) { diag.error = String((err && err.message) || err); }
+          return json(diag);
+        }
+        let cuadros = [];
+        try {
+          const ahora = new Date();
+          cuadros = elimGenerarCuadros(await elimLeerLigas(env, ahora), calcularClasificacionBoletin, ahora);
+        } catch (err) { console.error("eliminatorias: no se pudieron generar los cuadros", err); }
+        return json({ cuadros });
+      }
+
       // ---------- ORGANIGRAMA (Funcionalidades > Información) ----------
       // Lo puede consultar cualquier usuario con sesión; solo un admin lo modifica.
       if (path === "/api/organigrama" && method === "GET") {
@@ -18504,7 +24160,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/organigrama" && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede modificar el organigrama" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede modificar el organigrama" }, 403);
         let body;
         try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
         const r = limpiarOrganigrama(body);
@@ -18520,13 +24176,420 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true, ...r.datos });
       }
 
+      // ---------- GRUPOS DE TRABAJO (solo para organizarse; no cambian permisos) ----------
+      // Lo puede consultar cualquier usuario con sesión; solo un admin crea grupos y asigna personas.
+      if (path === "/api/grupos-trabajo" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        return json(await respuestaGruposTrabajo(env, payload));
+      }
+
+      if (path === "/api/grupos-trabajo" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede modificar los grupos de trabajo" }, 403);
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
+        const r = limpiarGruposTrabajo(body);
+        if (r.error) return json({ error: r.error }, 400);
+        const previo = await leerGruposTrabajo(env);
+        const vivos = new Set(r.grupos.map((g) => g.id));
+        const asignaciones = {};
+        for (const [uid, gid] of Object.entries(previo.asignaciones)) if (vivos.has(gid)) asignaciones[uid] = gid;
+        await guardarGruposTrabajo(env, podarLideresGrupos({ grupos: r.grupos, asignaciones, lideres: previo.lideres }));
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "editar_settings", entidad: "settings",
+          descripcion: `Ha modificado los grupos de trabajo (${r.grupos.length} grupos)`,
+        }));
+        return json({ ok: true, ...(await respuestaGruposTrabajo(env, payload)) });
+      }
+
+      if (path === "/api/grupos-trabajo/asignar" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede asignar grupos de trabajo" }, 403);
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
+        const bruto = Array.isArray(body && body.user_ids) ? body.user_ids : [body && body.user_id];
+        const userIds = [...new Set(bruto.map((v) => parseInt(v, 10)).filter((n) => Number.isInteger(n) && n > 0))];
+        if (!userIds.length) return json({ error: "Falta la persona a la que asignar el grupo" }, 400);
+        if (userIds.length > 200) return json({ error: "Demasiadas personas a la vez" }, 400);
+        const datos = await leerGruposTrabajo(env);
+        const grupoId = body.grupo_id === null || body.grupo_id === undefined || body.grupo_id === "" ? null : String(body.grupo_id);
+        if (grupoId !== null && !datos.grupos.some((g) => g.id === grupoId)) return json({ error: "Ese grupo de trabajo no existe" }, 400);
+        const grupoElegido = grupoId === null ? null : datos.grupos.find((g) => g.id === grupoId);
+        const nivelGrupo = grupoElegido ? nivelRedactorDeGrupo(grupoElegido.nombre) : null;
+        const usuariosNivel = [];
+        const nombres = [];
+        for (const uid of userIds) {
+          const u = await env.DB.prepare("SELECT id, nombre, rol, nivel FROM users WHERE id = ?").bind(uid).first();
+          if (!u) return json({ error: `No existe el usuario #${uid}` }, 404);
+          if (grupoId !== null && !puedeTenerGrupoTrabajo(u.rol)) return json({ error: `${u.nombre} es ${u.rol === "fotografo" ? "fotógrafo" : "de un rol sin grupos"}: los grupos de trabajo son solo para redactores y Responsables` }, 400);
+          nombres.push(u.nombre);
+          const previoId = datos.asignaciones[String(uid)] || null;
+          if (grupoId === null) delete datos.asignaciones[String(uid)];
+          else datos.asignaciones[String(uid)] = grupoId;
+          if (u.rol === "redactor") usuariosNivel.push({ u, previoId });
+        }
+        podarLideresGrupos(datos); // quien sale de un grupo deja de ser su Sub-Responsable
+        await guardarGruposTrabajo(env, datos);
+        const grupo = datos.grupos.find((g) => g.id === grupoId);
+        // Grupos «Redacción nivel N»: al entrar, el redactor pasa a ese nivel (se recuerda el que tenía);
+        // al salir a un grupo sin nivel o sin grupo, vuelve al que tenía, salvo que un Responsable
+        // le haya cambiado el nivel a mano mientras tanto.
+        const nivelesCambiados = [];
+        const previos = await leerNivelesPreviosGrupos(env);
+        let previosTocados = false;
+        for (const { u, previoId } of usuariosNivel) {
+          const clave = String(u.id);
+          const nivelActual = nivelEfectivoUsuario(u);
+          const gPrev = previoId ? datos.grupos.find((g) => g.id === previoId) : null;
+          const nivelGPrev = gPrev ? nivelRedactorDeGrupo(gPrev.nombre) : null;
+          let nuevo = null;
+          let motivo = "";
+          if (nivelGrupo !== null) {
+            nuevo = nivelGrupo;
+            motivo = `Grupo de trabajo «${grupo.nombre}»`;
+            if (nuevo !== nivelActual && previos[clave] === undefined) { previos[clave] = nivelActual; previosTocados = true; }
+          } else if (previoId !== grupoId && previos[clave] !== undefined) {
+            if (nivelGPrev !== null && nivelActual === nivelGPrev) {
+              nuevo = previos[clave];
+              motivo = `Sale del grupo de trabajo «${gPrev.nombre}»: vuelve a su nivel anterior`;
+            }
+            delete previos[clave];
+            previosTocados = true;
+          }
+          if (nuevo === null || nuevo === nivelActual) continue;
+          await env.DB.prepare("UPDATE users SET nivel = ?, nivel_nota = NULL WHERE id = ?").bind(nuevo, u.id).run();
+          await env.DB.prepare(
+            `INSERT INTO nivel_historial (usuario_id, usuario_nombre, nivel_anterior, nivel_nuevo, motivo, cambiado_por_id, cambiado_por_nombre)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).bind(u.id, u.nombre, nivelActual, nuevo, motivo, payload.uid, payload.nombre).run();
+          nivelesCambiados.push({ id: Number(u.id), nivel: nuevo });
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "cambiar_nivel_usuario", entidad: "usuario", entidad_id: u.id,
+            descripcion: `Ha ${nuevo > nivelActual ? "subido" : "bajado"} el nivel de "${u.nombre}" de ${etiquetaNivelUsuario(u, nivelActual)} a ${etiquetaNivelUsuario(u, nuevo)} (${motivo})`,
+            detalle: { nivel_anterior: nivelActual, nivel_nuevo: nuevo, nota: motivo },
+          }));
+        }
+        if (previosTocados) { try { await guardarNivelesPreviosGrupos(env, previos); } catch (err) { console.error("niveles previos de grupos: no se pudo guardar", err); } }
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "editar_settings", entidad: "settings",
+          descripcion: grupo
+            ? `Ha puesto en el grupo de trabajo "${grupo.nombre}" a ${nombres.join(", ")}`
+            : `Ha quitado del grupo de trabajo a ${nombres.join(", ")}`,
+        }));
+        return json({ ok: true, niveles_cambiados: nivelesCambiados, ...(await respuestaGruposTrabajo(env, payload)) });
+      }
+
+      // Sub-Responsable de un grupo de trabajo (su líder). Solo un Responsable (admin) lo nombra; la
+      // persona tiene que ser miembro activo del grupo. Con user_id null el grupo se queda sin líder.
+      // Por sí solo no da permisos: es el cargo que se ve en el equipo.
+      if (path === "/api/grupos-trabajo/lider" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede nombrar Sub-Responsables" }, 403);
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
+        const datos = await leerGruposTrabajo(env);
+        const grupoId = body && body.grupo_id != null ? String(body.grupo_id) : "";
+        const grupo = datos.grupos.find((g) => g.id === grupoId);
+        if (!grupo) return json({ error: "Ese grupo de trabajo no existe" }, 400);
+        const quitar = body.user_id === null || body.user_id === undefined || body.user_id === "";
+        let nombre = "";
+        if (quitar) {
+          delete datos.lideres[grupoId];
+        } else {
+          const uid = parseInt(body.user_id, 10);
+          if (!Number.isInteger(uid) || uid <= 0) return json({ error: "Persona no válida" }, 400);
+          const u = await env.DB.prepare("SELECT id, nombre, rol, activo FROM users WHERE id = ?").bind(uid).first();
+          if (!u) return json({ error: `No existe el usuario #${uid}` }, 404);
+          if (Number(u.activo) !== 1) return json({ error: `${u.nombre} tiene la cuenta desactivada` }, 400);
+          if (!puedeTenerGrupoTrabajo(u.rol)) return json({ error: `${u.nombre} es fotógrafo: los grupos de trabajo son solo para redactores y Responsables` }, 400);
+          if (datos.asignaciones[String(uid)] !== grupoId) return json({ error: `${u.nombre} no está en el grupo «${grupo.nombre}»: primero hay que ponerle en el grupo` }, 400);
+          nombre = u.nombre;
+          datos.lideres[grupoId] = uid;
+        }
+        await guardarGruposTrabajo(env, podarLideresGrupos(datos));
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "editar_settings", entidad: "settings",
+          descripcion: quitar
+            ? `Ha dejado sin Sub-Responsable el grupo de trabajo "${grupo.nombre}"`
+            : `Ha nombrado a ${nombre} ${tituloCargo("Sub-Responsable", [grupo.nombre])}`,
+        }));
+        return json({ ok: true, ...(await respuestaGruposTrabajo(env, payload)) });
+      }
+
+      // ---------- RESPONSABLES (los antiguos "Responsables") y sus funciones ----------
+      // Lo ve cualquier persona con sesión; las funciones las pone un Responsable (máximo dos cada uno).
+      if (path === "/api/responsables" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const funciones = await leerFuncionesResponsables(env);
+        const { results } = await env.DB.prepare("SELECT id, nombre, avatar_url FROM users WHERE rol = 'admin' AND activo = 1 ORDER BY nombre").all();
+        return json({
+          responsables: (results || []).map((u) => ({
+            id: u.id, nombre: u.nombre, avatar: u.avatar_url || null,
+            funciones: funciones[String(u.id)] || [],
+            cargo: tituloCargo("Responsable", funciones[String(u.id)] || []),
+          })),
+        });
+      }
+
+      if (path === "/api/responsables/funciones" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede cambiar las funciones" }, 403);
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
+        const uid = parseInt(body && body.user_id, 10);
+        if (!Number.isInteger(uid) || uid <= 0) return json({ error: "Falta la persona" }, 400);
+        const u = await env.DB.prepare("SELECT id, nombre, rol FROM users WHERE id = ?").bind(uid).first();
+        if (!u) return json({ error: `No existe el usuario #${uid}` }, 404);
+        if (u.rol !== "admin") return json({ error: `${u.nombre} no es Responsable: las funciones son solo para Responsables` }, 400);
+        const r = limpiarFuncionesResponsable(body.funciones);
+        if (r.error) return json({ error: r.error }, 400);
+        const mapa = await leerFuncionesResponsables(env);
+        if (r.funciones.length) mapa[String(uid)] = r.funciones; else delete mapa[String(uid)];
+        await guardarFuncionesResponsables(env, mapa);
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "editar_settings", entidad: "settings",
+          descripcion: `Ha dejado a ${u.nombre} como ${tituloCargo("Responsable", r.funciones)}`,
+        }));
+        return json({ ok: true, user_id: uid, funciones: r.funciones, cargo: tituloCargo("Responsable", r.funciones) });
+      }
+
+      // ---------- SUB-RESPONSABLES DE ÁREAS (Acreditaciones y otras que no son grupos de trabajo) ----------
+      // Lo ve cualquier persona con sesión; solo un Responsable nombra o quita Sub-Responsables y gestiona las áreas.
+      if (path === "/api/subresponsables" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        return json(await respuestaAreasSub(env));
+      }
+
+      // Cargos de quien pregunta: el panel lo consulta al arrancar para saber qué pestañas enseñar.
+      if (path === "/api/mis-cargos" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const datos = await leerAreasSub(env);
+        const propias = AREAS_SUB_ROLES.includes(payload.rol) ? areasDeUsuarioSub(datos, payload.uid) : [];
+        return json({
+          sub_responsable_de: propias.map((a) => ({ id: a.id, titulo: tituloArea(a), permiso: a.permiso || null })),
+          puede_gestionar_acreditaciones: await puedeGestionarAcreditaciones(env, payload),
+        });
+      }
+
+      // Crea, renombra o borra áreas (la de acreditaciones es fija). Quien estaba en un área borrada la pierde.
+      if (path === "/api/subresponsables/areas" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede gestionar las áreas" }, 403);
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
+        const r = limpiarAreasSub(body && body.areas);
+        if (r.error) return json({ error: r.error }, 400);
+        const datos = await leerAreasSub(env);
+        const vivas = new Set(r.areas.map((a) => a.id));
+        const asignaciones = {};
+        for (const [aid, lista] of Object.entries(datos.asignaciones)) if (vivas.has(aid)) asignaciones[aid] = lista;
+        await guardarAreasSub(env, { areas: r.areas, asignaciones });
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "editar_settings", entidad: "settings",
+          descripcion: `Ha actualizado las áreas de Sub-Responsables (${r.areas.map((a) => a.nombre).join(", ")})`,
+        }));
+        return json({ ok: true, ...(await respuestaAreasSub(env)) });
+      }
+
+      // Nombra (o quita) a un Sub-Responsable de un área. Hasta AREAS_SUB_PERSONAS_MAX personas por área.
+      if (path === "/api/subresponsables/asignar" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede nombrar Sub-Responsables" }, 403);
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
+        const datos = await leerAreasSub(env);
+        const area = datos.areas.find((a) => a.id === String(body && body.area_id != null ? body.area_id : ""));
+        if (!area) return json({ error: "Esa área no existe" }, 400);
+        const uid = parseInt(body && body.user_id, 10);
+        if (!Number.isInteger(uid) || uid <= 0) return json({ error: "Persona no válida" }, 400);
+        const quitar = body.quitar === true;
+        const lista = datos.asignaciones[area.id] || [];
+        const u = await env.DB.prepare("SELECT id, nombre, rol, activo FROM users WHERE id = ?").bind(uid).first();
+        if (!u) return json({ error: `No existe el usuario #${uid}` }, 404);
+        if (quitar) {
+          const resto = lista.filter((x) => x !== uid);
+          if (resto.length) datos.asignaciones[area.id] = resto; else delete datos.asignaciones[area.id];
+        } else {
+          if (Number(u.activo) !== 1) return json({ error: `${u.nombre} tiene la cuenta desactivada` }, 400);
+          if (u.rol === "admin") return json({ error: `${u.nombre} ya es Responsable: puede gestionarlo todo sin ser Sub-Responsable` }, 400);
+          if (!AREAS_SUB_ROLES.includes(u.rol)) return json({ error: `${u.nombre} es fotógrafo: los Sub-Responsables de área son solo para redactores` }, 400);
+          if (!lista.includes(uid)) {
+            if (lista.length >= AREAS_SUB_PERSONAS_MAX) return json({ error: `«${area.nombre}» ya tiene ${AREAS_SUB_PERSONAS_MAX} Sub-Responsables` }, 400);
+            datos.asignaciones[area.id] = [...lista, uid];
+          }
+        }
+        await guardarAreasSub(env, datos);
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "editar_settings", entidad: "settings",
+          descripcion: quitar
+            ? `Ha quitado a ${u.nombre} como ${tituloArea(area)}`
+            : `Ha nombrado a ${u.nombre} ${tituloArea(area)}`,
+        }));
+        return json({ ok: true, ...(await respuestaAreasSub(env)) });
+      }
+
       // ---------- RESPONSABILIDADES ESPECÍFICAS (Funcionalidades > Responsabilidades) ----------
       // Checklists de clubes (relaciones institucionales y recursos humanos) y lista
-      // de personas a fichar. Es cosa exclusiva de un administrador (leer y escribir).
+      // de personas a fichar. Es cosa exclusiva de un Responsable (leer y escribir).
+      // ---------- RESPONSABILIDADES > REDACCIÓN / FOTOGRAFÍA: control de niveles ----------
+      // Ver respuestaNivelesResp. Solo Responsables. La decisión «subir» revalida los requisitos en el servidor
+      // y deja constancia igual que PUT /api/users/:id/nivel (nivel_historial + historial de actividad).
+      // Preferencia del aviso POR CORREO de niveles (el push se activa en la campanita, categoría «niveles»).
+      if (path === "/api/responsabilidades/niveles/avisos" && (method === "GET" || method === "PUT")) {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede configurar estos avisos" }, 403);
+        const clave = `niveles_avisos_email_off:${payload.uid}`;
+        if (method === "PUT") {
+          const b = await request.json().catch(() => null);
+          if (!b || typeof b.email !== "boolean") return json({ error: "Indica si quieres el aviso por correo (true o false)" }, 400);
+          if (b.email) await env.DB.prepare("DELETE FROM settings WHERE key = ?").bind(clave).run();
+          else await env.DB.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, '1', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = datetime('now')").bind(clave).run();
+        }
+        return json({ ok: true, email: await nivelesAvisosEmailActivo(env, payload.uid) });
+      }
+
+      if (path === "/api/responsabilidades/niveles" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede ver los niveles" }, 403);
+        const area = url.searchParams.get("area") || "redaccion";
+        if (!NIVELES_RESP_AREAS[area]) return json({ error: "Área no válida (redaccion o fotografia)" }, 400);
+        return json(await respuestaNivelesResp(env, area));
+      }
+
+      if (path === "/api/responsabilidades/niveles/decision" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede decidir ascensos" }, 403);
+        const b = await request.json().catch(() => null);
+        const id = parseInt(b && b.usuario_id);
+        const decision = b && b.decision;
+        if (!Number.isInteger(id) || id <= 0) return json({ error: "Indica a qué persona se refiere" }, 400);
+        if (decision !== "subir" && decision !== "aplazar") return json({ error: "La decisión debe ser «subir» o «aplazar»" }, 400);
+        const nota = typeof b.nota === "string" ? b.nota.trim().slice(0, 500) : "";
+        const user = await env.DB.prepare("SELECT id, nombre, nivel, rol, activo FROM users WHERE id = ?").bind(id).first();
+        if (!user || Number(user.activo) !== 1) return json({ error: "Usuario no encontrado" }, 404);
+        const area = user.rol === "fotografo" ? "fotografia" : (user.rol === "redactor" ? "redaccion" : null);
+        if (!area) return json({ error: "Solo se decide el nivel de redactores y fotógrafos" }, 400);
+        const maximo = area === "fotografia" ? NIVEL_MAXIMO_FOTOGRAFO : NIVEL_MAXIMO;
+        const nivelAnterior = nivelEfectivoUsuario(user);
+        if (nivelAnterior >= maximo) return json({ error: "Ya está en el nivel máximo" }, 400);
+        const nuevoNivel = nivelAnterior + 1;
+        const requisitos = area === "fotografia" ? NIVELES_FOTO_REQUISITOS[nuevoNivel] : NIVELES_REQUISITOS[nuevoNivel];
+        const conteo = area === "fotografia"
+          ? ((await actividadFotografosResp(env)).get(Number(user.id)) || { partidos: 0, fotos: 0 })
+          : await contarPublicacionesPorTipo(env, user.id);
+        const ev = evaluarProgresoNivelResp(conteo, requisitos);
+        if (!ev.cumple) return json({ error: "Todavía no cumple los requisitos del siguiente nivel" }, 409);
+        await asegurarTablaNivelValoraciones(env);
+
+        if (decision === "aplazar") {
+          await env.DB.prepare(
+            "INSERT INTO nivel_valoraciones (usuario_id, nivel_objetivo, decision, nota, decidido_por_id, decidido_por_nombre) VALUES (?, ?, 'aplazado', ?, ?, ?)"
+          ).bind(user.id, nuevoNivel, nota || null, payload.uid, payload.nombre || "Responsable").run();
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "valorar_nivel_usuario", entidad: "usuario", entidad_id: user.id,
+            descripcion: `Ha decidido que "${user.nombre}" todavía no suba a ${etiquetaNivelUsuario(user, nuevoNivel)}${nota ? `: ${nota}` : ""}`,
+            detalle: { nivel_actual: nivelAnterior, nivel_objetivo: nuevoNivel, decision: "aplazado", nota: nota || null },
+          }));
+          return json({ ok: true, decision: "aplazado" });
+        }
+
+        await env.DB.prepare("UPDATE users SET nivel = ?, nivel_nota = ? WHERE id = ?").bind(nuevoNivel, nota || null, user.id).run();
+        await env.DB.prepare(
+          `INSERT INTO nivel_historial (usuario_id, usuario_nombre, nivel_anterior, nivel_nuevo, motivo, cambiado_por_id, cambiado_por_nombre)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).bind(user.id, user.nombre, nivelAnterior, nuevoNivel, nota || null, payload.uid, payload.nombre || "Responsable").run();
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "cambiar_nivel_usuario", entidad: "usuario", entidad_id: user.id,
+          descripcion: `Ha subido el nivel de "${user.nombre}" de ${etiquetaNivelUsuario(user, nivelAnterior)} a ${etiquetaNivelUsuario(user, nuevoNivel)}${nota ? `: ${nota}` : ""}`,
+          detalle: { nivel_anterior: nivelAnterior, nivel_nuevo: nuevoNivel, nota: nota || null },
+        }));
+        return json({ ok: true, decision: "subido", nivel_nuevo: nuevoNivel, etiqueta: etiquetaNivelUsuario(user, nuevoNivel) });
+      }
+
+      // Fotógrafos con la acreditación aprobada y estado de la galería de su partido (¿publicada o no?).
+      // Solo lectura y solo Responsables, igual que /api/responsabilidades.
+      if (path === "/api/responsabilidades/fotografia" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede ver las responsabilidades" }, 403);
+        return json(await respuestaFotografiaResp(env));
+      }
+
+      // Recordatorio MANUAL de galería: el Responsable lo manda con un clic a uno o a todos los fotógrafos
+      // cuya galería NO está publicada (partido ya jugado). Mismo correo que el recordatorio automático.
+      // Solo en el Worker principal (D1): el secundario responde 503 para no duplicar correos.
+      // Antirrebote: no se vuelve a avisar a la misma solicitud y partido antes de 12 h (cuenta también el
+      // aviso automático, porque comparten la tabla recordatorios_galeria).
+      if (path === "/api/responsabilidades/fotografia/recordar" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede enviar recordatorios" }, 403);
+        const b = await request.json().catch(() => null);
+        const ids = [...new Set((Array.isArray(b && b.ids) ? b.ids : [b && b.id]).map(Number).filter((n) => Number.isInteger(n) && n > 0))].slice(0, 30);
+        if (!ids.length) return json({ error: "Indica a qué fotógrafo recordar" }, 400);
+        await asegurarTablaRecordatoriosGaleria(env);
+        const ahora = Date.now();
+        const desde = diaYHoraEnMadrid(new Date(ahora - FOTOGRAFIA_RESP_ATRAS_DIAS * 86400000)).dia;
+        const hasta = diaYHoraEnMadrid(new Date(ahora + FOTOGRAFIA_RESP_ADELANTE_DIAS * 86400000)).dia;
+        const { results: partidos } = await consultaConAlternativas(env, [
+          "SELECT id, competicion, jornada, equipo_local, equipo_visitante, goles_local, goles_visitante, fecha_partido, estado FROM results WHERE substr(fecha_partido, 1, 10) >= ? AND substr(fecha_partido, 1, 10) <= ? LIMIT 6000",
+        ], [desde, hasta]);
+        const resultados = [];
+        for (const id of ids) {
+          const marca = (estado, extra = {}) => resultados.push({ id, estado, ...extra });
+          const a = await env.DB.prepare(
+            `SELECT id, nombre, email, equipo, tipo_acreditacion, jornada_partido, fecha_partido FROM acreditaciones WHERE id = ? AND estado = 'aprobada'`
+          ).bind(id).first().catch(() => null);
+          if (!a || !esAcreditacionFotografo(a.tipo_acreditacion)) { marca("no_encontrada"); continue; }
+          if (!String(a.email || "").trim()) { marca("sin_correo", { nombre: a.nombre }); continue; }
+          const partido = partidoDeAcreditacionGaleria(a, partidos || []);
+          if (!partido) { marca("sin_partido", { nombre: a.nombre }); continue; }
+          if (String(partido.estado) !== "finalizado") { marca("pendiente", { nombre: a.nombre }); continue; }
+          // Pasada una semana del partido ya no se recuerda (el panel tampoco enseña el botón).
+          const diaPartido = String(partido.fecha_partido || "").slice(0, 10);
+          const limiteAntiguo = diaYHoraEnMadrid(new Date(ahora - 7 * 86400000)).dia;
+          if (/^\d{4}-\d{2}-\d{2}$/.test(diaPartido) && diaPartido < limiteAntiguo) { marca("antiguo", { nombre: a.nombre }); continue; }
+          const pub = await consultaConAlternativas(env, [
+            "SELECT COUNT(*) AS n FROM match_gallery mg JOIN media m ON m.id = mg.media_id WHERE mg.result_id = ? AND COALESCE(m.visibilidad, 'publico') = 'publico'",
+            "SELECT COUNT(*) AS n FROM match_gallery WHERE result_id = ?",
+          ], [partido.id]);
+          if (Number(((pub.results || [])[0] || {}).n) > 0) { marca("ya_publicada", { nombre: a.nombre }); continue; }
+          const previo = await env.DB.prepare("SELECT enviado_at FROM recordatorios_galeria WHERE acreditacion_id = ? AND result_id = ?").bind(a.id, partido.id).first();
+          const previoMs = previo && previo.enviado_at ? msDesdeFechaBD(previo.enviado_at) : null;
+          if (previoMs !== null && ahora - previoMs < 12 * 3600 * 1000) { marca("reciente", { nombre: a.nombre, enviado_at: previo.enviado_at }); continue; }
+          const cuenta = await env.DB.prepare("SELECT id FROM users WHERE LOWER(email) = ? AND activo = 1 LIMIT 1").bind(String(a.email).trim().toLowerCase()).first();
+          const ok = await enviarCorreoRecordatorioGaleria(env, a, partido, { tieneCuenta: !!cuenta });
+          if (!ok) { marca("fallo", { nombre: a.nombre }); continue; }
+          await env.DB.prepare("INSERT OR REPLACE INTO recordatorios_galeria (acreditacion_id, result_id, email) VALUES (?, ?, ?)").bind(a.id, partido.id, a.email).run();
+          marca("enviado", { nombre: a.nombre });
+        }
+        const enviados = resultados.filter((r) => r.estado === "enviado");
+        if (enviados.length) {
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "recordatorio_galeria_manual", entidad: "acreditacion", entidad_id: enviados.length === 1 ? enviados[0].id : null,
+            descripcion: enviados.length === 1 ? `Ha recordado la galería a ${enviados[0].nombre}` : `Ha recordado la galería a ${enviados.length} fotógrafos`,
+          }));
+        }
+        return json({ ok: true, enviados: enviados.length, resultados });
+      }
+
       if (path === "/api/responsabilidades" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las responsabilidades" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede ver las responsabilidades" }, 403);
         const row = await env.DB.prepare("SELECT value, updated_at FROM settings WHERE key = 'responsabilidades'").first();
         let datos = responsabilidadesVacias();
         if (row) {
@@ -18541,7 +24604,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/responsabilidades" && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede modificar las responsabilidades" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede modificar las responsabilidades" }, 403);
         let body;
         try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
         const r = limpiarResponsabilidades(body);
@@ -18590,7 +24653,7 @@ async function handlePrimary(request, env, ctx) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         const art = await env.DB.prepare(
-          "SELECT id, tipo, resultado_id, publicado, programado_para, fecha_publicacion, fuera_calendario FROM articles WHERE id = ?"
+          "SELECT id, tipo, categoria, resultado_id, publicado, programado_para, fecha_publicacion, fuera_calendario FROM articles WHERE id = ?"
         ).bind(parseInt(compartirPermitidoMatch[1], 10)).first();
         if (!art) return json({ error: "Noticia no encontrada" }, 404);
         const [evaluada] = await aplicarFueraCalendarioEnLectura(env, [art]);
@@ -18674,7 +24737,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/calendario-contenido" && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede modificar el calendario" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede modificar el calendario" }, 403);
         let body;
         try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
         const r = limpiarCalendarioContenido(body);
@@ -18742,18 +24805,85 @@ async function handlePrimary(request, env, ctx) {
           try { redes = JSON.parse(autor.redes_sociales); } catch { redes = {}; }
         }
 
-        const { results: articulos } = await env.DB.prepare(
-          `SELECT id, slug, titulo, subtitulo, contenido, tipo, resultado_id, categoria, club, imagen_url, imagenes, autor_id, autor_nombre, coautor_id, coautor_nombre, fecha_publicacion
+        // Las consultas son independientes entre sí: se lanzan a la vez (antes iban una tras otra,
+        // ~10 viajes seguidos a D1) y las tarjetas reciben solo el arranque del texto, no el artículo entero.
+        const pArticulos = (async () => {
+          const { results: articulos } = await env.DB.prepare(
+          `SELECT id, slug, titulo, subtitulo, substr(contenido, 1, 800) AS contenido, tipo, resultado_id, categoria, club, imagen_url, imagenes, autor_id, autor_nombre, coautor_id, coautor_nombre, fecha_publicacion
            FROM articles WHERE (autor_id = ? OR coautor_id = ?) AND publicado = 1 ORDER BY fecha_publicacion DESC LIMIT 30`
         ).bind(id, id).all();
-        const articulosAutor = await remapearSlugsFusion(env, articulos);
-
-        // Galerías fotográficas del autor: sus fotos PÚBLICAS agrupadas por partido
-        // (match_gallery). Los fotógrafos suben fotos de partidos; el perfil las enseña
-        // como una galería por partido (portada + unas muestras) con enlace a la galería
-        // completa (/galeria/:slug). Las fotos sin partido van aparte. Si algo falla
-        // (columna aún sin migrar, etc.) el perfil sale igual, solo que sin galerías.
-        let galeriasAutor = [];
+        return await remapearSlugsFusion(env, articulos);
+        })();
+        const pPerfilExtra = (async () => {
+          let perfilExtra = {};
+        try {
+          perfilExtra = (await env.DB.prepare("SELECT cargo, ciudad, articulo_destacado_id FROM users WHERE id = ?").bind(id).first()) || {};
+        } catch (e) { if (!esErrorColumnaFaltante(e)) throw e; }
+          return perfilExtra;
+        })();
+        const CAMPOS_ART = "id, slug, titulo, subtitulo, contenido, tipo, resultado_id, categoria, club, imagen_url, imagenes, autor_id, autor_nombre, coautor_id, coautor_nombre, fecha_publicacion";
+        const comoTarjeta = (a) => ({ ...a, imagen_foco: focoDePortada(a), imagenes: undefined });
+        const CAMPOS_ART_LISTA = CAMPOS_ART.replace("contenido,", "substr(contenido, 1, 800) AS contenido,");
+        const pEstadisticas = (async () => {
+          let estadisticas = null;
+          try {
+          const resumen = await env.DB.prepare(
+            "SELECT COUNT(*) AS total, MIN(fecha_publicacion) AS primera, MAX(fecha_publicacion) AS ultima FROM articles WHERE (autor_id = ? OR coautor_id = ?) AND publicado = 1"
+          ).bind(id, id).first();
+          const { results: porCategoria } = await env.DB.prepare(
+            "SELECT categoria, COUNT(*) AS n FROM articles WHERE (autor_id = ? OR coautor_id = ?) AND publicado = 1 GROUP BY categoria ORDER BY n DESC LIMIT 6"
+          ).bind(id, id).all();
+          const { results: porTipo } = await env.DB.prepare(
+            "SELECT tipo, COUNT(*) AS n FROM articles WHERE (autor_id = ? OR coautor_id = ?) AND publicado = 1 GROUP BY tipo ORDER BY n DESC"
+          ).bind(id, id).all();
+          let lecturas = null;
+          try {
+            const v = await env.DB.prepare(
+              "SELECT COUNT(*) AS n FROM article_views v JOIN articles a ON a.id = v.article_id WHERE (a.autor_id = ? OR a.coautor_id = ?) AND a.publicado = 1"
+            ).bind(id, id).first();
+            lecturas = Number(v && v.n) || 0;
+          } catch (e) { console.error("Perfil de autor: sin lecturas:", e.message); }
+          estadisticas = {
+            articulos_total: Number(resumen && resumen.total) || 0,
+            primera_publicacion: (resumen && resumen.primera) || null,
+            ultima_publicacion: (resumen && resumen.ultima) || null,
+            lecturas_total: lecturas,
+            por_categoria: (porCategoria || []).map((r) => ({ categoria: r.categoria, n: Number(r.n) || 0 })),
+            por_tipo: (porTipo || []).map((r) => ({ tipo: r.tipo, n: Number(r.n) || 0 })),
+          };
+        } catch (e) { console.error("Perfil de autor: sin estadísticas:", e.message); }
+          return estadisticas;
+        })();
+        const pDestacadas = (async () => {
+          let destacado = null, masLeidas = [];
+          try {
+          const perfilExtra = await pPerfilExtra;
+          if (perfilExtra.articulo_destacado_id) {
+            const { results: filaDest } = await env.DB.prepare(
+              `SELECT ${CAMPOS_ART_LISTA} FROM articles WHERE id = ? AND publicado = 1 AND (autor_id = ? OR coautor_id = ?)`
+            ).bind(perfilExtra.articulo_destacado_id, id, id).all();
+            const [d] = await remapearSlugsFusion(env, filaDest || []);
+            if (d) destacado = comoTarjeta(d);
+          }
+          const { results: top } = await env.DB.prepare(
+            "SELECT a.id AS id, COUNT(*) AS n FROM article_views v JOIN articles a ON a.id = v.article_id WHERE (a.autor_id = ? OR a.coautor_id = ?) AND a.publicado = 1 GROUP BY a.id ORDER BY n DESC LIMIT 3"
+          ).bind(id, id).all();
+          if (top && top.length) {
+            const ids = top.map((t) => Number(t.id));
+            const { results: filasTop } = await env.DB.prepare(
+              `SELECT ${CAMPOS_ART_LISTA} FROM articles WHERE id IN (${ids.map(() => "?").join(",")})`
+            ).bind(...ids).all();
+            const remapeadas = await remapearSlugsFusion(env, filasTop || []);
+            masLeidas = top.map((t) => {
+              const a = remapeadas.find((x) => Number(x.id) === Number(t.id));
+              return a ? { ...comoTarjeta(a), lecturas: Number(t.n) || 0 } : null;
+            }).filter(Boolean);
+          }
+        } catch (e) { console.error("Perfil de autor: sin destacada/más leídas:", e.message); }
+          return { destacado, masLeidas };
+        })();
+        const pGalerias = (async () => {
+          let galeriasAutor = [];
         let fotosSinPartido = [];
         let fotosTotalAutor = 0;
         try {
@@ -18792,10 +24922,17 @@ async function handlePrimary(request, env, ctx) {
         } catch (err) {
           console.error("Perfil de autor: no se pudieron cargar sus galerías (se continúa sin ellas):", err.message);
         }
+          return { galeriasAutor, fotosSinPartido, fotosTotalAutor };
+        })();
+        const [articulosAutor, perfilExtra, estadisticas, { destacado, masLeidas }, { galeriasAutor, fotosSinPartido, fotosTotalAutor }] =
+          await Promise.all([pArticulos, pPerfilExtra, pEstadisticas, pDestacadas, pGalerias]);
 
         return json({
-          autor: { id: autor.id, nombre: autor.nombre, rol: autor.rol === "fotografo" ? "fotografo" : "redactor", bio: autor.bio || "", experiencia: autor.experiencia || "", avatar_url: autor.avatar_url || "", avatar_foco: normalizarFoco(autor.avatar_foco), equipo: parsearEquipos(autor.equipo), redes },
+          autor: { id: autor.id, nombre: autor.nombre, rol: autor.rol === "fotografo" ? "fotografo" : "redactor", bio: autor.bio || "", experiencia: autor.experiencia || "", avatar_url: autor.avatar_url || "", avatar_foco: normalizarFoco(autor.avatar_foco), equipo: parsearEquipos(autor.equipo), redes, cargo: perfilExtra.cargo || "", ciudad: perfilExtra.ciudad || "" },
           articulos: articulosAutor.map((a) => ({ ...a, imagen_foco: focoDePortada(a), imagenes: undefined })),
+          estadisticas,
+          destacado,
+          mas_leidas: masLeidas,
           galerias: galeriasAutor,
           fotos_sin_partido: fotosSinPartido,
           fotos_total: fotosTotalAutor,
@@ -18808,7 +24945,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/admin/busqueda/reindexar" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede reindexar la búsqueda" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede reindexar la búsqueda" }, 403);
         if (url.searchParams.get("reset") === "1") await reiniciarIndiceBusqueda(env);
         return json(await reconciliarIndiceBusqueda(env, {
           limite: parseInt(url.searchParams.get("limite") || "20", 10) || 20,
@@ -18822,7 +24959,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/activity" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver el historial" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede ver el historial" }, 403);
 
         const usuarioId = url.searchParams.get("usuario_id");
         const accion = url.searchParams.get("accion");
@@ -18895,7 +25032,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/newsletter/suscriptores" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver los suscriptores" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede ver los suscriptores" }, 403);
         const { results } = await env.DB.prepare(
           "SELECT id, email, activo, created_at, baja_at FROM newsletter_suscriptores ORDER BY created_at DESC"
         ).all();
@@ -18933,12 +25070,13 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/acreditaciones/acceso" && (method === "GET" || method === "PUT")) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede cambiar el acceso" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede cambiar el acceso" }, 403);
         let acceso = await obtenerAccesoAcreditacion(env);
         if (method === "PUT") {
           const body = await request.json().catch(() => ({}));
           const pedido = body && typeof body.acceso === "string" ? body.acceso.trim() : "";
           if (!ACREDITACION_ACCESOS.includes(pedido)) return json({ error: "Modo de acceso no válido" }, 400);
+          if (pedido !== "login") return json({ error: "El formulario de acreditación exige siempre cuenta con Nivel 2 o superior." }, 400);
           await guardarAccesoAcreditacion(env, pedido);
           acceso = pedido;
           const etiquetas = { pin: "con PIN", login: "con login de colaborador", solicitar: "libre (solicitar sin PIN ni cuenta)" };
@@ -18955,7 +25093,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/acreditaciones/pin" && (method === "GET" || method === "PUT")) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar el PIN" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede gestionar el PIN" }, 403);
         let pin = await obtenerPinAcreditacion(env);
         if (method === "PUT") {
           const body = await request.json().catch(() => ({}));
@@ -18981,7 +25119,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/acreditaciones/config" && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede editar el formulario" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede editar el formulario" }, 403);
         const body = await request.json().catch(() => ({}));
         const cfg = normalizarConfigAcreditacion(body && body.restaurar ? null : body);
         await env.DB.prepare(
@@ -18999,7 +25137,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/acreditaciones/importar" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede importar acreditaciones" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede importar acreditaciones" }, 403);
         const body = await request.json().catch(() => ({}));
         const filas = Array.isArray(body && body.filas) ? body.filas : [];
         if (!filas.length) return json({ error: "No hay filas que importar" }, 400);
@@ -19060,7 +25198,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/acreditaciones/huella" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las acreditaciones" }, 403);
+        if (!(await puedeGestionarAcreditaciones(env, payload))) return json({ error: "Solo un Responsable o un Sub-Responsable de las acreditaciones puede ver las acreditaciones" }, 403);
         const f = await env.DB.prepare("SELECT COUNT(*) AS n, MAX(updated_at) AS ultimo, MAX(id) AS max_id FROM acreditaciones").first();
         const ultimo = f && f.ultimo ? String(f.ultimo) : "";
         let reciente = false;
@@ -19101,11 +25239,14 @@ async function handlePrimary(request, env, ctx) {
                 " COALESCE(SUM(id * CASE estado WHEN 'en_juego' THEN 3 WHEN 'finalizado' THEN 5 ELSE 1 END), 0) AS b FROM results",
               "SELECT COUNT(*) AS n, MAX(id) AS max_id FROM results",
             ];
+        // Todos los paneles abiertos preguntan cada pocos segundos: la huella se calcula UNA vez
+        // cada 3 s por isolate y se comparte (antes cada consulta recorría la tabla entera).
+        const calcularHuella = async () => {
         let f = null;
         for (const sql of consultas) {
           try { f = await env.DB.prepare(sql).first(); break; } catch (e) { /* prueba la siguiente */ }
         }
-        if (!f) return json({ error: "No se pudo calcular la huella" }, 500);
+        if (!f) return null;
         const partes = [f.n, f.max_id, f.ultimo || "", f.a, f.b, f.c, f.d].map((v) => (v === null || v === undefined ? "" : String(v)));
         if (path === "/api/results/huella") {
           // Los goles, tarjetas y demás eventos del minuto a minuto también cuentan como cambio.
@@ -19114,13 +25255,40 @@ async function handlePrimary(request, env, ctx) {
             partes.push(String(ev && ev.n || 0), String(ev && ev.max_id || 0));
           } catch (e) { /* sin tabla de eventos: se ignora */ }
         }
-        return json({ huella: partes.join("|") });
+        return partes.join("|");
+        };
+        const huella = await memoCorta(`huella:${path}`, 3000, calcularHuella);
+        if (!huella) return json({ error: "No se pudo calcular la huella" }, 500);
+        return json({ huella });
+      }
+
+      // Correos de prensa de los clubes (Relaciones institucionales) para el modal «INFO CORREO» de las
+      // acreditaciones. /api/responsabilidades es solo de Responsables, pero un Sub-Responsable de acreditaciones
+      // también gestiona solicitudes, así que aquí se sirve SOLO lo imprescindible (club, correo, persona y cargo)
+      // de los contactos de tipo club con correo y departamento de prensa/comunicación.
+      if (path === "/api/acreditaciones/contactos-prensa" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!(await puedeGestionarAcreditaciones(env, payload))) return json({ error: "Solo un Responsable o un Sub-Responsable de las acreditaciones puede ver las acreditaciones" }, 403);
+        let contactos = [];
+        try {
+          const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'responsabilidades'").first();
+          if (row) {
+            const r = limpiarResponsabilidades(JSON.parse(row.value));
+            if (r.datos) {
+              contactos = r.datos.relaciones.contactos
+                .filter((c) => c.tipo === "club" && c.email && (c.area === "prensa" || c.area === "comunicacion"))
+                .map((c) => ({ entidad: c.entidad, area: c.area, nombre: c.nombre, cargo: c.cargo, email: c.email }));
+            }
+          }
+        } catch { /* valor corrupto o sin tabla de ajustes: se devuelve vacío */ }
+        return json({ contactos });
       }
 
       if (path === "/api/acreditaciones" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las acreditaciones" }, 403);
+        if (!(await puedeGestionarAcreditaciones(env, payload))) return json({ error: "Solo un Responsable o un Sub-Responsable de las acreditaciones puede ver las acreditaciones" }, 403);
         const colsBase = "id, nombre, email, dni, equipo, tipo_evento, tipo_acreditacion, funciones, jornada_partido, estado, nota_admin, revisado_por, revisado_at, created_at";
         let res;
         try {
@@ -19140,7 +25308,7 @@ async function handlePrimary(request, env, ctx) {
       if (path.match(/^\/api\/acreditaciones\/\d+\/historial$/) && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las acreditaciones" }, 403);
+        if (!(await puedeGestionarAcreditaciones(env, payload))) return json({ error: "Solo un Responsable o un Sub-Responsable de las acreditaciones puede ver las acreditaciones" }, 403);
         const idH = Number(path.split("/")[3]);
         const { results: filasH } = await env.DB.prepare(
           `SELECT usuario_nombre, accion, descripcion, detalle, created_at FROM activity_log
@@ -19159,7 +25327,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/acreditaciones/lote" && method === "PATCH") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar las acreditaciones" }, 403);
+        if (!(await puedeGestionarAcreditaciones(env, payload))) return json({ error: "Solo un Responsable o un Sub-Responsable de las acreditaciones puede gestionar las acreditaciones" }, 403);
         const body = await request.json().catch(() => ({}));
         const estadoL = String(body.estado || "");
         if (!ACRED_ESTADOS_VALIDOS.includes(estadoL)) return json({ error: "Estado no válido" }, 400);
@@ -19237,7 +25405,7 @@ async function handlePrimary(request, env, ctx) {
       if (path.match(/^\/api\/acreditaciones\/\d+$/) && method === "PATCH") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar las acreditaciones" }, 403);
+        if (!(await puedeGestionarAcreditaciones(env, payload))) return json({ error: "Solo un Responsable o un Sub-Responsable de las acreditaciones puede gestionar las acreditaciones" }, 403);
         const id = Number(path.split("/").pop());
         const body = await request.json().catch(() => ({}));
         // Solo indicaciones: envía el correo SIN tocar estado, nota ni revisión.
@@ -19406,7 +25574,7 @@ async function handlePrimary(request, env, ctx) {
       if (path.match(/^\/api\/acreditaciones\/\d+$/) && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede eliminar acreditaciones" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede eliminar acreditaciones" }, 403);
         const id = Number(path.split("/").pop());
         await env.DB.prepare("DELETE FROM acreditaciones WHERE id = ?").bind(id).run();
         return json({ ok: true });
@@ -19416,7 +25584,7 @@ async function handlePrimary(request, env, ctx) {
       if (path.startsWith("/api/formularios") && !path.startsWith("/api/formularios-publicos")) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede gestionar los formularios" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede gestionar los formularios" }, 403);
         const idDe = (p) => Number(p.split("/").pop());
 
         if (path === "/api/formularios" && method === "GET") {
@@ -19686,7 +25854,7 @@ async function handlePrimary(request, env, ctx) {
       if (path.match(/^\/api\/newsletter\/suscriptores\/\d+$/) && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede eliminar suscriptores" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede eliminar suscriptores" }, 403);
         const id = Number(path.split("/").pop());
         await env.DB.prepare("DELETE FROM newsletter_suscriptores WHERE id = ?").bind(id).run();
         return json({ ok: true });
@@ -19704,7 +25872,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/newsletter/enviar" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede enviar el boletín" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede enviar el boletín" }, 403);
         const body = await request.json().catch(() => ({}));
 
         // "suscriptor_ids" es opcional: si no se manda (o se manda vacío
@@ -19777,14 +25945,16 @@ async function handlePrimary(request, env, ctx) {
       if (path.startsWith("/api/anuncios")) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede enviar anuncios" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede enviar anuncios" }, 403);
 
         if (path === "/api/anuncios/audiencias" && method === "GET") {
           const conteos = {};
           for (const a of ANUNCIO_AUDIENCIAS) conteos[a] = (await resolverDestinatariosAnuncio(env, [a])).length;
+          const gruposAud = (await leerGruposTrabajo(env)).grupos;
+          for (const g of gruposAud) conteos[ANUNCIO_PREFIJO_GRUPO + g.id] = (await resolverDestinatariosAnuncio(env, [ANUNCIO_PREFIJO_GRUPO + g.id])).length;
           const total = (await resolverDestinatariosAnuncio(env, ANUNCIO_AUDIENCIAS)).length;
           // Total sin repetidos de la selección pedida (?aud=admins,lectores).
-          const pedidas = (url.searchParams.get("aud") || "").split(",").filter((a) => ANUNCIO_AUDIENCIAS.includes(a));
+          const pedidas = (url.searchParams.get("aud") || "").split(",").filter((a) => ANUNCIO_AUDIENCIAS.includes(a) || esClaveGrupoAnuncio(a));
           const totalSeleccion = pedidas.length ? (await resolverDestinatariosAnuncio(env, pedidas)).length : 0;
           return json({ conteos, total_unico: total, total_seleccion: totalSeleccion, tanda: ANUNCIO_TAMANO_TANDA, correo_configurado: cuentasResend(env).length > 0 });
         }
@@ -19793,12 +25963,18 @@ async function handlePrimary(request, env, ctx) {
         // Solo nombre, correo, avatar y rol: nunca hashes ni tokens de baja.
         if (path === "/api/anuncios/personas" && method === "GET") {
           const personas = { admins: [], redactores: [], fotografos: [], lectores: [], suscriptores: [] };
+          const datosGrupos = await leerGruposTrabajo(env);
+          for (const g of datosGrupos.grupos) personas[ANUNCIO_PREFIJO_GRUPO + g.id] = [];
           const { results: us } = await env.DB.prepare(
             "SELECT id, nombre, username, email, rol, avatar_url FROM users WHERE activo = 1 AND email IS NOT NULL AND TRIM(email) <> '' ORDER BY nombre COLLATE NOCASE"
           ).all();
           for (const u of us || []) {
             const aud = Object.keys(ANUNCIO_ROL_POR_AUDIENCIA).find((a) => ANUNCIO_ROL_POR_AUDIENCIA[a] === u.rol);
-            if (aud && emailAnuncioValido(u.email)) personas[aud].push({ nombre: u.nombre || u.username || "", email: String(u.email).trim(), avatar: u.avatar_url || null });
+            if (aud && emailAnuncioValido(u.email)) personas[aud].push({ nombre: u.nombre || u.username || "", email: String(u.email).trim(), avatar: u.avatar_url || null, rol: u.rol });
+            const gid = puedeTenerGrupoTrabajo(u.rol) ? datosGrupos.asignaciones[String(u.id)] : null;
+            if (gid && personas[ANUNCIO_PREFIJO_GRUPO + gid] && emailAnuncioValido(u.email)) {
+              personas[ANUNCIO_PREFIJO_GRUPO + gid].push({ nombre: u.nombre || u.username || "", email: String(u.email).trim(), avatar: u.avatar_url || null, rol: u.rol });
+            }
           }
           const { results: rs } = await env.DB.prepare(
             "SELECT nombre, email FROM readers WHERE activo = 1 AND email_verificado = 1 ORDER BY nombre COLLATE NOCASE LIMIT 3000"
@@ -19808,7 +25984,7 @@ async function handlePrimary(request, env, ctx) {
             "SELECT email FROM newsletter_suscriptores WHERE activo = 1 ORDER BY email COLLATE NOCASE LIMIT 3000"
           ).all();
           for (const x of ss || []) if (emailAnuncioValido(x.email)) personas.suscriptores.push({ nombre: "", email: String(x.email).trim(), avatar: null });
-          return json({ personas });
+          return json({ personas, grupos_trabajo: datosGrupos.grupos });
         }
 
         if (path === "/api/anuncios" && method === "GET") {
@@ -19885,7 +26061,7 @@ async function handlePrimary(request, env, ctx) {
             await registrarDestinatariosAnuncio(env, id, dest0.map((d) => String(d.email).trim().toLowerCase()));
             ctx.waitUntil(registrarActividad(env, request, payload, {
               accion: "anuncio_email_envio", entidad: "anuncio", entidad_id: id,
-              descripcion: `Ha enviado el anuncio por correo "${v.datos.asunto}" a ${total} persona(s) (${describirSeleccionAnuncio(v.datos.audiencias)})`,
+              descripcion: `Ha enviado el anuncio por correo "${v.datos.asunto}" a ${total} persona(s) (${describirSeleccionAnuncio(v.datos.audiencias, (await leerGruposTrabajo(env)).grupos)})`,
             }));
             ctx.waitUntil((async () => {
               const correos = new Set(dest0.map((d) => String(d.email).trim().toLowerCase()));
@@ -19939,18 +26115,70 @@ async function handlePrimary(request, env, ctx) {
         return json({ error: "No encontrado" }, 404);
       }
 
-      // ---------- LECTORES (cuentas públicas, solo lectura para admins) ----------
-      // Solo lectura desde el panel: los lectores se gestionan a sí mismos
-      // (registro, verificación, contraseña) desde la web pública. Nunca se
+      // ---------- LECTORES (cuentas públicas, gestionadas por admins) ----------
+      // Los lectores se registran y gestionan solos desde la web pública (registro,
+      // verificación, contraseña); desde el panel un Responsable puede además
+      // desactivar/reactivar su acceso y eliminar su cuenta (más abajo). Nunca se
       // devuelve password_hash ni salt.
       if (path === "/api/readers" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver los lectores" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede ver los lectores" }, 403);
         const { results } = await env.DB.prepare(
           "SELECT id, nombre, email, email_verificado, activo, created_at FROM readers ORDER BY created_at DESC"
         ).all();
         return json({ readers: results });
+      }
+
+      // PATCH /api/readers/:id { activo }  -> desactiva (cierra sus sesiones) o reactiva el acceso.
+      // DELETE /api/readers/:id            -> elimina la cuenta con el mismo borrado que
+      //   DELETE /api/readers/me (porras, guardadas, historial, votos, sesiones, suscripción al
+      //   boletín con ese correo). Comentarios: se borran los que nadie ha respondido; los que ya
+      //   tienen respuestas de otras personas se anonimizan para no llevarse la conversación.
+      const lectorAdminMatch = path.match(/^\/api\/readers\/(\d+)$/);
+      if (lectorAdminMatch && (method === "DELETE" || method === "PATCH")) {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede gestionar los lectores" }, 403);
+        const rid = parseInt(lectorAdminMatch[1]);
+        const lector = await env.DB.prepare("SELECT id, nombre, email, activo FROM readers WHERE id = ?").bind(rid).first();
+        if (!lector) return json({ error: "Lector no encontrado" }, 404);
+
+        if (method === "PATCH") {
+          const cuerpo = await request.json().catch(() => ({}));
+          if (cuerpo.activo !== true && cuerpo.activo !== false && cuerpo.activo !== 0 && cuerpo.activo !== 1) {
+            return json({ error: "Datos no válidos" }, 400);
+          }
+          const activo = (cuerpo.activo === true || cuerpo.activo === 1) ? 1 : 0;
+          await env.DB.prepare("UPDATE readers SET activo = ? WHERE id = ?").bind(activo, rid).run();
+          if (!activo) await env.DB.prepare("DELETE FROM reader_sessions WHERE reader_id = ?").bind(rid).run();
+          await registrarActividad(env, request, payload, {
+            accion: activo ? "activar_lector" : "desactivar_lector", entidad: "lector", entidad_id: rid,
+            descripcion: `Ha ${activo ? "reactivado" : "desactivado"} al lector "${lector.nombre}"`,
+          });
+          return json({ ok: true, activo });
+        }
+
+        await env.DB.batch([
+          env.DB.prepare(
+            `UPDATE comments SET texto = '[Comentario eliminado por su autor]', nombre = 'Cuenta eliminada', email = '', ip = NULL, reader_id = NULL
+             WHERE reader_id = ? AND EXISTS (
+               SELECT 1 FROM comments r WHERE r.parent_id = comments.id AND (r.reader_id IS NULL OR r.reader_id != ?))`
+          ).bind(rid, rid),
+          env.DB.prepare("DELETE FROM comments WHERE reader_id = ?").bind(rid),
+          env.DB.prepare("DELETE FROM poll_votes WHERE reader_id = ?").bind(rid),
+          env.DB.prepare("DELETE FROM porras WHERE reader_id = ?").bind(rid),
+          env.DB.prepare("DELETE FROM reader_saved_articles WHERE reader_id = ?").bind(rid),
+          env.DB.prepare("DELETE FROM reader_reading_history WHERE reader_id = ?").bind(rid),
+          env.DB.prepare("DELETE FROM reader_sessions WHERE reader_id = ?").bind(rid),
+          env.DB.prepare("DELETE FROM newsletter_suscriptores WHERE lower(email) = lower(?)").bind(lector.email),
+          env.DB.prepare("DELETE FROM readers WHERE id = ?").bind(rid),
+        ]);
+        await registrarActividad(env, request, payload, {
+          accion: "eliminar_lector", entidad: "lector", entidad_id: rid,
+          descripcion: `Ha eliminado al lector "${lector.nombre}"`,
+        });
+        return json({ ok: true });
       }
 
       // ---------- USUARIOS (solo admins) ----------
@@ -19959,12 +26187,13 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/users" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver los usuarios" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede ver los usuarios" }, 403);
         await asegurarColumnas2fa(env);
         await asegurarColumnaPrimerAcceso(env);
         await asegurarColumnaSinApellidos(env);
+        await asegurarColumnaAnonimo(env);
         const { results } = await env.DB.prepare(
-          "SELECT id, username, nombre, rol, activo, email, equipo, categorias_fijas, avatar_url, nivel, nivel_nota, created_at, totp_activo, primer_acceso_at, sin_apellidos FROM users ORDER BY nombre"
+          "SELECT id, username, nombre, rol, activo, email, equipo, categorias_fijas, avatar_url, nivel, nivel_nota, created_at, totp_activo, primer_acceso_at, sin_apellidos, anonimo FROM users ORDER BY nombre"
         ).all();
         // El progreso de nivel de TODOS los usuarios se calcula con una
         // sola consulta agregada (antes: una consulta por usuario,
@@ -19977,12 +26206,23 @@ async function handlePrimary(request, env, ctx) {
         // Avisos de inactividad enviados a cada redactor (ver
         // cargarEstadoInactividadUsuarios): se muestran en la tabla de Usuarios.
         const inactividad = await cargarEstadoInactividadUsuarios(env, results);
+        const gruposTrabajo = await leerGruposTrabajo(env); // nunca lanza: si falla, todos sin grupo
+        const funcionesResp = await leerFuncionesResponsables(env); // idem
+        const areasSub = await leerAreasSub(env); // idem
+        const excepcionesAct = await cargarExcepcionesUsuariosParaListado(env); // idem
         const users = await Promise.all(results.map(async (u) => ({
           ...u,
+          grupo_trabajo: puedeTenerGrupoTrabajo(u.rol) ? (gruposTrabajo.asignaciones[String(u.id)] || null) : null,
+          // Grupo del que es Sub-Responsable (o null), funciones de Responsable y cargo ya compuesto.
+          sub_responsable_de: puedeTenerGrupoTrabajo(u.rol) ? (Object.keys(gruposTrabajo.lideres).find((gid) => String(gruposTrabajo.lideres[gid]) === String(u.id)) || null) : null,
+          funciones: u.rol === "admin" ? (funcionesResp[String(u.id)] || []) : [],
+          sub_responsable_areas: AREAS_SUB_ROLES.includes(u.rol) ? areasDeUsuarioSub(areasSub, u.id).map((a) => ({ id: a.id, nombre: a.nombre, titulo: tituloArea(a), permiso: a.permiso || null })) : [],
+          cargo: cargoDeUsuario(u, gruposTrabajo, funcionesResp, areasSub),
           equipo: parsearEquipos(u.equipo),
           categorias_fijas: parsearCategoriasFijas(u.categorias_fijas),
           progreso_nivel: await construirProgresoNivel(env, u, conteos.get(u.id)),
           inactividad: inactividad.get(Number(u.id)) || null,
+          excepcionalidad: excepcionesAct.get(Number(u.id)) || null,
         })));
         return json({ users });
       }
@@ -19990,7 +26230,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/users" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede crear usuarios" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede crear usuarios" }, 403);
         const body = await request.json();
         if (!body.username || !body.nombre) return json({ error: "Faltan campos obligatorios" }, 400);
         const username = body.username.trim().toLowerCase();
@@ -20039,9 +26279,9 @@ async function handlePrimary(request, env, ctx) {
       if (reset2faMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede restablecer la verificación en dos pasos" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede restablecer la verificación en dos pasos" }, 403);
         const id = parseInt(reset2faMatch[1]);
-        if (id === payload.uid) return json({ error: "No puedes restablecer tu propio 2FA. Usa un código de recuperación o pídeselo a otro administrador." }, 400);
+        if (id === payload.uid) return json({ error: "No puedes restablecer tu propio 2FA. Usa un código de recuperación o pídeselo a otro Responsable." }, 400);
         const user = await env.DB.prepare("SELECT id, username FROM users WHERE id = ?").bind(id).first();
         if (!user) return json({ error: "Usuario no encontrado" }, 404);
         await asegurarColumnas2fa(env);
@@ -20054,11 +26294,139 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true });
       }
 
+      // ---------- ESTADÍSTICAS DE UN COLABORADOR (solo Responsables) ----------
+      // GET /api/users/:id/estadisticas -> lo mismo que ve la persona en /api/me/estadisticas, para el modal «Gestionar».
+      const estadisticasUsuarioMatch = path.match(/^\/api\/users\/(\d+)\/estadisticas$/);
+      if (estadisticasUsuarioMatch && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede ver las estadísticas de otra cuenta" }, 403);
+        const user = await env.DB.prepare("SELECT id, nombre, rol, nivel, created_at FROM users WHERE id = ?").bind(parseInt(estadisticasUsuarioMatch[1])).first();
+        if (!user) return json({ error: "Usuario no encontrado" }, 404);
+        return json(await construirEstadisticasCuenta(env, user));
+      }
+
+      // ---------- EXCEPCIONALIDADES DE ACTIVIDAD (solo Responsables) ----------
+      // GET  /api/users/:id/excepcionalidades        -> causas, duraciones e historial del colaborador
+      // POST /api/users/:id/excepcionalidades        -> concede una (3 días o 1 semana) y le avisa por correo
+      // DELETE /api/users/:id/excepcionalidades/:eid -> la cancela (los avisos de inactividad vuelven a contar)
+      const excepcionesMatch = path.match(/^\/api\/users\/(\d+)\/excepcionalidades(?:\/(\d+))?$/);
+      if (excepcionesMatch && (method === "GET" || method === "POST" || method === "DELETE")) {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede gestionar las excepcionalidades de actividad" }, 403);
+        const uidExc = parseInt(excepcionesMatch[1]);
+        const eidExc = excepcionesMatch[2] ? parseInt(excepcionesMatch[2]) : null;
+        const usuarioExc = await env.DB.prepare("SELECT id, nombre, email, rol, activo FROM users WHERE id = ?").bind(uidExc).first();
+        if (!usuarioExc) return json({ error: "Usuario no encontrado" }, 404);
+        const hoyExc = diaYHoraEnMadrid(new Date()).dia;
+        try {
+          if (method === "GET" && eidExc === null) {
+            return json({
+              causas: causasExcepcionParaPanel(),
+              duraciones: EXCEPCION_DURACIONES_DIAS,
+              indefinida_causas: EXCEPCION_CAUSAS_INDEFINIDAS,
+              max_antelacion_dias: EXCEPCION_MAX_ANTELACION_DIAS,
+              hoy: hoyExc,
+              aplica: usuarioExc.rol === "redactor" || usuarioExc.rol === "fotografo",
+              tiene_correo: !!(usuarioExc.email && String(usuarioExc.email).trim()),
+              items: await listarExcepcionesActividadUsuario(env, uidExc),
+            });
+          }
+
+          if (method === "POST" && eidExc === null) {
+            if (usuarioExc.rol !== "redactor" && usuarioExc.rol !== "fotografo") return json({ error: "Las excepcionalidades de actividad son solo para redactores y fotógrafos (los avisos de inactividad no se aplican a otros roles)" }, 400);
+            if (Number(usuarioExc.activo) !== 1) return json({ error: "La cuenta está desactivada" }, 400);
+            let body;
+            try { body = await request.json(); } catch { return json({ error: "Cuerpo no válido" }, 400); }
+            const causaExc = typeof body.causa === "string" ? body.causa : "";
+            if (!EXCEPCION_CAUSAS[causaExc]) return json({ error: "Elige una causa justificable" }, 400);
+            const indefExc = body.dias === "indefinida";
+            if (indefExc && !EXCEPCION_CAUSAS_INDEFINIDAS.includes(causaExc)) return json({ error: "La duración indefinida solo se puede usar con el fallecimiento de un familiar" }, 400);
+            const diasExc = indefExc ? 0 : Number(body.dias);
+            if (!indefExc && !EXCEPCION_DURACIONES_DIAS.includes(diasExc)) return json({ error: "La duración tiene que ser de 3 días o de 1 semana" }, 400);
+            const notaExc = typeof body.nota === "string"
+              ? body.nota.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, EXCEPCION_NOTA_MAX)
+              : "";
+            if (causaExc === "otra" && !notaExc) return json({ error: "Con «Otra causa justificada» escribe una nota explicando el motivo" }, 400);
+            let desdeExc = hoyExc;
+            if (body.desde !== undefined && body.desde !== null && body.desde !== "") {
+              if (!fechaISOValida(body.desde)) return json({ error: "La fecha de inicio no es válida" }, 400);
+              desdeExc = body.desde;
+            }
+            if (desdeExc < hoyExc) return json({ error: "La excepcionalidad no puede empezar en el pasado" }, 400);
+            if (desdeExc > sumarDiasAFechaISO(hoyExc, EXCEPCION_MAX_ANTELACION_DIAS)) return json({ error: `Solo se puede programar con hasta ${EXCEPCION_MAX_ANTELACION_DIAS} días de antelación` }, 400);
+            const hastaExc = indefExc ? EXCEPCION_HASTA_INDEFINIDA : sumarDiasAFechaISO(desdeExc, diasExc - 1);
+
+            const solapada = await env.DB.prepare(
+              "SELECT desde, hasta FROM excepciones_actividad WHERE user_id = ? AND cancelada_at IS NULL AND desde <= ? AND hasta >= ? LIMIT 1"
+            ).bind(uidExc, hastaExc, desdeExc).first();
+            if (solapada) return json({ error: (solapada.hasta === EXCEPCION_HASTA_INDEFINIDA ? `Ya tiene una excepcionalidad indefinida desde el ${solapada.desde}: finalízala antes de conceder otra` : `Ya tiene una excepcionalidad del ${solapada.desde} al ${solapada.hasta} que se solapa con estas fechas`) }, 409);
+
+            await env.DB.prepare(
+              `INSERT INTO excepciones_actividad (user_id, causa, nota, dias, desde, hasta, concedida_por_id, concedida_por_nombre)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+            ).bind(uidExc, causaExc, notaExc || null, diasExc, desdeExc, hastaExc, payload.uid, payload.nombre || null).run();
+            const creada = await env.DB.prepare(
+              `SELECT id, user_id, causa, nota, dias, desde, hasta, concedida_por_nombre, correo_enviado_at, cancelada_at, created_at
+                 FROM excepciones_actividad WHERE user_id = ? ORDER BY id DESC LIMIT 1`
+            ).bind(uidExc).first();
+
+            // Correo automático al colaborador. Si falla, la excepcionalidad ya está concedida
+            // (el panel avisa de que el correo no salió) y no se reintenta solo.
+            let correoEnviado = false;
+            const emailExc = usuarioExc.email ? String(usuarioExc.email).trim() : "";
+            if (emailExc && creada) {
+              correoEnviado = await enviarEmailNotificacion(
+                env,
+                construirEmailExcepcionActividad({ nombre: usuarioExc.nombre, causaId: causaExc, dias: diasExc, desde: desdeExc, hasta: hastaExc, nota: notaExc, concedidaPor: payload.nombre }),
+                { destinatario: emailExc }
+              );
+              if (correoEnviado) {
+                await env.DB.prepare("UPDATE excepciones_actividad SET correo_enviado_at = datetime('now') WHERE id = ?").bind(creada.id).run();
+              }
+            }
+            ctx.waitUntil(registrarActividad(env, request, payload, {
+              accion: "excepcionalidad_actividad", entidad: "usuario", entidad_id: uidExc,
+              descripcion: indefExc ? `Ha concedido a "${usuarioExc.nombre}" una excepcionalidad de actividad INDEFINIDA (${EXCEPCION_CAUSAS[causaExc].etiqueta}) desde el ${desdeExc}` : `Ha concedido a "${usuarioExc.nombre}" una excepcionalidad de actividad de ${diasExc} días (${EXCEPCION_CAUSAS[causaExc].etiqueta}) del ${desdeExc} al ${hastaExc}`,
+            }));
+            return json({
+              ok: true,
+              correo_enviado: correoEnviado,
+              sin_correo: !emailExc,
+              items: await listarExcepcionesActividadUsuario(env, uidExc),
+            }, 201);
+          }
+
+          if (method === "DELETE" && eidExc !== null) {
+            const fila = await env.DB.prepare("SELECT id, causa, desde, hasta, cancelada_at FROM excepciones_actividad WHERE id = ? AND user_id = ?").bind(eidExc, uidExc).first();
+            if (!fila) return json({ error: "Excepcionalidad no encontrada" }, 404);
+            if (fila.cancelada_at) return json({ error: "Ya estaba cancelada" }, 400);
+            // Una indefinida ya empezada se FINALIZA (se cierra hoy y sus días cuentan como extra); el resto se cancela.
+            const finalizada = fila.hasta === EXCEPCION_HASTA_INDEFINIDA && fila.desde <= hoyExc;
+            if (finalizada) {
+              const diasTranscurridos = Math.round((Date.parse(`${hoyExc}T00:00:00Z`) - Date.parse(`${fila.desde}T00:00:00Z`)) / INACTIVIDAD_DIA_MS) + 1;
+              await env.DB.prepare("UPDATE excepciones_actividad SET hasta = ?, dias = ? WHERE id = ?").bind(hoyExc, diasTranscurridos, eidExc).run();
+            } else {
+              await env.DB.prepare("UPDATE excepciones_actividad SET cancelada_at = datetime('now') WHERE id = ?").bind(eidExc).run();
+            }
+            ctx.waitUntil(registrarActividad(env, request, payload, {
+              accion: "excepcionalidad_actividad", entidad: "usuario", entidad_id: uidExc,
+              descripcion: `Ha ${finalizada ? "finalizado" : "cancelado"} la excepcionalidad de actividad de "${usuarioExc.nombre}" (desde ${fila.desde})`,
+            }));
+            return json({ ok: true, items: await listarExcepcionesActividadUsuario(env, uidExc) });
+          }
+        } catch (err) {
+          console.error("excepcionalidades de actividad:", err);
+          return json({ error: "No se han podido gestionar las excepcionalidades de actividad. ¿Se ha ejecutado la migración de la tabla excepciones_actividad?" }, 500);
+        }
+      }
+
       const resetPassMatch = path.match(/^\/api\/users\/(\d+)\/reset-password$/);
       if (resetPassMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede restablecer contraseñas" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede restablecer contraseñas" }, 403);
         const id = parseInt(resetPassMatch[1]);
         const user = await env.DB.prepare("SELECT id, username FROM users WHERE id = ?").bind(id).first();
         if (!user) return json({ error: "Usuario no encontrado" }, 404);
@@ -20096,16 +26464,16 @@ async function handlePrimary(request, env, ctx) {
       if (nivelMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede cambiar el nivel de un colaborador" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede cambiar el nivel de un colaborador" }, 403);
         const id = parseInt(nivelMatch[1]);
         const user = await env.DB.prepare("SELECT id, nombre, nivel, rol FROM users WHERE id = ?").bind(id).first();
         if (!user) return json({ error: "Usuario no encontrado" }, 404);
         // Los admins siempre están al nivel máximo mientras tengan ese
         // rol: no se les puede subir ni bajar a mano. Si se quiere que
         // un admin vuelva a tener un nivel "normal", primero hay que
-        // quitarle el rol de administrador.
+        // quitarle el rol de Responsable.
         if (user.rol === "admin") {
-          return json({ error: "Los administradores están siempre en el nivel máximo y no se puede editar su nivel mientras tengan ese rol" }, 400);
+          return json({ error: "Los Responsables están siempre en el nivel máximo y no se puede editar su nivel mientras tengan ese rol" }, 400);
         }
         // Un fotógrafo tiene su propia escala (F1–F2, guardada como 1–2 en la misma
         // columna); un redactor, N1–N4. Ver NIVELES_FOTO_INFO.
@@ -20147,7 +26515,7 @@ async function handlePrimary(request, env, ctx) {
       if (nivelHistorialMatch && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver el historial de niveles" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede ver el historial de niveles" }, 403);
         const id = parseInt(nivelHistorialMatch[1]);
         const { results } = await env.DB.prepare(
           `SELECT nivel_anterior, nivel_nuevo, motivo, cambiado_por_nombre, created_at
@@ -20161,7 +26529,7 @@ async function handlePrimary(request, env, ctx) {
       if (userMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede editar usuarios" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede editar usuarios" }, 403);
         const id = parseInt(userMatch[1]);
         const body = await request.json();
         const user = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
@@ -20170,7 +26538,7 @@ async function handlePrimary(request, env, ctx) {
         // Evita que un admin se quite a sí mismo el rol o se desactive,
         // para no quedarse fuera del panel por error.
         if (id === payload.uid && body.rol && body.rol !== "admin") {
-          return json({ error: "No puedes quitarte a ti mismo el rol de administrador" }, 400);
+          return json({ error: "No puedes quitarte a ti mismo el rol de Responsable" }, 400);
         }
         // Si se le va a quitar el rol de admin a este usuario (o se le
         // asigna cualquier otro rol) y era el nivel máximo solo por ser
@@ -20217,10 +26585,29 @@ async function handlePrimary(request, env, ctx) {
           id
         ).run();
 
+        // Un fotógrafo no puede estar en un grupo de trabajo: si cambia a ese rol, se le suelta del suyo.
+        if (body.rol !== undefined && !puedeTenerGrupoTrabajo(normalizarRolColaborador(body.rol))) {
+          try {
+            const datosGt = await leerGruposTrabajo(env);
+            if (datosGt.asignaciones[String(id)]) {
+              delete datosGt.asignaciones[String(id)];
+              await guardarGruposTrabajo(env, datosGt);
+            }
+          } catch (err) { console.error("grupos de trabajo: no se pudo soltar al cambiar de rol", err); }
+        }
+
         // Excepción "firma solo con su nombre" (sin apellidos): solo la cambia un admin.
         if (body.sin_apellidos !== undefined) {
           await asegurarColumnaSinApellidos(env);
           await env.DB.prepare("UPDATE users SET sin_apellidos = ? WHERE id = ?").bind(body.sin_apellidos ? 1 : 0, id).run();
+        }
+
+        // "Colaborador anónimo": lo que publique no lleva su nombre. Solo lo cambia un admin y
+        // no aplica a otros admins.
+        if (body.anonimo !== undefined && user.rol !== "admin") {
+          await asegurarColumnaAnonimo(env);
+          await env.DB.prepare("UPDATE users SET anonimo = ? WHERE id = ?").bind(body.anonimo ? 1 : 0, id).run();
+          invalidarCacheCorta("anonimos:");
         }
 
         // Pasar de redactor a fotógrafo (o al revés) reinicia el nivel a 1: las escalas son
@@ -20249,7 +26636,7 @@ async function handlePrimary(request, env, ctx) {
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "editar_usuario", entidad: "usuario", entidad_id: id,
           descripcion: `Ha editado el usuario "${user.username}"`,
-          detalle: body,
+          detalle: { ...body, _rol_cambiado: rolFinalUsuario !== user.rol, _desactivado: seDesactivaUsuario },
         }));
 
         return json({ ok: true });
@@ -20258,7 +26645,7 @@ async function handlePrimary(request, env, ctx) {
       if (userMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede eliminar usuarios" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede eliminar usuarios" }, 403);
         const id = parseInt(userMatch[1]);
         if (id === payload.uid) return json({ error: "No puedes eliminar tu propia cuenta" }, 400);
         const userBorrado = await env.DB.prepare("SELECT username, nombre, rol, equipo, categorias_fijas, email FROM users WHERE id = ?").bind(id).first();
@@ -20329,8 +26716,13 @@ async function handlePrimary(request, env, ctx) {
         }
         // Fuera también su respuesta en los formularios con alta de usuario (su nombre vuelve a la lista).
         let respuestasFormularioBorradas = 0;
-        try { respuestasFormularioBorradas = await borrarRespuestasDeUsuarioFormulario(env, userBorrado); }
+        const opcionesElegidasBorradas = [];
+        try { respuestasFormularioBorradas = await borrarRespuestasDeUsuarioFormulario(env, userBorrado, opcionesElegidasBorradas); }
         catch (e) { console.error("[formularios/usuario-eliminado]", e); }
+        // Y su nombre fuera de la lista del formulario de incorporación (no bloquea el borrado si falla).
+        let nombresFormularioQuitados = 0;
+        try { nombresFormularioQuitados = await quitarNombreDeUsuarioFormularios(env, userBorrado, opcionesElegidasBorradas); }
+        catch (e) { console.error("[formularios/usuario-eliminado/nombres]", e); }
         if (!respuestasFormularioBorradas && userBorrado && FORMULARIO_ALTA_ROLES.includes(userBorrado.rol)) {
           console.warn(`[formularios/usuario-eliminado] No se encontró respuesta de formulario para "${userBorrado.username}" (${userBorrado.nombre})`);
         }
@@ -20340,7 +26732,7 @@ async function handlePrimary(request, env, ctx) {
           accion: "eliminar_usuario", entidad: "usuario", entidad_id: id,
           descripcion: `Ha eliminado el usuario "${userBorrado ? userBorrado.username : id}"`,
         }));
-        return json({ ok: true, respuestas_formulario_borradas: respuestasFormularioBorradas });
+        return json({ ok: true, respuestas_formulario_borradas: respuestasFormularioBorradas, nombres_formulario_quitados: nombresFormularioQuitados });
       }
 
       // ---------- MEDIA: subir contenido (fotos/vídeos) ----------
@@ -20571,7 +26963,7 @@ async function handlePrimary(request, env, ctx) {
           // "pesa demasiado" en el panel: falla al momento con un mensaje claro.
           if (esCuotaCloudinaria(err.cloudinaryStatus, err.cloudinaryMensaje)) {
             return json({
-              error: "Ninguna cuenta de Cloudinary puede aceptar más archivos ahora mismo (sin cupo o credenciales rechazadas). Avisa a un administrador.",
+              error: "Ninguna cuenta de Cloudinary puede aceptar más archivos ahora mismo (sin cupo o credenciales rechazadas). Avisa a un Responsable.",
               detail: err.message,
             }, 507);
           }
@@ -20876,7 +27268,7 @@ async function handlePrimary(request, env, ctx) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
         try {
-          const resultado = payload.rol === "admin"
+          const resultado = esAdminOGestor(payload)
             ? await env.DB.prepare(
                 "SELECT c.id, c.nombre, c.created_at, (SELECT COUNT(*) FROM media m WHERE m.carpeta_id = c.id) AS total FROM media_carpetas c ORDER BY LOWER(c.nombre)"
               ).all()
@@ -20940,8 +27332,8 @@ async function handlePrimary(request, env, ctx) {
       if (carpetaMediaMatch && (method === "PUT" || method === "DELETE")) {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") {
-          return json({ error: "Solo un administrador puede renombrar o eliminar carpetas" }, 403);
+        if (!esAdminOGestor(payload)) {
+          return json({ error: "Solo un Responsable o un Sub-Responsable de Contenido/Diseño puede renombrar o eliminar carpetas" }, 403);
         }
         const carpetaId = parseInt(carpetaMediaMatch[1]);
         try {
@@ -21003,7 +27395,6 @@ async function handlePrimary(request, env, ctx) {
         try { body = await request.json(); } catch { return json({ error: "Petición no válida" }, 400); }
         const ids = [...new Set((Array.isArray(body && body.ids) ? body.ids : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
         if (!ids.length) return json({ error: "No has elegido ningún archivo" }, 400);
-        if (ids.length > 200) return json({ error: "Demasiados archivos a la vez (máximo 200)" }, 400);
         const destinoRaw = body.carpeta_id === undefined || body.carpeta_id === null ? "" : String(body.carpeta_id).trim();
         let destino = null;
         if (destinoRaw) {
@@ -21016,10 +27407,10 @@ async function handlePrimary(request, env, ctx) {
           for (let i = 0; i < ids.length; i += 50) {
             const lote = ids.slice(i, i + 50);
             const marcadores = lote.map(() => "?").join(",");
-            const soloMios = payload.rol === "admin" ? "" : " AND autor_id = ?";
+            const soloMios = esAdminOGestor(payload) ? "" : " AND autor_id = ?";
             const res = await env.DB.prepare(
               `UPDATE media SET carpeta_id = ? WHERE id IN (${marcadores}) AND visibilidad = 'privado'${soloMios}`
-            ).bind(destino, ...lote, ...(payload.rol === "admin" ? [] : [payload.uid])).run();
+            ).bind(destino, ...lote, ...(esAdminOGestor(payload) ? [] : [payload.uid])).run();
             movidos += Number(res && res.meta && res.meta.changes) || 0;
           }
           if (movidos) {
@@ -21038,8 +27429,136 @@ async function handlePrimary(request, env, ctx) {
         }
       }
 
+      // ---------- MEDIA: editar varios archivos a la vez ----------
+      // POST /api/media/editar-lote { ids: [...], cambios: {...} }
+      // Solo se aplican las claves PRESENTES en "cambios" (clave ausente = sin cambios):
+      //   titulo      texto no vacío; con numerar=true queda "Título 1", "Título 2"... (orden de ids)
+      //   descripcion texto ("" = vaciar)
+      //   club        texto ("" = quitar). Se ignora en lo que se vincule a un partido.
+      //   visibilidad "publico" | "privado" (pasar a público desvincula de su carpeta)
+      //   carpeta_id  "" = Sin carpeta | id. Solo afecta a lo que quede/sea privado.
+      //   resultId    id de partido (vincula a su galería) | null/"" = quitar el vínculo
+      //   equipo      "local" | "visitante" | "" (solo junto a resultId)
+      // Un admin/gestor edita cualquier archivo; el resto, solo los suyos (lo demás se
+      // omite y se cuenta en "omitidos"). Todo se valida ANTES de guardar nada.
+      if (path === "/api/media/editar-lote" && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Petición no válida" }, 400); }
+        const ids = [...new Set((Array.isArray(body && body.ids) ? body.ids : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+        if (!ids.length) return json({ error: "No has elegido ningún archivo" }, 400);
+        const cambios = body && body.cambios && typeof body.cambios === "object" ? body.cambios : {};
+        const tiene = (k) => Object.prototype.hasOwnProperty.call(cambios, k);
+
+        const set = []; // fragmentos "columna = ?" comunes a todas las filas
+        const vals = [];
+        const campos = [];
+        let titulo = null;
+        if (tiene("titulo")) {
+          titulo = String(cambios.titulo === null || cambios.titulo === undefined ? "" : cambios.titulo).replace(/\s+/g, " ").trim();
+          if (!titulo) return json({ error: "El título no puede quedar vacío" }, 400);
+          if (titulo.length > 190) return json({ error: "El título es demasiado largo (máximo 190 caracteres)" }, 400);
+          campos.push("título");
+        }
+        const numerar = titulo !== null && cambios.numerar === true;
+        if (tiene("descripcion")) {
+          const d = String(cambios.descripcion === null || cambios.descripcion === undefined ? "" : cambios.descripcion).trim();
+          if (d.length > 5000) return json({ error: "La descripción es demasiado larga" }, 400);
+          set.push("descripcion = ?"); vals.push(d || null); campos.push("descripción");
+        }
+        let visibilidad = null;
+        if (tiene("visibilidad")) {
+          visibilidad = String(cambios.visibilidad || "").trim().toLowerCase();
+          if (visibilidad !== "publico" && visibilidad !== "privado") return json({ error: "La visibilidad elegida no es válida" }, 400);
+          set.push("visibilidad = ?"); vals.push(visibilidad); campos.push("visibilidad");
+        }
+        // Partido: id numérico = vincular; null/"" = quitar el vínculo; ausente = no tocar.
+        let resultId; // undefined = no tocar
+        if (tiene("resultId")) {
+          const raw = cambios.resultId === null || cambios.resultId === undefined ? "" : String(cambios.resultId).trim();
+          if (!raw) resultId = null;
+          else {
+            resultId = Number(raw);
+            if (!Number.isInteger(resultId) || resultId <= 0) return json({ error: "El partido elegido no es válido" }, 400);
+            const partido = await env.DB.prepare("SELECT id FROM results WHERE id = ?").bind(resultId).first();
+            if (!partido) return json({ error: "El partido elegido ya no existe" }, 404);
+          }
+          campos.push("partido");
+        }
+        let equipoGaleria = null;
+        if (resultId) {
+          const e = String(cambios.equipo || "").trim().toLowerCase();
+          equipoGaleria = e === "local" || e === "visitante" ? e : null;
+        }
+        // Club: si se vincula a un partido el club de texto libre se anula (igual que en PUT /api/media/:id).
+        if (resultId) { set.push("club = NULL"); }
+        else if (tiene("club")) {
+          const c = String(cambios.club === null || cambios.club === undefined ? "" : cambios.club).trim();
+          if (c.length > 120) return json({ error: "El nombre del club es demasiado largo" }, 400);
+          set.push("club = ?"); vals.push(c || null); campos.push("club");
+        }
+        // Carpeta: solo tiene sentido en contenido privado.
+        let carpetaDestino; // undefined = no tocar
+        if (tiene("carpeta_id")) {
+          const texto = cambios.carpeta_id === null || cambios.carpeta_id === undefined ? "" : String(cambios.carpeta_id).trim();
+          if (!texto) carpetaDestino = null;
+          else {
+            const r = await resolverCarpetaMediaDeSubida(env, texto, true);
+            if (r.error) return json({ error: r.error }, r.status);
+            carpetaDestino = r.id;
+          }
+          campos.push("carpeta");
+        }
+        if (visibilidad === "publico") {
+          set.push("carpeta_id = NULL");
+        } else if (carpetaDestino !== undefined) {
+          if (visibilidad === "privado") { set.push("carpeta_id = ?"); vals.push(carpetaDestino); }
+          else { set.push("carpeta_id = CASE WHEN visibilidad = 'privado' THEN ? ELSE carpeta_id END"); vals.push(carpetaDestino); }
+        }
+        if (!campos.length) return json({ error: "No has elegido ningún cambio" }, 400);
+
+        try {
+          // Qué filas puede tocar esta persona (el orden de "ids" se conserva para numerar).
+          const permitidas = new Set();
+          for (let i = 0; i < ids.length; i += 50) {
+            const lote = ids.slice(i, i + 50);
+            const { results: filas } = await env.DB.prepare(
+              `SELECT id, autor_id FROM media WHERE id IN (${lote.map(() => "?").join(",")})`
+            ).bind(...lote).all();
+            for (const f of (filas || [])) if (esAdminOGestor(payload) || f.autor_id === payload.uid) permitidas.add(Number(f.id));
+          }
+          const objetivo = ids.filter((id) => permitidas.has(id));
+          if (!objetivo.length) return json({ error: "No se ha editado ningún archivo (no existen o son de otra persona)" }, 403);
+
+          // Si el único cambio es quitar el partido no hay ninguna columna de "media" que tocar.
+          if (set.length || titulo !== null) {
+            const sentencias = objetivo.map((id, i) => {
+              const columnas = [...set];
+              const params = [...vals];
+              if (titulo !== null) { columnas.unshift("titulo = ?"); params.unshift(numerar ? `${titulo} ${i + 1}` : titulo); }
+              return env.DB.prepare(`UPDATE media SET ${columnas.join(", ")} WHERE id = ?`).bind(...params, id);
+            });
+            for (let i = 0; i < sentencias.length; i += 80) await env.DB.batch(sentencias.slice(i, i + 80));
+          }
+          await sincronizarGaleriaPartidoLoteMedia(env, payload, objetivo, resultId, equipoGaleria);
+
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "editar_media_lote", entidad: "media", entidad_id: "lote",
+            descripcion: `Ha editado ${objetivo.length} archivo(s) de contenido a la vez (${campos.join(", ")})`,
+          }));
+          return json({ ok: true, editados: objetivo.length, omitidos: ids.length - objetivo.length });
+        } catch (err) {
+          // 409 y no 5xx: ver resolverCarpetaMediaDeSubida (evita un failover falso).
+          if (/no such (table|column)|does not exist/i.test(err.message || "") || esErrorColumnaFaltante(err)) {
+            return json({ error: "Falta ejecutar una migración de la base de datos (visibilidad o carpetas) para aplicar este cambio.", detail: err.message }, 409);
+          }
+          return json({ error: "No se pudieron editar los archivos", detail: err.message }, 500);
+        }
+      }
+
       // ---------- MEDIA: listado ----------
-      // Los administradores ven todo lo subido por el equipo; un redactor
+      // Los Responsables ven todo lo subido por el equipo; un redactor
       // normal solo ve (y por tanto solo puede editar) lo que ha subido él.
       if (path === "/api/media" && method === "GET") {
         const payload = await requireAuth(request, env);
@@ -21047,9 +27566,36 @@ async function handlePrimary(request, env, ctx) {
         const base = "SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.nombre_archivo, m.content_type, m.tamano_bytes, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre, m.club, m.created_at, m.portada_segundo, m.portada_foco, m.visibilidad FROM media m LEFT JOIN users u ON u.id = m.autor_id";
         const baseSinFoco = "SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.nombre_archivo, m.content_type, m.tamano_bytes, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre, m.club, m.created_at, m.portada_segundo FROM media m LEFT JOIN users u ON u.id = m.autor_id";
         const baseSinPortada = "SELECT m.id, m.cloudinary_url, m.titulo, m.descripcion, m.tipo, m.nombre_archivo, m.content_type, m.tamano_bytes, m.autor_id, COALESCE(u.nombre, m.autor_nombre) AS autor_nombre, m.club, m.created_at FROM media m LEFT JOIN users u ON u.id = m.autor_id";
+        // Las lecturas auxiliares (carpeta y partido vinculado de cada archivo) NO dependen del
+        // listado principal: se lanzan YA, en paralelo con él. Antes se esperaba a tener el
+        // listado y luego se hacía una consulta por cada 90 ids, primero las carpetas y después
+        // los partidos (con cientos de archivos, decenas de viajes a la base de datos en serie).
+        // Ahora son dos consultas en total, con filtro por autor para quien no es admin.
+        const verTodoMedia = esAdminOGestor(payload);
+        const lecturaCarpetasMedia = (async () => {
+          try {
+            const r = verTodoMedia
+              ? await env.DB.prepare("SELECT id, carpeta_id FROM media").all()
+              : await env.DB.prepare("SELECT id, carpeta_id FROM media WHERE autor_id = ?").bind(payload.uid).all();
+            return new Map((r.results || []).map((c) => [c.id, c.carpeta_id]));
+          } catch (err) {
+            return null; // sin migración de carpetas: todo cae en "sin carpeta", como antes
+          }
+        })();
+        const SQL_ENLACES_MEDIA = `SELECT mg.id AS enlace_id, mg.media_id, mg.equipo, mg.result_id,
+                        r.equipo_local, r.equipo_visitante, r.slug
+                 FROM match_gallery mg
+                 JOIN results r ON r.id = mg.result_id`;
+        const lecturaEnlacesMedia = (async () => {
+          const r = verTodoMedia
+            ? await env.DB.prepare(SQL_ENLACES_MEDIA).all()
+            : await env.DB.prepare(`${SQL_ENLACES_MEDIA} WHERE mg.media_id IN (SELECT id FROM media WHERE autor_id = ?)`).bind(payload.uid).all();
+          return r.results || [];
+        })();
+        lecturaEnlacesMedia.catch(() => {}); // el fallo se trata más abajo; evita "unhandled rejection"
         let resultadoMedia;
         try {
-          resultadoMedia = payload.rol === "admin"
+          resultadoMedia = esAdminOGestor(payload)
             ? await env.DB.prepare(`${base} ORDER BY m.created_at DESC`).all()
             : await env.DB.prepare(`${base} WHERE m.autor_id = ? ORDER BY m.created_at DESC`).bind(payload.uid).all();
         } catch (err) {
@@ -21057,11 +27603,11 @@ async function handlePrimary(request, env, ctx) {
           // migraciones manuales: si aún no se han ejecutado en esta base
           // de datos, se reintenta sin ellas en vez de romper el listado.
           try {
-            resultadoMedia = payload.rol === "admin"
+            resultadoMedia = esAdminOGestor(payload)
               ? await env.DB.prepare(`${baseSinFoco} ORDER BY m.created_at DESC`).all()
               : await env.DB.prepare(`${baseSinFoco} WHERE m.autor_id = ? ORDER BY m.created_at DESC`).bind(payload.uid).all();
           } catch (err2) {
-            resultadoMedia = payload.rol === "admin"
+            resultadoMedia = esAdminOGestor(payload)
               ? await env.DB.prepare(`${baseSinPortada} ORDER BY m.created_at DESC`).all()
               : await env.DB.prepare(`${baseSinPortada} WHERE m.autor_id = ? ORDER BY m.created_at DESC`).bind(payload.uid).all();
           }
@@ -21072,17 +27618,8 @@ async function handlePrimary(request, env, ctx) {
         // migracion_media_carpetas.sql, el listado sigue igual que antes (con
         // visibilidad y foco) y todo aparece sin carpeta.
         if (filas.length) {
-          try {
-            const conCarpeta = await selectPorLotesDeIds(
-              env,
-              filas.map((f) => f.id),
-              (marcadores) => `SELECT id, carpeta_id FROM media WHERE id IN (${marcadores})`
-            );
-            const carpetaPorId = new Map(conCarpeta.map((c) => [c.id, c.carpeta_id]));
-            for (const f of filas) f.carpeta_id = carpetaPorId.get(f.id) ?? null;
-          } catch (err) {
-            for (const f of filas) f.carpeta_id = null;
-          }
+          const carpetaPorId = await lecturaCarpetasMedia;
+          for (const f of filas) f.carpeta_id = (carpetaPorId && carpetaPorId.get(f.id)) ?? null;
         }
         // Se añade a cada foto/vídeo, si tiene, el partido al que está
         // vinculada en match_gallery (result_id + nombres de equipos +
@@ -21093,18 +27630,7 @@ async function handlePrimary(request, env, ctx) {
         // los reintentos por columnas que puedan faltar.
         if (filas.length) {
           try {
-            // Por lotes: la mediateca puede tener cientos de archivos y D1
-            // rechaza consultas con más de 100 variables (?).
-            const enlaces = await selectPorLotesDeIds(
-              env,
-              filas.map((f) => f.id),
-              (marcadores) =>
-                `SELECT mg.id AS enlace_id, mg.media_id, mg.equipo, mg.result_id,
-                        r.equipo_local, r.equipo_visitante, r.slug
-                 FROM match_gallery mg
-                 JOIN results r ON r.id = mg.result_id
-                 WHERE mg.media_id IN (${marcadores})`
-            );
+            const enlaces = await lecturaEnlacesMedia;
             const porMediaId = new Map(enlaces.map((e) => [e.media_id, e]));
             // El slug de un partido se genera "bajo demanda" (puede que un
             // partido con galería todavía no lo tenga si nadie ha abierto
@@ -21149,7 +27675,7 @@ async function handlePrimary(request, env, ctx) {
         const id = parseInt(mediaMatch[1]);
         const registro = await env.DB.prepare("SELECT autor_id, tipo FROM media WHERE id = ?").bind(id).first();
         if (!registro) return json({ error: "No encontrado" }, 404);
-        if (payload.rol !== "admin" && registro.autor_id !== payload.uid) {
+        if (!esAdminOGestor(payload) && registro.autor_id !== payload.uid) {
           return json({ error: "Solo la persona que subió este contenido puede editarlo" }, 403);
         }
         const body = await request.json();
@@ -21324,7 +27850,7 @@ async function handlePrimary(request, env, ctx) {
       if (mediaDownloadMatch && method === "GET") {
         const payload = await requireAuth(request, env, url);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede descargar contenido" }, 403);
+        if (!esAdminOGestor(payload)) return json({ error: "Solo un Responsable o un Sub-Responsable de Contenido/Diseño puede descargar contenido" }, 403);
         const id = parseInt(mediaDownloadMatch[1]);
         const registro = await env.DB.prepare("SELECT * FROM media WHERE id = ?").bind(id).first();
         if (!registro) return json({ error: "No encontrado" }, 404);
@@ -21360,16 +27886,23 @@ async function handlePrimary(request, env, ctx) {
         const id = parseInt(mediaMatch[1]);
         const registro = await env.DB.prepare("SELECT cloudinary_public_id, cloudinary_resource_type, cloudinary_url, autor_id FROM media WHERE id = ?").bind(id).first();
         if (!registro) return json({ error: "No encontrado" }, 404);
-        if (payload.rol !== "admin" && registro.autor_id !== payload.uid) {
+        if (!esAdminOGestor(payload) && registro.autor_id !== payload.uid) {
           return json({ error: "Solo puedes eliminar contenido que hayas subido tú" }, 403);
         }
-        await borrarDeCloudinary(env, registro.cloudinary_public_id, registro.cloudinary_resource_type, cloudNameDeUrlCloudinary(registro.cloudinary_url));
+        // Papelera: se guarda una copia recuperable y NO se toca Cloudinary; el original solo
+        // se destruye cuando la entrada caduca o un admin la borra definitivamente.
+        try {
+          await papeleraGuardarMedia(env, payload, id);
+        } catch (err) {
+          console.error("[papelera] No se pudo guardar el archivo; no se borra:", err);
+          return json({ error: "No se pudo mover el archivo a la papelera, así que no se ha borrado. Inténtalo de nuevo." }, 500);
+        }
         await env.DB.prepare("DELETE FROM media WHERE id = ?").bind(id).run();
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "eliminar_media", entidad: "media", entidad_id: id,
-          descripcion: `Ha eliminado un contenido multimedia (id ${id})`,
+          descripcion: `Ha movido a la papelera un contenido multimedia (id ${id})`,
         }));
-        return json({ ok: true });
+        return json({ ok: true, papelera: true });
       }
 
       // ---------- GALERÍA DE PARTIDO (match_gallery) ----------
@@ -21590,9 +28123,9 @@ async function handlePrimary(request, env, ctx) {
         const id = parseInt(galeriaItemMatch[1]);
         const enlace = await env.DB.prepare("SELECT result_id, vinculado_por_id FROM match_gallery WHERE id = ?").bind(id).first();
         if (!enlace) return json({ error: "No encontrado" }, 404);
-        const puedeQuitar = esAdmin(payload) || enlace.vinculado_por_id === payload.uid;
+        const puedeQuitar = esAdminOGestor(payload) || enlace.vinculado_por_id === payload.uid;
         if (!puedeQuitar) {
-          return json({ error: "Solo un administrador o quien vinculó esta imagen puede quitarla de la galería" }, 403);
+          return json({ error: "Solo un Responsable o quien vinculó esta imagen puede quitarla de la galería" }, 403);
         }
         // La portada es obligatoria: si esta foto ES la portada y quedan otras
         // fotos públicas en la galería, primero hay que elegir otra portada. (Si
@@ -21954,10 +28487,10 @@ async function handlePrimary(request, env, ctx) {
       //    y programado_para con fecha). Quitar la etiqueta se puede siempre.
       //  - La etiqueta desaparece sola cuando la noticia se publica (ver
       //    publicarArticulosProgramados) o deja de estar programada (PUT).
-      //  - Permiso: admin o redactor Nivel 4+ (NIVEL_REDES_MINIMO). No
+      //  - Permiso: admin o redactor Nivel 3+ (NIVEL_REDES_MINIMO). No
       //    hace falta ser autor: es organización de redes de toda la redacción.
       // Nivel mínimo para organizar noticias en carruseles (el panel lo oculta por debajo).
-      const NIVEL_REDES_MINIMO = 4;
+      // NIVEL_REDES_MINIMO (global, junto a NIVELES_INFO): Nivel 3.
       // Acepta varias a la vez: { ids: [1, 2, 3], destino: "carousel_1" | "carousel_2" | "individual" | null }
       // ===== Feedback de revisores =====
       if (path === "/api/feedback" && method === "GET") {
@@ -21966,6 +28499,12 @@ async function handlePrimary(request, env, ctx) {
         const tipo = url.searchParams.get("tipo");
         const limite = Math.min(Math.max(parseInt(url.searchParams.get("limit")) || 100, 1), 300);
         const enviados = url.searchParams.get("enviados") === "1";
+        // El feedback «enviado» (el que se deja al aprobar o programar piezas ajenas) solo lo ven los
+        // Responsables y los redactores de Nivel 4, que son quienes lo escriben.
+        if (enviados && payload.rol !== "admin" && (await obtenerNivelUsuario(env, payload.uid)) < NIVEL_MAXIMO) {
+          const sinLeer = await env.DB.prepare("SELECT COUNT(*) AS n FROM article_feedback WHERE destinatario_id = ? AND leido = 0").bind(payload.uid).first();
+          return json({ feedback: [], no_leidos: Number(sinLeer && sinLeer.n) || 0 });
+        }
         const columna = enviados ? "autor_feedback_id" : "destinatario_id";
         const binds = [payload.uid];
         let where = `${columna} = ?`;
@@ -22081,7 +28620,7 @@ async function handlePrimary(request, env, ctx) {
       // Desactivar el banner sin tener que reenviar todo el formulario
       // de edición de la noticia (pensado para el botón "Quitar" del
       // listado del panel, ver Fase 2). Mismo criterio de permisos que
-      // activarlo desde el PUT normal: admin o redactor Nivel 2+, y
+      // activarlo desde el PUT normal: admin o redactor Nivel 3+, y
       // además tiene que poder editar esa noticia en concreto.
       const desactivarBannerMatch = path.match(/^\/api\/articles\/(\d+)\/banner-urgente$/);
       if (desactivarBannerMatch && method === "DELETE") {
@@ -22097,7 +28636,7 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: "No puedes modificar esta noticia." }, 403);
         }
         const nivelUsuario = payload.rol === "admin" ? NIVEL_MAXIMO : await obtenerNivelUsuario(env, payload.uid);
-        if (payload.rol !== "admin" && nivelUsuario < 2) {
+        if (payload.rol !== "admin" && nivelUsuario < NIVEL_PUBLICACION_DIRECTA) {
           return json({ error: "No tienes permiso para gestionar el banner de última hora." }, 403);
         }
         await env.DB.prepare("UPDATE articles SET banner_urgente = 0, banner_urgente_hasta = NULL, updated_at = datetime('now') WHERE id = ?").bind(id).run();
@@ -22150,12 +28689,12 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- Admin: corrección manual de jugadores (estadísticas, Fase 1) ----------
-      // Funcionalidades > Jugadores. Solo administradores. Ver
+      // Funcionalidades > Jugadores. Solo Responsables. Ver
       // statsAplicarCorrecciones y worker/migracion_jugadores.sql.
       if (path.startsWith("/api/admin/jugadores")) {
         const plJug = await requireAuth(request, env);
         if (!plJug) return json({ error: "No autorizado" }, 401);
-        if (!esAdmin(plJug)) return json({ error: "Solo un administrador puede corregir jugadores" }, 403);
+        if (!esAdmin(plJug)) return json({ error: "Solo un Responsable puede corregir jugadores" }, 403);
         const limpiarNombreJug = (t) => String(t || "").replace(/\s+/g, " ").trim();
         const dorsalJug = (v) => {
           if (v === null || v === undefined || v === "") return null;
@@ -22449,6 +28988,29 @@ async function handlePrimary(request, env, ctx) {
         return json({ mas_leidas: masLeidas.map(paraPortada), tendencias: tendencias.map(paraPortada) });
       }
 
+      // ---------- Etiquetas (tags) reales de las noticias ----------
+      // GET /api/etiquetas            listado { etiquetas: [{ nombre, slug, total, ultima }] }
+      //                               (?min=2 solo las de 2+ noticias; ?limit=N, máx. 500)
+      // GET /api/etiquetas/{slug}     una etiqueta + si debe indexarse; 404 si no existe
+      // Las noticias de una etiqueta salen de GET /api/articles?etiqueta={slug}.
+      if (path === "/api/etiquetas" && method === "GET") {
+        const limitPedido = parseInt(url.searchParams.get("limit") || "200", 10);
+        const limite = Number.isInteger(limitPedido) && limitPedido > 0 ? Math.min(limitPedido, 500) : 200;
+        const minPedido = parseInt(url.searchParams.get("min") || "1", 10);
+        const minimo = Number.isInteger(minPedido) && minPedido > 1 ? minPedido : 1;
+        const lista = (await listarEtiquetas(env)).filter((e) => e.total >= minimo).slice(0, limite);
+        return json({ etiquetas: lista });
+      }
+      const etiquetaMatch = path.match(/^\/api\/etiquetas\/([^/]+)$/);
+      if (etiquetaMatch && method === "GET") {
+        let segmento = etiquetaMatch[1];
+        try { segmento = decodeURIComponent(segmento); } catch { /* se usa tal cual */ }
+        const slug = slugEtiqueta(segmento);
+        const etiqueta = slug ? (await listarEtiquetas(env)).find((e) => e.slug === slug) : null;
+        if (!etiqueta) return json({ error: "Etiqueta no encontrada" }, 404);
+        return json({ etiqueta, indexable: etiqueta.total >= MIN_NOTICIAS_ETIQUETA_INDEXABLE });
+      }
+
       if (path === "/api/articles" && method === "GET") {
         const categoria = url.searchParams.get("categoria");
         const club = url.searchParams.get("club");
@@ -22523,7 +29085,7 @@ async function handlePrimary(request, env, ctx) {
             ${admin ? "CASE WHEN publicado = 1 AND (fecha_publicacion IS NULL OR fecha_publicacion < datetime('now', '-2 days')) THEN NULL ELSE redes_destino END" : "NULL"} AS redes_destino,
             ${admin
               ? `CASE WHEN publicado = 1 AND redes_destino IS NULL AND fecha_publicacion >= datetime('now', '-2 days')
-                   AND EXISTS (SELECT 1 FROM users u WHERE u.id = articles.autor_id AND u.rol = 'redactor' AND u.nivel = 2)
+                   AND EXISTS (SELECT 1 FROM users u WHERE u.id = articles.autor_id AND u.rol = 'redactor' AND u.nivel >= ${NIVEL_PUBLICACION_DIRECTA} AND u.nivel < ${NIVEL_REDES_MINIMO})
                    AND NOT EXISTS (SELECT 1 FROM activity_log l WHERE l.accion = 'compartir_redes' AND l.entidad = 'articulo' AND l.entidad_id = CAST(articles.id AS TEXT))
                    THEN 1 ELSE 0 END`
               : "0"} AS sin_revision_redes,
@@ -22573,6 +29135,15 @@ async function handlePrimary(request, env, ctx) {
           binds.push(club, `%"${club}"%`);
         }
         if (tipo) { query += " AND tipo = ?"; binds.push(tipo); }
+        // Etiqueta (tag) real: /etiqueta/{slug} pide aquí sus noticias (ver
+        // src/etiquetas.js). Un valor que no se puede normalizar no devuelve
+        // todo el listado: devuelve vacío.
+        const etiquetaParam = url.searchParams.get("etiqueta");
+        if (etiquetaParam) {
+          const etiquetaSlug = slugEtiqueta(etiquetaParam);
+          if (etiquetaSlug) { query += " AND etiquetas_slugs IS NOT NULL AND etiquetas_slugs LIKE ?"; binds.push(`%,${etiquetaSlug},%`); }
+          else query += " AND 1 = 0";
+        }
         if (autorId) { query += " AND autor_id = ?"; binds.push(parseInt(autorId, 10)); }
         if (destacado === "1") { query += " AND destacado = 1"; }
         if (destacado === "0") { query += " AND destacado = 0"; }
@@ -22630,9 +29201,20 @@ async function handlePrimary(request, env, ctx) {
         // cliente al paginar para no cambiar de criterio entre páginas).
         const ejecutarListado = async () => {
           if (!usarFts) {
-            const { results } = await env.DB.prepare(query + " ORDER BY fecha_publicacion DESC LIMIT ? OFFSET ?")
-              .bind(...binds, limit + 1, offsetArticulos).all();
-            return { filas: results, info: null };
+            const cargarFilas = async () => {
+              const { results } = await env.DB.prepare(query + " ORDER BY fecha_publicacion DESC LIMIT ? OFFSET ?")
+                .bind(...binds, limit + 1, offsetArticulos).all();
+              return results;
+            };
+            // Lectura pública repetida (portada, categorías, fichas de club): 20 s de caché por isolate
+            // en vez de una consulta a D1 por visita. Nunca en la vista admin ni con slug exacto.
+            // Se vacía sola al escribir artículos (ver arriba). Se copian las filas porque el
+            // código de después las modifica (recorta el cuerpo, etc.).
+            if (!admin && !slugExacto && !busqueda) {
+              const filas = await memoCorta(`arts:${url.search}`, 20000, cargarFilas);
+              return { filas: filas.map((f) => ({ ...f })), info: null };
+            }
+            return { filas: await cargarFilas(), info: null };
           }
           const vacio = { q: busqueda, intento: 0, modo: "and", corregido: null, expr: null, extractos: {}, facetas: null };
           if (planBusqueda.vacio) return { filas: [], info: vacio };
@@ -22708,19 +29290,19 @@ async function handlePrimary(request, env, ctx) {
         // Un redactor de Nivel 1 no puede publicar directamente noticias,
         // crónicas, artículos de opinión ni entrevistas: se guardan
         // siempre como borrador salvo que use "Última hora" con su PIN
-        // de 4 dígitos. A partir de Nivel 2, el redactor ya publica
+        // de 4 dígitos. A partir de Nivel 3, el redactor ya publica
         // directo sin necesitar el PIN. Un admin siempre publica directo.
         let esUltimaHora = false;
         let nivelUsuario = payload.rol === "admin" ? NIVEL_MAXIMO : null;
         if (payload.rol !== "admin" && body.publicado !== false) {
           nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
-          if (nivelUsuario < 2) {
+          if (nivelUsuario < NIVEL_PUBLICACION_DIRECTA) {
             esUltimaHora = await comprobarUltimaHora(env, body.ultima_hora_pin);
             if (!esUltimaHora) body.publicado = false;
           }
         }
 
-        // Programar publicación: un admin, o un redactor de Nivel 2+ (que
+        // Programar publicación: un admin, o un redactor de Nivel 3+ (que
         // ya publica directo sin PIN de "Última hora"), puede dejar una
         // noticia programada para publicarse sola en una fecha/hora
         // futura. Si se manda "programado_para" con una fecha futura
@@ -22729,7 +29311,7 @@ async function handlePrimary(request, env, ctx) {
         // estado de borrador (no es un borrador normal, es una programación).
         let programadoPara = null;
         if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
-        if ((payload.rol === "admin" || nivelUsuario >= 2) && body.programado_para) {
+        if ((payload.rol === "admin" || nivelUsuario >= NIVEL_PUBLICACION_DIRECTA) && body.programado_para) {
           const fechaProgramada = new Date(body.programado_para);
           // Se compara por minuto, no por milisegundo exacto: el input del
           // panel solo tiene granularidad de minuto, así que si se programa
@@ -22764,9 +29346,9 @@ async function handlePrimary(request, env, ctx) {
         const preferenciaFechas = normalizarPreferenciaFechas(estadoBorrador === "terminado" ? body : null);
         // Un redactor de Nivel 1 está obligado a indicar fecha de preferencia
         // al mandar una noticia a revisión (borrador "terminado"): así quien
-        // la revisa sabe cuándo conviene publicarla. Nivel 2+ y admin: opcional.
-        if (payload.rol !== "admin" && estadoBorrador === "terminado" && (nivelUsuario ?? 1) < 2 && !preferenciaFechas.desde) {
-          return json({ error: "Como redactor de nivel 1 debes indicar una fecha de preferencia para que la revisen" }, 400);
+        // la revisa sabe cuándo conviene publicarla. Nivel 3+ y admin: opcional.
+        if (payload.rol !== "admin" && estadoBorrador === "terminado" && (nivelUsuario ?? 1) < NIVEL_PUBLICACION_DIRECTA && !preferenciaFechas.desde) {
+          return json({ error: "Como redactor de nivel 1 o 2 debes indicar una fecha de preferencia para que la revisen" }, 400);
         }
 
         // Un borrador guardado como "en proceso" (todavía se está
@@ -22775,9 +29357,9 @@ async function handlePrimary(request, env, ctx) {
         // borrador "terminado".
         const longitudContenido = longitudTextoPlano(body.contenido);
         // Una noticia de "última hora" (PIN válido, o banner urgente activado
-        // por quien tiene permiso: admin o Nivel 2+) no necesita el mínimo.
+        // por quien tiene permiso: admin o Nivel 3+) no necesita el mínimo.
         const sinMinimoUltimaHora = esUltimaHora
-          || (body.banner_urgente === true && (payload.rol === "admin" || nivelUsuario >= 2));
+          || (body.banner_urgente === true && (payload.rol === "admin" || nivelUsuario >= NIVEL_PUBLICACION_DIRECTA));
         if (estadoBorrador !== "en_proceso") {
           if (longitudContenido < CONTENIDO_MIN && !sinMinimoUltimaHora) {
             return json({ error: `El contenido debe tener al menos ${CONTENIDO_MIN} caracteres (tiene ${longitudContenido}).` }, 400);
@@ -22794,7 +29376,7 @@ async function handlePrimary(request, env, ctx) {
         // texto y su foco de recorte); la marcada como portada hace además
         // de "imagen_url", que es la que usan las tarjetas y el hero.
         const imagenes = normalizarImagenes(separarFotosSeguidas(body.imagenes, body.imagen_url, !!body.resultado_id));
-        const imagenPortada = body.imagen_url || (imagenes.find((i) => i.tipo !== "tweet") || {}).url || null;
+        const imagenPortada = body.imagen_url || (imagenes.find((i) => !esItemNoFoto(i)) || {}).url || null;
         // Es obligatorio poner al menos una imagen de portada por noticia.
         // Un borrador "en proceso" (todavía se está escribiendo) puede no
         // tenerla todavía, igual que puede no cumplir los límites de
@@ -22847,6 +29429,12 @@ async function handlePrimary(request, env, ctx) {
         );
         if (errorCategoriasAdicionales) return json({ error: errorCategoriasAdicionales }, 400);
 
+        // Etiquetas (tags) reales: temas libres («Ascenso 2026», «Fichajes») con
+        // página propia en /etiqueta/{slug}. Se guardan aparte, tras crear la
+        // noticia (ver guardarEtiquetasArticulo).
+        const validacionEtiquetas = validarEtiquetas(body.etiquetas);
+        if (validacionEtiquetas.error) return json({ error: validacionEtiquetas.error }, 400);
+
         // Segundo autor (coautor) opcional: una noticia se puede firmar
         // entre dos personas. Solo aporta el nombre extra; no cambia
         // permisos de edición ni nada más (eso lo sigue decidiendo el
@@ -22880,7 +29468,7 @@ async function handlePrimary(request, env, ctx) {
         const fichaTecnica = fichaLimpia ? JSON.stringify(fichaLimpia) : null;
 
         // Banner urgente: solo puede activarlo (a mano, al crear la
-        // noticia) un admin o un redactor de Nivel 2+ -- igual de
+        // noticia) un admin o un redactor de Nivel 3+ -- igual de
         // criterio que programar publicación, más arriba -- para que un
         // redactor recién llegado no pueda ponerse a sí mismo en el
         // banner de toda la web. body.banner_urgente = true lo activa;
@@ -22891,13 +29479,13 @@ async function handlePrimary(request, env, ctx) {
         // más arriba si body.publicado !== false), así que se completa
         // bajo demanda antes de decidir el permiso del banner.
         if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
-        const puedeActivarBanner = payload.rol === "admin" || nivelUsuario >= 2;
+        const puedeActivarBanner = payload.rol === "admin" || nivelUsuario >= NIVEL_PUBLICACION_DIRECTA;
         // Un Nivel 1 que publica con el PIN de "Última hora" (esUltimaHora, ya
         // validado arriba) también puede activar el banner de esa noticia.
         // Con ese mismo PIN también puede dejarla destacada.
         const activarBanner = (puedeActivarBanner || esUltimaHora) && body.banner_urgente === true;
         // "Destacado" lleva la noticia a lo más visible de la portada: mismo
-        // criterio que el banner (admin o Nivel 2+). Un Nivel 1 solo lo activa si
+        // criterio que el banner (admin o Nivel 3+). Un Nivel 1 solo lo activa si
         // publica con el PIN de "Última hora" (esUltimaHora).
         const destacadoFinal = (puedeActivarBanner || esUltimaHora) && body.destacado ? 1 : 0;
 
@@ -22923,16 +29511,21 @@ async function handlePrimary(request, env, ctx) {
         // de "imagenes", que van dentro del propio texto). Solo se guarda
         // algo si el redactor mandó media_ids y/o galeria_resultado_id.
         await sincronizarArticleMedia(env, filaArticuloCreado.id, body);
+        await registrarVersionNoticia(env, payload, filaArticuloCreado.id, "creacion");
+        if (validacionEtiquetas.etiquetas.length) {
+          await guardarEtiquetasArticulo(env, filaArticuloCreado.id, validacionEtiquetas);
+          olvidarCacheEtiquetas();
+        }
 
         // Horario de publicación: si se publica ahora (no borrador ni
         // programada) se comprueba si el día y el tipo están permitidos.
         let fueraCalendario = false;
         if (body.publicado !== false && !programadoPara) {
-          fueraCalendario = await marcarFueraDeCalendario(env, filaArticuloCreado.id, { tipo: body.tipo, resultado_id: resultadoId });
+          fueraCalendario = await marcarFueraDeCalendario(env, filaArticuloCreado.id, { tipo: body.tipo, resultado_id: resultadoId, categoria: categoriaFinal });
         } else if (programadoPara) {
           // Programada: se avisa ya si su día/hora cae fuera del horario, para no
           // ofrecer "Compartir". La marca definitiva la guarda el cron al publicarse.
-          try { fueraCalendario = await estaFueraDeCalendario(env, { tipo: body.tipo, resultado_id: resultadoId, fecha: fechaSqlADate(programadoPara) || undefined }); } catch (err) { console.error("horario_publicacion:", err); }
+          try { fueraCalendario = await estaFueraDeCalendario(env, { tipo: body.tipo, resultado_id: resultadoId, fecha: fechaSqlADate(programadoPara) || undefined, categoria: categoriaFinal }); } catch (err) { console.error("horario_publicacion:", err); }
         }
 
         const publicado = body.publicado !== false;
@@ -23013,6 +29606,20 @@ async function handlePrimary(request, env, ctx) {
       }
 
       // ---------- ARTICLE individual ----------
+      // ---------- Huella pública ligera de una noticia (aviso «noticia actualizada») ----------
+      // GET /api/articles/:slug/version. La consulta noticia.html cada pocos segundos mientras
+      // el lector la tiene abierta; si la huella cambia, le avisa de que hay una versión nueva.
+      // Solo noticias publicadas, sin cuerpo ni datos de autor: una fila mínima de D1.
+      const versionPublicaMatch = path.match(/^\/api\/articles\/([^/]+)\/version$/);
+      if (versionPublicaMatch && method === "GET") {
+        const claveVersion = versionPublicaMatch[1];
+        const filaVersion = await env.DB.prepare(
+          "SELECT id, slug, updated_at FROM articles WHERE (slug = ?1 OR id = ?2) AND publicado = 1"
+        ).bind(claveVersion, isNaN(claveVersion) ? -1 : parseInt(claveVersion)).first();
+        if (!filaVersion) return json({ error: "No encontrado" }, 404);
+        return json({ id: filaVersion.id, slug: filaVersion.slug, huella: `${filaVersion.id}|${filaVersion.slug}|${filaVersion.updated_at || ""}` });
+      }
+
       const articleMatch = path.match(/^\/api\/articles\/([^/]+)$/);
       if (articleMatch && method === "GET") {
         const key = articleMatch[1];
@@ -23087,12 +29694,15 @@ async function handlePrimary(request, env, ctx) {
               try {
                 const lista = normalizarImagenes(JSON.parse(programada.imagenes));
                 // Los tuits/posts incrustados también viven en "imagenes": no son foto.
-                const primera = Array.isArray(lista) && lista.find((x) => x && x.tipo !== "tweet" && x.url);
+                const primera = Array.isArray(lista) && lista.find((x) => x && !esItemNoFoto(x) && x.url);
                 if (primera) programada.imagen_url = primera.url;
               } catch { /* imagenes mal formadas: se queda sin imagen */ }
             }
             programada.imagen_foco = focoDePortada(programada);
             delete programada.imagenes;
+            // Hora del servidor: la página de cuenta atrás la usa para corregir un reloj
+            // desajustado del dispositivo del lector (si no, el contador miente).
+            programada.ahora = new Date().toISOString();
             return json({ programado: programada });
           }
 
@@ -23127,6 +29737,7 @@ async function handlePrimary(request, env, ctx) {
 
         const articleConIdiomas = conIdiomasDisponibles(article);
         Object.assign(article, articleConIdiomas);
+        delete article.etiquetas_slugs; // columna de consulta interna: no se expone
 
         // Fotos adicionales: de JSON guardado a array de verdad. Se
         // normalizan aquí también para que las noticias guardadas antes de
@@ -23274,7 +29885,7 @@ async function handlePrimary(request, env, ctx) {
           const yaMostradas = new Set();
           if (article.imagen_url) yaMostradas.add(claveImagenFusion(article.imagen_url));
           const cuerpoImgs = Array.isArray(article.imagenes) ? article.imagenes : parseImagenesFusion(article.imagenes);
-          for (const f of cuerpoImgs) if (f && f.tipo !== "tweet") yaMostradas.add(claveImagenFusion(f.url));
+          for (const f of cuerpoImgs) if (f && !esItemNoFoto(f)) yaMostradas.add(claveImagenFusion(f.url));
           article.galeria_fotografo = (mediaArticulo || [])
             .filter((m) => {
               if (m.tipo === "video") return false;
@@ -23433,6 +30044,102 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true });
       }
 
+      // ---------- HISTORIAL DE VERSIONES DE UNA NOTICIA ----------
+      // GET /api/articles/:id/versiones        -> lista (sin texto), la más reciente primero
+      // GET /api/articles/:id/versiones/:vid   -> una versión completa (para ver/comparar/restaurar en el editor)
+      // Solo quien puede editar esa noticia (autor, coautor, admin, Nivel 4 o permiso temporal).
+      // Restaurar NO se hace aquí: el panel carga la versión en el editor y al guardar se crea una versión nueva,
+      // así nada se pierde y se aplican las mismas validaciones que en cualquier edición.
+      const versionesNoticiaMatch = path.match(/^\/api\/articles\/(\d+)\/versiones(?:\/(\d+))?$/);
+      if (versionesNoticiaMatch && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no tiene acceso al historial de noticias" }, 403);
+        }
+        const articuloId = parseInt(versionesNoticiaMatch[1], 10);
+        const articuloHist = await env.DB.prepare("SELECT id, autor_id, coautor_id FROM articles WHERE id = ?").bind(articuloId).first();
+        if (!articuloHist) return json({ error: "Noticia no encontrada" }, 404);
+        if (!(await puedeEditar(env, payload, "articulo", articuloId, articuloHist.autor_id, articuloHist.coautor_id))) {
+          return json({ error: "No puedes ver el historial de esta noticia porque no es tuya." }, 403);
+        }
+        try {
+          if (versionesNoticiaMatch[2]) {
+            const v = await env.DB.prepare(
+              "SELECT id, numero, titulo, subtitulo, contenido, datos, editor_id, editor_nombre, motivo, created_at FROM article_versions WHERE id = ? AND article_id = ?"
+            ).bind(parseInt(versionesNoticiaMatch[2], 10), articuloId).first();
+            if (!v) return json({ error: "Versión no encontrada" }, 404);
+            let datosVersion = null;
+            try { datosVersion = v.datos ? JSON.parse(v.datos) : null; } catch { datosVersion = null; }
+            return json({ version: { ...v, datos: datosVersion } });
+          }
+          const { results: versiones } = await env.DB.prepare(
+            "SELECT id, numero, titulo, editor_id, editor_nombre, motivo, created_at, LENGTH(contenido) AS longitud FROM article_versions WHERE article_id = ? ORDER BY id DESC LIMIT ?"
+          ).bind(articuloId, VERSIONES_MAX_POR_NOTICIA).all();
+          return json({ versiones: versiones || [], max: VERSIONES_MAX_POR_NOTICIA });
+        } catch (err) {
+          if (/no such table|does not exist|no existe/i.test(String((err && err.message) || err))) {
+            return json({ versiones: [], max: VERSIONES_MAX_POR_NOTICIA, sin_tabla: true });
+          }
+          console.error("[versiones] Error al leer el historial:", err && err.message);
+          return json({ error: "No se ha podido cargar el historial de versiones" }, 500);
+        }
+      }
+
+      // ---------- BLOQUEO DE EDICIÓN SIMULTÁNEA DE NOTICIAS ----------
+      // GET    /api/articles/:id/bloqueo?sesion=X            -> quién la tiene (sin reservar)
+      // POST   /api/articles/:id/bloqueo?sesion=X[&forzar=1] -> reservar / renovar (latido)
+      // DELETE /api/articles/:id/bloqueo?sesion=X[&forzar=1] -> liberar
+      const bloqueoNoticiaMatch = path.match(/^\/api\/articles\/(\d+)\/bloqueo$/);
+      if (bloqueoNoticiaMatch && (method === "GET" || method === "POST" || method === "DELETE")) {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede editar noticias, crónicas ni artículos" }, 403);
+        }
+        const articuloId = parseInt(bloqueoNoticiaMatch[1]);
+        const sesion = sesionEdicionLimpia(url.searchParams.get("sesion"));
+        const forzar = url.searchParams.get("forzar") === "1" && esAdminOGestor(payload);
+        try {
+          if (method === "GET") {
+            const fila = await leerBloqueoNoticiaVigente(env, articuloId);
+            return json({ bloqueo: bloqueoNoticiaParaCliente(fila, sesion), ttl_ms: BLOQUEO_NOTICIA_TTL_MS });
+          }
+          if (method === "DELETE") {
+            await liberarBloqueoNoticia(env, articuloId, sesion, forzar);
+            return json({ ok: true });
+          }
+          // POST: reservar o renovar
+          if (!sesion) return json({ error: "Falta el identificador de la sesión de edición" }, 400);
+          const articulo = await env.DB.prepare("SELECT id, titulo, autor_id, coautor_id FROM articles WHERE id = ?").bind(articuloId).first();
+          if (!articulo) return json({ error: "Noticia no encontrada" }, 404);
+          if (!(await puedeEditar(env, payload, "articulo", articuloId, articulo.autor_id, articulo.coautor_id))) {
+            return json({ error: "No puedes editar esta noticia porque no es tuya." }, 403);
+          }
+          const antes = forzar ? await leerBloqueoNoticiaVigente(env, articuloId) : null;
+          const r = await adquirirBloqueoNoticia(env, articuloId, payload, sesion, forzar);
+          if (!r.ok) {
+            const quien = r.fila && r.fila.user_name ? r.fila.user_name : "otra persona";
+            return json({
+              error: `${quien} está editando esta noticia ahora mismo.`,
+              bloqueo: bloqueoNoticiaParaCliente(r.fila, sesion),
+              ttl_ms: BLOQUEO_NOTICIA_TTL_MS,
+            }, 423);
+          }
+          if (forzar && antes && antes.session_id !== sesion) {
+            await registrarActividad(env, request, payload, {
+              accion: "noticia_bloqueo_forzado", entidad: "articulo", entidad_id: articuloId,
+              descripcion: `Ha tomado el control de la edición de "${articulo.titulo}" que tenía ${antes.user_name || "otra persona"}`,
+            });
+          }
+          return json({ ok: true, bloqueo: bloqueoNoticiaParaCliente(r.fila, sesion), ttl_ms: BLOQUEO_NOTICIA_TTL_MS });
+        } catch (err) {
+          console.error("[bloqueo-noticia]", err && err.message);
+          // Fallo de infraestructura: no se bloquea a nadie (el bloqueo es cooperativo).
+          return json({ ok: true, sin_bloqueo: true, ttl_ms: BLOQUEO_NOTICIA_TTL_MS });
+        }
+      }
+
       if (articleMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
@@ -23447,14 +30154,14 @@ async function handlePrimary(request, env, ctx) {
         const articuloParaPermiso = await env.DB.prepare("SELECT slug, autor_id, coautor_id, publicado, programado_para, estado_borrador, fecha_publicacion, slug_congelado, resultado_id, tipo, categoria, categorias_adicionales, club, ficha_tecnica, banner_urgente, fuera_calendario, destacado FROM articles WHERE id = ?").bind(id).first();
         if (!articuloParaPermiso) return json({ error: "Noticia no encontrada" }, 404);
         if (!(await puedeEditar(env, payload, "articulo", id, articuloParaPermiso.autor_id, articuloParaPermiso.coautor_id))) {
-          return json({ error: "No puedes editar esta noticia porque no es tuya. Solicita permiso al autor o a un administrador." }, 403);
+          return json({ error: "No puedes editar esta noticia porque no es tuya. Solicita permiso al autor o a un Responsable." }, 403);
         }
         // Para que quede constancia en el historial de que esta edición
         // es una "revisión" (Nivel 4 corrigiendo contenido de otra
         // persona) y no una edición normal de lo propio, salvo que
         // además tenga un permiso temporal aprobado por edit_requests
         // (en ese caso ya queda igualmente registrado como antes).
-        const esEdicionAjenaPorNivel4 = payload.rol !== "admin"
+        const esEdicionAjenaPorNivel4 = !esAdminOGestor(payload)
           && articuloParaPermiso.autor_id !== payload.uid
           && articuloParaPermiso.coautor_id !== payload.uid
           && !(await tienePermisoTemporal(env, payload, "articulo", id));
@@ -23466,6 +30173,18 @@ async function handlePrimary(request, env, ctx) {
 
         const body = await request.json();
         if (typeof body.contenido === "string") body.contenido = sanearHtmlArticulo(body.contenido);
+
+        // Bloqueo de edición simultánea: si otra persona (u otra pestaña) tiene
+        // abierta esta noticia, se rechaza el guardado para no pisar su trabajo.
+        {
+          const bloqueoAjeno = await bloqueoNoticiaAjeno(env, id, payload, sesionEdicionLimpia(body.sesion_edicion));
+          if (bloqueoAjeno) {
+            return json({
+              error: `${bloqueoAjeno.user_name || "Otra persona"} está editando esta noticia ahora mismo. Para no pisar su trabajo, espera a que termine o pídele que cierre su edición.`,
+              bloqueo: bloqueoNoticiaParaCliente(bloqueoAjeno, ""),
+            }, 423);
+          }
+        }
 
         // NUNCA se devuelve a "en revisión" (ni a borrador) una noticia que ya
         // está publicada o programada: editarla (corregir una errata, cambiar
@@ -23495,7 +30214,7 @@ async function handlePrimary(request, env, ctx) {
         }
 
         // Un redactor de Nivel 1 no puede publicar directamente una noticia
-        // NUEVA al editarla: si no es admin y no ha llegado a Nivel 2,
+        // NUEVA al editarla: si no es admin y no ha llegado a Nivel 3,
         // cualquier intento de dejarla publicada (true, o sin mandar el
         // campo, que por defecto publicaría) se guarda sin publicar salvo
         // que use "Última hora" con su PIN. Pero esto solo se aplica
@@ -23508,18 +30227,18 @@ async function handlePrimary(request, env, ctx) {
         let puedeUltimaHora = false;
         if (payload.rol !== "admin" && body.publicado !== false && !articuloParaPermiso.publicado) {
           nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
-          if (nivelUsuario < 2) {
+          if (nivelUsuario < NIVEL_PUBLICACION_DIRECTA) {
             puedeUltimaHora = await comprobarUltimaHora(env, body.ultima_hora_pin);
             if (!puedeUltimaHora) body.publicado = false;
           }
         }
 
         // Programar publicación (igual que al crear): un admin, o un
-        // redactor de Nivel 2+, puede dejarla programada para una fecha/
+        // redactor de Nivel 3+, puede dejarla programada para una fecha/
         // hora futura.
         let programadoPara = null;
         if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
-        if ((payload.rol === "admin" || nivelUsuario >= 2) && body.programado_para) {
+        if ((payload.rol === "admin" || nivelUsuario >= NIVEL_PUBLICACION_DIRECTA) && body.programado_para) {
           const fechaProgramada = new Date(body.programado_para);
           // Mismo criterio que al crear: comparar por minuto, no por
           // milisegundo exacto, para no perder la programación por la
@@ -23548,9 +30267,9 @@ async function handlePrimary(request, env, ctx) {
         const preferenciaFechas = normalizarPreferenciaFechas(estadoBorrador === "terminado" ? body : null);
         // Un redactor de Nivel 1 está obligado a indicar fecha de preferencia
         // al mandar una noticia a revisión (borrador "terminado"): así quien
-        // la revisa sabe cuándo conviene publicarla. Nivel 2+ y admin: opcional.
-        if (payload.rol !== "admin" && estadoBorrador === "terminado" && (nivelUsuario ?? 1) < 2 && !preferenciaFechas.desde) {
-          return json({ error: "Como redactor de nivel 1 debes indicar una fecha de preferencia para que la revisen" }, 400);
+        // la revisa sabe cuándo conviene publicarla. Nivel 3+ y admin: opcional.
+        if (payload.rol !== "admin" && estadoBorrador === "terminado" && (nivelUsuario ?? 1) < NIVEL_PUBLICACION_DIRECTA && !preferenciaFechas.desde) {
+          return json({ error: "Como redactor de nivel 1 o 2 debes indicar una fecha de preferencia para que la revisen" }, 400);
         }
 
         // Un borrador "en proceso" no tiene por qué cumplir los límites de
@@ -23558,9 +30277,9 @@ async function handlePrimary(request, env, ctx) {
         if (body.contenido !== undefined && estadoBorrador !== "en_proceso") {
           const longitudContenido = longitudTextoPlano(body.contenido);
           // Última hora (PIN válido, o banner urgente pedido/ya activo y con
-          // permiso: admin o Nivel 2+): sin mínimo de caracteres.
+          // permiso: admin o Nivel 3+): sin mínimo de caracteres.
           if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
-          const puedeBannerUH = payload.rol === "admin" || nivelUsuario >= 2;
+          const puedeBannerUH = payload.rol === "admin" || nivelUsuario >= NIVEL_PUBLICACION_DIRECTA;
           const bannerUHSolicitado = Object.prototype.hasOwnProperty.call(body, "banner_urgente")
             ? body.banner_urgente === true
             : !!articuloParaPermiso.banner_urgente;
@@ -23575,7 +30294,7 @@ async function handlePrimary(request, env, ctx) {
         }
 
         const imagenes = normalizarImagenes(separarFotosSeguidas(body.imagenes, body.imagen_url, !!body.resultado_id));
-        const imagenPortada = body.imagen_url || (imagenes.find((i) => i.tipo !== "tweet") || {}).url || null;
+        const imagenPortada = body.imagen_url || (imagenes.find((i) => !esItemNoFoto(i)) || {}).url || null;
         // Es obligatorio poner al menos una imagen de portada por noticia,
         // igual que al crear. Un borrador "en proceso" puede seguir sin
         // ella; para publicar, programar o marcar como "terminado" hace falta.
@@ -23648,6 +30367,11 @@ async function handlePrimary(request, env, ctx) {
         );
         if (errorCategoriasAdicionales) return json({ error: errorCategoriasAdicionales }, 400);
 
+        // Etiquetas (tags) reales. Si el panel no manda el campo se dejan las
+        // que tuviera; si manda [] se quitan todas.
+        const validacionEtiquetas = validarEtiquetas(body.etiquetas);
+        if (validacionEtiquetas.error) return json({ error: validacionEtiquetas.error }, 400);
+
         // Segundo autor (coautor) opcional, igual que al crear. Si se
         // manda explícitamente "coautor_id: null" (o vacío) se quita el
         // coautor que hubiera; si no se manda el campo, se deja el que
@@ -23719,7 +30443,7 @@ async function handlePrimary(request, env, ctx) {
         }
 
         // Banner urgente al editar: mismo permiso que al crear (admin o
-        // Nivel 2+). Si el campo no se manda en absoluto, se conserva
+        // Nivel 3+). Si el campo no se manda en absoluto, se conserva
         // el estado que ya tuviera la noticia (para que una edición que
         // no toca el banner -p.ej. corregir una errata- no lo apague
         // sin querer). Si se manda explícitamente true/false, manda eso:
@@ -23734,7 +30458,7 @@ async function handlePrimary(request, env, ctx) {
           // más arriba en ciertos casos, ver "programar publicación"), así
           // que se completa bajo demanda antes de decidir el permiso.
           if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
-          const puedeActivarBanner = payload.rol === "admin" || nivelUsuario >= 2;
+          const puedeActivarBanner = payload.rol === "admin" || nivelUsuario >= NIVEL_PUBLICACION_DIRECTA;
           // Con el PIN de "Última hora" válido (puedeUltimaHora, solo al publicar
           // por primera vez) un Nivel 1 también puede activar el banner. Si no
           // tiene permiso, el banner se queda como estaba (retocar una errata no
@@ -23746,13 +30470,15 @@ async function handlePrimary(request, env, ctx) {
           }
         }
 
-        // "Destacado": solo lo cambia un admin o un Nivel 2+; el resto conserva
+        // "Destacado": solo lo cambia un admin o un Nivel 3+; el resto conserva
         // el valor que ya tenía la noticia (no se le quita ni se le pone).
         if (nivelUsuario === null) nivelUsuario = await obtenerNivelUsuario(env, payload.uid);
-        const destacadoFinal = (payload.rol === "admin" || nivelUsuario >= 2 || puedeUltimaHora)
+        const destacadoFinal = (payload.rol === "admin" || nivelUsuario >= NIVEL_PUBLICACION_DIRECTA || puedeUltimaHora)
           ? (body.destacado ? 1 : 0)
           : (articuloParaPermiso.destacado ? 1 : 0);
 
+        // Historial: si es una noticia anterior al historial, se guarda antes su estado previo.
+        await registrarVersionNoticia(env, payload, id, "inicial", true);
         await env.DB.prepare(
           `UPDATE articles SET slug=?, titulo=?, subtitulo=?, contenido=?, tipo=?, categoria=?, categorias_adicionales=?, club=?, imagen_url=?, imagenes=?, resultado_id=?, autor_id=?, autor_nombre=?, coautor_id=?, coautor_nombre=?, destacado=?, publicado=?, estado_borrador=?, programado_para=?, fecha_preferencia_desde=?, fecha_preferencia_hasta=?, slug_congelado=?, fecha_publicacion=?, updated_at=datetime('now'),
             titulo_eu=?, subtitulo_eu=?, contenido_eu=?, titulo_ca=?, subtitulo_ca=?, contenido_ca=?, titulo_gl=?, subtitulo_gl=?, contenido_gl=?, titulo_en=?, subtitulo_en=?, contenido_en=?, ficha_tecnica=?, banner_urgente=?${bannerUrgenteHastaSQL !== null ? `, banner_urgente_hasta=${bannerUrgenteHastaSQL}` : ""}
@@ -23771,12 +30497,17 @@ async function handlePrimary(request, env, ctx) {
           fichaTecnica, bannerUrgenteFinal, id
         ).run();
         await registrarRedirectSiCambia(env, id, articuloParaPermiso.slug, slug);
+        await registrarVersionNoticia(env, payload, id, esEdicionAjenaPorNivel4 ? "revision" : "edicion");
 
         // Fase 12: igual que al crear, sincroniza la galería/imágenes
         // sueltas vinculadas a la noticia si el redactor mandó media_ids
         // y/o galeria_resultado_id; si no manda ninguno de los dos, deja
         // la que ya hubiera guardada tal cual.
         await sincronizarArticleMedia(env, id, body);
+        if (body.etiquetas !== undefined) {
+          await guardarEtiquetasArticulo(env, id, validacionEtiquetas);
+          olvidarCacheEtiquetas();
+        }
 
         // Horario de publicación: solo se evalúa cuando esta edición
         // publica por primera vez un borrador. Si ya estaba publicada, se
@@ -23784,7 +30515,7 @@ async function handlePrimary(request, env, ctx) {
         // debe cambiarla).
         let fueraCalendario = !!articuloParaPermiso.fuera_calendario;
         if (!articuloParaPermiso.publicado && vaAPublicarseAhora) {
-          fueraCalendario = await marcarFueraDeCalendario(env, id, { tipo: tipoFinal, resultado_id: resultadoId });
+          fueraCalendario = await marcarFueraDeCalendario(env, id, { tipo: tipoFinal, resultado_id: resultadoId, categoria: categoriaFinal });
         }
 
         // Si esta edición vincula por primera vez la noticia a un
@@ -23887,6 +30618,95 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true, slug, publicado: body.publicado === false ? 0 : 1, fuera_calendario: fueraCalendario, estado_borrador: estadoBorrador, programado_para: programadoPara, fecha_preferencia_desde: preferenciaFechas.desde, fecha_preferencia_hasta: preferenciaFechas.hasta, avisos_traduccion: avisosTraduccion });
       }
 
+      // ---------- PAPELERA (borrado recuperable de noticias y archivos) ----------
+      // GET    /api/papelera                 -> lo que hay en la papelera (admin: todo; el resto: solo lo que borró)
+      // POST   /api/papelera/:id/restaurar   -> lo devuelve (noticia: como borrador)
+      // DELETE /api/papelera/:id             -> borrado definitivo (solo admin)
+      // ---------- GUARDIÁN DE RESPONSABLES: configuración e incidentes (solo Responsables) ----------
+      // GET /api/guardian -> { config, incidentes } ; PUT /api/guardian { activo, ventana_min, umbral, exentos }
+      if (path === "/api/guardian" && (method === "GET" || method === "PUT")) {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!esAdmin(payload)) return json({ error: "Solo un Responsable puede ver o cambiar el guardián" }, 403);
+        if (method === "PUT") {
+          const cuerpo = await request.json().catch(() => ({}));
+          const actual = await guardianLeerConfig(env);
+          const nueva = guardianLimpiarConfig({ ...actual, ...(cuerpo && typeof cuerpo === "object" ? cuerpo : {}) });
+          await env.DB.prepare(
+            `INSERT INTO settings (key, value, updated_at) VALUES ('guardian_admins', ?, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+          ).bind(JSON.stringify(nueva)).run();
+          ctx.waitUntil(registrarActividad(env, request, payload, {
+            accion: "editar_settings", entidad: "settings", entidad_id: "guardian_admins",
+            descripcion: "Ha cambiado los ajustes del guardián de Responsables", detalle: nueva,
+          }));
+          return json({ ok: true, config: nueva });
+        }
+        const config = await guardianLeerConfig(env);
+        const { results } = await env.DB.prepare(
+          "SELECT id, accion, entidad_id, descripcion, detalle, created_at FROM activity_log WHERE accion IN ('guardian_bloqueo','guardian_alerta') ORDER BY id DESC LIMIT 30"
+        ).all();
+        return json({ config, incidentes: results || [] });
+      }
+
+      if (path === "/api/papelera" && method === "GET") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const columnas = "id, tipo, subtipo, entidad_id, titulo, miniatura, eliminado_por_id, eliminado_por_nombre, created_at, purgar_despues";
+        const admin = esAdminOGestor(payload);
+        const { results } = admin
+          ? await env.DB.prepare(`SELECT ${columnas} FROM papelera ORDER BY created_at DESC, id DESC LIMIT 300`).all()
+          : await env.DB.prepare(`SELECT ${columnas} FROM papelera WHERE eliminado_por_id = ? ORDER BY created_at DESC, id DESC LIMIT 300`).bind(payload.uid).all();
+        return json({ items: results || [], dias: PAPELERA_DIAS, es_admin: esAdmin(payload), ve_todo: admin });
+      }
+
+      const papeleraRestaurarMatch = path.match(/^\/api\/papelera\/(\d+)\/restaurar$/);
+      if (papeleraRestaurarMatch && method === "POST") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        const id = parseInt(papeleraRestaurarMatch[1], 10);
+        const fila = await env.DB.prepare("SELECT * FROM papelera WHERE id = ?").bind(id).first();
+        if (!fila) return json({ error: "Ya no está en la papelera" }, 404);
+        if (!esAdminOGestor(payload) && fila.eliminado_por_id !== payload.uid) {
+          return json({ error: "Solo puedes restaurar lo que borraste tú. Pídeselo a un Responsable." }, 403);
+        }
+        let resultado;
+        try {
+          resultado = await papeleraRestaurar(env, fila);
+        } catch (err) {
+          if (err && err.status) return json({ error: err.message }, err.status);
+          console.error("[papelera] Error al restaurar:", err);
+          return json({ error: "No se ha podido restaurar. Sigue en la papelera; inténtalo de nuevo." }, 500);
+        }
+        if (fila.tipo === "articulo") ctx.waitUntil(indexarArticuloBusqueda(env, fila.entidad_id));
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "restaurar_papelera", entidad: fila.tipo === "articulo" ? "articulo" : "media", entidad_id: fila.entidad_id,
+          descripcion: `Ha restaurado de la papelera ${fila.tipo === "articulo" ? "la noticia/crónica" : "el archivo"} "${fila.titulo}"`,
+        }));
+        return json({ ok: true, tipo: fila.tipo, entidad_id: fila.entidad_id, slug: resultado.slug || null });
+      }
+
+      const papeleraItemMatch = path.match(/^\/api\/papelera\/(\d+)$/);
+      if (papeleraItemMatch && method === "DELETE") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!esAdmin(payload)) return json({ error: "Solo un Responsable puede borrar definitivamente de la papelera" }, 403);
+        const id = parseInt(papeleraItemMatch[1], 10);
+        const fila = await env.DB.prepare("SELECT id, tipo, titulo, entidad_id, cloudinary_public_id, cloudinary_resource_type, cloud_name FROM papelera WHERE id = ?").bind(id).first();
+        if (!fila) return json({ error: "Ya no está en la papelera" }, 404);
+        try {
+          await papeleraPurgar(env, fila);
+        } catch (err) {
+          console.error("[papelera] Error al borrar definitivamente:", err);
+          return json({ error: "No se ha podido borrar definitivamente. Sigue en la papelera; inténtalo de nuevo." }, 502);
+        }
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "vaciar_papelera", entidad: fila.tipo === "articulo" ? "articulo" : "media", entidad_id: fila.entidad_id,
+          descripcion: `Ha borrado definitivamente ${fila.tipo === "articulo" ? "la noticia/crónica" : "el archivo"} "${fila.titulo}" de la papelera`,
+        }));
+        return json({ ok: true });
+      }
+
       if (articleMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
@@ -23901,27 +30721,35 @@ async function handlePrimary(request, env, ctx) {
         // lo de otros". Por eso aquí se comprueba autoría/coautoría/admin
         // o permiso temporal aprobado, sin el atajo de nivel que sí tiene
         // puedeEditar() para PUT.
-        const puedeBorrar = payload.rol === "admin"
+        const puedeBorrar = esAdminOGestor(payload)
           || articuloBorrado.autor_id === payload.uid
           || articuloBorrado.coautor_id === payload.uid
           || (await tienePermisoTemporal(env, payload, "articulo", id));
         if (!puedeBorrar) {
-          return json({ error: "No puedes eliminar esta noticia porque no es tuya. Solicita permiso al autor o a un administrador." }, 403);
+          return json({ error: "No puedes eliminar esta noticia porque no es tuya. Solicita permiso al autor o a un Responsable." }, 403);
+        }
+        // Papelera: antes de borrar se guarda una copia recuperable (30 días). Si no se
+        // puede guardar, NO se borra (mejor un error que perder la noticia).
+        try {
+          await papeleraGuardarArticulo(env, payload, id);
+        } catch (err) {
+          console.error("[papelera] No se pudo guardar la noticia; no se borra:", err);
+          return json({ error: "No se pudo mover la noticia a la papelera, así que no se ha borrado. Inténtalo de nuevo." }, 500);
         }
         await env.DB.prepare("DELETE FROM articles WHERE id = ?").bind(id).run();
         ctx.waitUntil(eliminarArticuloBusqueda(env, id));
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "eliminar_articulo", entidad: "articulo", entidad_id: id,
-          descripcion: `Ha eliminado la noticia/crónica "${articuloBorrado ? articuloBorrado.titulo : id}"`,
+          descripcion: `Ha movido a la papelera la noticia/crónica "${articuloBorrado ? articuloBorrado.titulo : id}"`,
         }));
-        return json({ ok: true });
+        return json({ ok: true, papelera: true });
       }
 
       // ---------- ÚLTIMA HORA: PIN único, solo visible/regenerable por un admin ----------
       if (path === "/api/settings/ultima-hora-pin" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver el PIN de Última hora" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede ver el PIN de Última hora" }, 403);
         const pin = await obtenerUltimaHoraPin(env);
         return json({ pin });
       }
@@ -23930,7 +30758,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/settings/ultima-hora-pin/regenerar" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede regenerar el PIN de Última hora" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede regenerar el PIN de Última hora" }, 403);
         const pin = await regenerarUltimaHoraPin(env);
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "regenerar_pin_ultima_hora", entidad: "settings", entidad_id: 0,
@@ -24103,7 +30931,7 @@ async function handlePrimary(request, env, ctx) {
         // Solo puede resolverla un admin o el autor original de la entidad.
         const esAutorOriginal = solicitud.autor_id && solicitud.autor_id === payload.uid;
         if (payload.rol !== "admin" && !esAutorOriginal) {
-          return json({ error: "Solo un administrador o el autor original pueden responder a esta solicitud" }, 403);
+          return json({ error: "Solo un Responsable o el autor original pueden responder a esta solicitud" }, 403);
         }
 
         if (accion === "rechazar") {
@@ -24275,7 +31103,7 @@ async function handlePrimary(request, env, ctx) {
       async function requirePodcastEditor(request, env) {
         const payload = await requireAuthTienda(request, env);
         if (!payload) return { error: json({ error: "No autorizado" }, 401) };
-        if (!esAdmin(payload) && !esRedactor(payload)) return { error: json({ error: "Solo administradores y redactores" }, 403) };
+        if (!esAdmin(payload) && !esRedactor(payload)) return { error: json({ error: "Solo Responsables y redactores" }, 403) };
         return { payload };
       }
 
@@ -24483,7 +31311,7 @@ async function handlePrimary(request, env, ctx) {
         const auth = await requireColaboradorVotaciones(request, env);
         if (auth.error) return auth.error;
         const payload = auth.payload;
-        if (!esAdmin(payload)) return json({ error: "Solo un administrador puede crear votaciones" }, 403);
+        if (!esAdmin(payload)) return json({ error: "Solo un Responsable puede crear votaciones" }, 403);
 
         const body = await request.json().catch(() => null);
         if (!body || typeof body !== "object") return json({ error: "Petición no válida" }, 400);
@@ -24607,7 +31435,7 @@ async function handlePrimary(request, env, ctx) {
         const auth = await requireColaboradorVotaciones(request, env);
         if (auth.error) return auth.error;
         const payload = auth.payload;
-        if (!esAdmin(payload)) return json({ error: "Solo un administrador puede cerrar o reabrir votaciones" }, 403);
+        if (!esAdmin(payload)) return json({ error: "Solo un Responsable puede cerrar o reabrir votaciones" }, 403);
         const partes = path.split("/");
         const votacionId = parseInt(partes[3], 10);
         const cerrar = partes[4] === "cerrar";
@@ -24629,7 +31457,7 @@ async function handlePrimary(request, env, ctx) {
         const auth = await requireColaboradorVotaciones(request, env);
         if (auth.error) return auth.error;
         const payload = auth.payload;
-        if (!esAdmin(payload)) return json({ error: "Solo un administrador puede borrar votaciones" }, 403);
+        if (!esAdmin(payload)) return json({ error: "Solo un Responsable puede borrar votaciones" }, 403);
         const votacionId = parseInt(path.split("/").pop(), 10);
         const v = await env.DB.prepare("SELECT titulo FROM votaciones_internas WHERE id = ?").bind(votacionId).first();
         if (!v) return json({ error: "Votación no encontrada" }, 404);
@@ -25248,6 +32076,14 @@ async function handlePrimary(request, env, ctx) {
         if (!texto) return json({ error: "El comentario no puede estar vacío" }, 400);
         if (texto.length > 2000) return json({ error: "El comentario es demasiado largo (máximo 2000 caracteres)" }, 400);
 
+        // Filtro automático (enlaces e insultos, ver src/moderacion.js): se aplica
+        // también a lectores con sesión y antes de guardar nada, así que lo que se
+        // bloquea no llega a la bandeja de moderación. El mensaje no repite la palabra.
+        {
+          const revision = analizarComentario({ texto, nombre });
+          if (!revision.ok) return json({ error: revision.mensaje, motivo: revision.motivo }, 422);
+        }
+
         // Respuesta a otro comentario (hilos de un solo nivel): solo se puede
         // contestar a un comentario visible de esta misma noticia (o de su grupo
         // de previas/crónicas fusionadas). Si se contesta a una respuesta, el
@@ -25268,16 +32104,24 @@ async function handlePrimary(request, env, ctx) {
         }
 
         const ip = request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || null;
-        await env.DB.prepare(
-          `INSERT INTO comments (article_id, nombre, email, texto, ip, reader_id, parent_id, responde_a_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        // Publicación automática: si el filtro de arriba no lo ha bloqueado, el
+        // comentario entra ya como "aprobado". La redacción puede rechazarlo o
+        // devolverlo a "pendiente" después desde el panel (Comentarios).
+        const ins = await env.DB.prepare(
+          `INSERT INTO comments (article_id, nombre, email, texto, ip, reader_id, parent_id, responde_a_id, estado) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'aprobado')`
         ).bind(articleId, nombre, email, texto, ip, readerId, parentId, respondeAId).run();
 
+        // Avisos por correo (a quien comenta y a quien contestan): antes salían
+        // al aprobar a mano, ahora al publicarse. Idempotente.
+        const nuevoComentarioId = ins && ins.meta ? ins.meta.last_row_id : null;
+        if (nuevoComentarioId) ctx.waitUntil(avisarComentarioAprobado(env, nuevoComentarioId));
+
         ctx.waitUntil(staffPushEnviar(env, "comentarios", {
-          titulo: parentId ? "Nueva respuesta pendiente" : "Nuevo comentario pendiente",
+          titulo: parentId ? "Nueva respuesta publicada" : "Nuevo comentario publicado",
           cuerpo: `${nombre}: ${texto}`,
           ir: "comentarios", tag: "comentarios",
         }));
-        return json({ ok: true, mensaje: parentId ? "Respuesta enviada. Se publicará en cuanto la revise la redacción." : "Comentario enviado. Se publicará en cuanto lo revise la redacción." });
+        return json({ ok: true, publicado: true, mensaje: parentId ? "Respuesta publicada." : "Comentario publicado." });
       }
 
       // ---------- Encuestas ----------
@@ -25356,6 +32200,8 @@ async function handlePrimary(request, env, ctx) {
       // se puede determinar la IP: mejor rechazar el voto que juntar a
       // todo el mundo bajo la misma IP "vacía" y falsear los resultados.
       async function hashVotanteEncuesta(request, env, pollId) {
+        // Crear/editar una encuesta desde el panel llama sin petición (null): no hay voto que reconocer.
+        if (!request) return null;
         const ip =
           request.headers.get("CF-Connecting-IP") ||
           (request.headers.get("X-Forwarded-For") || "").split(",")[0].trim() ||
@@ -25623,9 +32469,10 @@ async function handlePrimary(request, env, ctx) {
         await cerrarEncuestasCaducadas(env);
 
         const { results: encuestas } = await env.DB.prepare(
-          `SELECT p.*, a.titulo AS articulo_titulo, a.slug AS articulo_slug
+          `SELECT p.*, a.titulo AS articulo_titulo, a.slug AS articulo_slug, u.nombre AS autor_nombre
            FROM polls p
            LEFT JOIN articles a ON a.id = p.article_id
+           LEFT JOIN users u ON u.id = p.autor_id
            ORDER BY p.created_at DESC`
         ).all();
 
@@ -25666,6 +32513,10 @@ async function handlePrimary(request, env, ctx) {
             articulo_titulo: p.articulo_titulo || null,
             articulo_slug: p.articulo_slug || null,
             orden_portada: p.orden_portada,
+            autor_id: p.autor_id ?? null,
+            autor_nombre: p.autor_nombre || null,
+            // Una encuesta solo la edita, cierra, reabre o borra su autor (o un Responsable).
+            editable: esAdminOGestor(payload) || (p.autor_id != null && Number(p.autor_id) === Number(payload.uid)),
           };
         });
         return json({ encuestas: conResultados });
@@ -25924,6 +32775,44 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true, likes: actualizado.likes, dislikes: actualizado.dislikes, votoActual: valor });
       }
 
+      // Reacciones a una noticia publicada ("Útil" / "Me gusta"). Igual que los votos de
+      // comentarios, `votanteId` es un id anónimo del navegador, no una cuenta: solo sirve
+      // para no contar dos veces la misma reacción y para poder quitarla (activo: false).
+      // GET devuelve solo los contadores (cacheable); lo que ya marcó cada lector lo
+      // recuerda su navegador.
+      const reaccionesArticuloMatch = path.match(/^\/api\/articles\/(\d+)\/reactions$/);
+      if (reaccionesArticuloMatch && method === "GET") {
+        const articleId = parseInt(reaccionesArticuloMatch[1]);
+        return json({ ok: true, ...(await contarReaccionesArticulo(env, articleId)) });
+      }
+      if (reaccionesArticuloMatch && method === "POST") {
+        const articleId = parseInt(reaccionesArticuloMatch[1]);
+        const articulo = await env.DB.prepare("SELECT id FROM articles WHERE id = ? AND publicado = 1").bind(articleId).first();
+        if (!articulo) return json({ error: "Noticia no encontrada" }, 404);
+
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Petición no válida" }, 400); }
+        const votanteId = normalizarTexto(body && body.votanteId);
+        const tipo = normalizarTexto(body && body.tipo);
+        if (!votanteId || votanteId.length > 64) return json({ error: "Falta identificador de votante" }, 400);
+        if (!TIPOS_REACCION_ARTICULO.includes(tipo)) return json({ error: "Reacción no válida" }, 400);
+        if (typeof body.activo !== "boolean") return json({ error: "Falta indicar si se marca o se quita" }, 400);
+        if (await limiteExcedido(request, env, "reaccion-noticia", 120, 3600)) {
+          return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        }
+
+        if (body.activo) {
+          await env.DB.prepare(
+            "INSERT INTO article_reactions (article_id, votante_id, tipo) VALUES (?, ?, ?) ON CONFLICT (article_id, votante_id, tipo) DO NOTHING"
+          ).bind(articleId, votanteId, tipo).run();
+        } else {
+          await env.DB.prepare(
+            "DELETE FROM article_reactions WHERE article_id = ? AND votante_id = ? AND tipo = ?"
+          ).bind(articleId, votanteId, tipo).run();
+        }
+        return json({ ok: true, tipo, activo: body.activo, ...(await contarReaccionesArticulo(env, articleId)) });
+      }
+
       // Denuncia de un comentario. Se guarda para revisión manual del
       // admin en el panel; si un comentario acumula varias denuncias de
       // navegadores distintos se oculta automáticamente de la web (sin
@@ -25978,7 +32867,7 @@ async function handlePrimary(request, env, ctx) {
 
       if (path.startsWith("/api/admin/analiticas") && method === "GET") {
         const payload = await requireAuth(request, env, url);
-        if (!payload || payload.rol !== "admin") return json({ error: "Solo un administrador puede ver las analíticas" }, 403);
+        if (!payload || payload.rol !== "admin") return json({ error: "Solo un Responsable puede ver las analíticas" }, 403);
 
         // Rango capado a RANGO_ANALITICAS_MAX_DIAS (90): 365 días puede
         // escanear un año entero de article_views/article_reading sin
@@ -26184,7 +33073,7 @@ async function handlePrimary(request, env, ctx) {
       // se aplica por prefijo de path, no por método).
       if (path === "/api/admin/analiticas/datos" && method === "DELETE") {
         const payload = await requireAuth(request, env, url);
-        if (!payload || payload.rol !== "admin") return json({ error: "Solo un administrador puede borrar las analíticas" }, 403);
+        if (!payload || payload.rol !== "admin") return json({ error: "Solo un Responsable puede borrar las analíticas" }, 403);
 
         const todo = url.searchParams.get("todo") === "1";
         let dias = parseInt(url.searchParams.get("dias") || "28", 10);
@@ -26200,7 +33089,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/admin/comments" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede moderar comentarios" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede moderar comentarios" }, 403);
 
         const estado = url.searchParams.get("estado") || "pendiente";
         const { results: comentarios } = await env.DB.prepare(
@@ -26220,7 +33109,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/admin/comments/reported" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede moderar comentarios" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede moderar comentarios" }, 403);
 
         const { results: comentarios } = await env.DB.prepare(
           `SELECT c.*, a.titulo AS articulo_titulo, a.slug AS articulo_slug, a.categoria AS articulo_categoria,
@@ -26239,7 +33128,7 @@ async function handlePrimary(request, env, ctx) {
       if (desocultarComentarioMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede moderar comentarios" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede moderar comentarios" }, 403);
 
         const id = parseInt(desocultarComentarioMatch[1]);
         const resultado = await env.DB.prepare(
@@ -26254,11 +33143,72 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true });
       }
 
+      // ---------- Editar / borrar el PROPIO comentario (lectores con sesión) ----------
+      //   PUT    /api/comments/:id   { texto }  -> guarda el cambio (pasa por el mismo filtro automático
+      //                                           que al comentar; el estado no cambia)
+      //   DELETE /api/comments/:id              -> lo borra; si otras personas ya le han respondido
+      //                                           no se puede (se llevaría por delante sus respuestas)
+      // Solo su autora/autor (reader_id de la sesión). Un comentario ajeno responde 404, igual que
+      // uno que no existe, para no revelar qué ids existen.
+      const comentarioPropioMatch = path.match(/^\/api\/comments\/(\d+)$/);
+      if (comentarioPropioMatch && (method === "PUT" || method === "DELETE")) {
+        const payloadLector = await requireReaderAuth(request, env);
+        if (!payloadLector) return json({ error: "Inicia sesión para gestionar tus comentarios" }, 401);
+        if (await limiteExcedido(request, env, "comentario-propio", 30, 600)) {
+          return json({ error: RESPUESTA_DEMASIADOS_INTENTOS }, 429);
+        }
+        const id = parseInt(comentarioPropioMatch[1]);
+        const propio = await env.DB.prepare(
+          "SELECT id, nombre, texto, estado, reader_id FROM comments WHERE id = ?"
+        ).bind(id).first();
+        if (!propio || !propio.reader_id || Number(propio.reader_id) !== Number(payloadLector.rid)) {
+          return json({ error: "Comentario no encontrado" }, 404);
+        }
+
+        if (method === "DELETE") {
+          const conRespuestas = await env.DB.prepare(
+            "SELECT 1 AS x FROM comments WHERE parent_id = ? AND (reader_id IS NULL OR reader_id != ?) LIMIT 1"
+          ).bind(id, payloadLector.rid).first();
+          if (conRespuestas) {
+            return json({ error: "Este comentario ya tiene respuestas de otras personas, así que no se puede borrar. Puedes editarlo." }, 409);
+          }
+          await env.DB.prepare("DELETE FROM comments WHERE id = ?").bind(id).run();
+          return json({ ok: true });
+        }
+
+        if (propio.estado === "rechazado") {
+          return json({ error: "Este comentario fue rechazado por la redacción y ya no se puede editar." }, 403);
+        }
+        const cuerpo = await request.json().catch(() => ({}));
+        const textoNuevo = normalizarTexto(cuerpo.texto);
+        if (!textoNuevo) return json({ error: "El comentario no puede estar vacío" }, 400);
+        if (textoNuevo.length > 2000) return json({ error: "El comentario es demasiado largo (máximo 2000 caracteres)" }, 400);
+        if (textoNuevo === propio.texto) return json({ ok: true, sinCambios: true });
+        const revisionPropia = analizarComentario({ texto: textoNuevo, nombre: propio.nombre });
+        if (!revisionPropia.ok) return json({ error: revisionPropia.mensaje, motivo: revisionPropia.motivo }, 422);
+
+        // El texto nuevo ya ha pasado el filtro automático: se conserva el estado
+        // actual (un comentario aprobado sigue publicado; uno que la redacción
+        // devolvió a "pendiente" sigue pendiente hasta que ella lo apruebe).
+        await env.DB.prepare("UPDATE comments SET texto = ? WHERE id = ?").bind(textoNuevo, id).run();
+        ctx.waitUntil(staffPushEnviar(env, "comentarios", {
+          titulo: "Comentario editado",
+          cuerpo: `${propio.nombre}: ${textoNuevo}`,
+          ir: "comentarios", tag: "comentarios",
+        }));
+        return json({
+          ok: true,
+          mensaje: propio.estado === "aprobado"
+            ? "Cambio guardado."
+            : "Cambio guardado. Tu comentario se verá en cuanto lo revise la redacción.",
+        });
+      }
+
       const comentarioMatch = path.match(/^\/api\/admin\/comments\/(\d+)$/);
       if (comentarioMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede moderar comentarios" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede moderar comentarios" }, 403);
 
         const id = parseInt(comentarioMatch[1]);
         const body = await request.json();
@@ -26283,7 +33233,7 @@ async function handlePrimary(request, env, ctx) {
       if (comentarioMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede borrar comentarios" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede borrar comentarios" }, 403);
 
         const id = parseInt(comentarioMatch[1]);
         const resultado = await env.DB.prepare("DELETE FROM comments WHERE id = ?").bind(id).run();
@@ -26312,13 +33262,20 @@ async function handlePrimary(request, env, ctx) {
         const { results: fichas } = await env.DB.prepare(
           "SELECT * FROM club_info ORDER BY club COLLATE NOCASE ASC"
         ).all();
-        return json({ fichas });
+        // Cada ficha solo la edita quien la creó (autor_id); un Responsable puede con todas.
+        const esAdminFichas = payload.rol === "admin";
+        return json({
+          fichas: (fichas || []).map((f) => ({
+            ...f,
+            editable: esAdminFichas || (f.autor_id != null && Number(f.autor_id) === Number(payload.uid)),
+          })),
+        });
       }
 
       // Propuestas de ficha de club pendientes de revisión (las crea un
       // redactor de Nivel 1). Un admin o un redactor de Nivel 4 ve TODAS
       // las pendientes (para poder resolverlas); cualquier otro usuario
-      // solo ve las suyas propias (para saber en qué punto están).
+      // no ve ninguna (las propuestas de fichas no se muestran a los redactores).
       if (path === "/api/admin/club-info/solicitudes" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
@@ -26326,7 +33283,7 @@ async function handlePrimary(request, env, ctx) {
         const puedeResolver = payload.rol === "admin" || nivelUsuario >= NIVEL_MAXIMO;
         const { results: solicitudes } = puedeResolver
           ? await env.DB.prepare("SELECT * FROM club_info_solicitudes WHERE estado = 'pendiente' ORDER BY created_at ASC").all()
-          : await env.DB.prepare("SELECT * FROM club_info_solicitudes WHERE estado = 'pendiente' AND solicitante_id = ? ORDER BY created_at ASC").bind(payload.uid).all();
+          : { results: [] };
         return json({ solicitudes, puede_resolver: puedeResolver });
       }
 
@@ -26348,12 +33305,24 @@ async function handlePrimary(request, env, ctx) {
           return json({ error: "El año de fundación no es válido" }, 400);
         }
 
+        // Una ficha solo la puede editar quien la creó (autor_id). Un Responsable puede
+        // con todas (por ejemplo, las que se quedaron sin autor al borrarse su cuenta).
+        const fichaExistente = await env.DB.prepare(
+          "SELECT autor_id, autor_nombre FROM club_info WHERE club = ?"
+        ).bind(club).first();
+        if (fichaExistente && payload.rol !== "admin" && Number(fichaExistente.autor_id) !== Number(payload.uid)) {
+          return json({
+            error: `La ficha del ${club} solo puede editarla quien la creó${fichaExistente.autor_nombre ? " (" + fichaExistente.autor_nombre + ")" : ""}.`,
+            solo_creador: true,
+          }, 403);
+        }
+
         // Un redactor de Nivel 1 no aplica el cambio directamente: se
         // guarda como propuesta pendiente de aprobación (por un admin o
-        // un redactor de Nivel 4). A partir de Nivel 2 se aplica
+        // un redactor de Nivel 4). A partir de Nivel 3 se aplica
         // directo, igual que un admin.
         const nivelUsuario = payload.rol === "admin" ? NIVEL_MAXIMO : await obtenerNivelUsuario(env, payload.uid);
-        if (payload.rol !== "admin" && nivelUsuario < 2) {
+        if (payload.rol !== "admin" && nivelUsuario < NIVEL_PUBLICACION_DIRECTA) {
           // Anti-duplicados: no se admite una propuesta con EXACTAMENTE los mismos datos que otra
           // ya pendiente del mismo club (de cualquier redactor) ni que la ficha ya publicada.
           // Se comparan sin distinguir mayúsculas ni espacios de más.
@@ -26400,8 +33369,8 @@ async function handlePrimary(request, env, ctx) {
              estadio = excluded.estadio,
              fundacion = excluded.fundacion,
              ciudad = excluded.ciudad,
-             autor_id = excluded.autor_id,
-             autor_nombre = excluded.autor_nombre,
+             autor_id = COALESCE(club_info.autor_id, excluded.autor_id),
+             autor_nombre = CASE WHEN club_info.autor_id IS NULL THEN excluded.autor_nombre ELSE club_info.autor_nombre END,
              updated_at = datetime('now')`
         ).bind(club, entrenador, estadio, fundacion, ciudad, payload.uid, payload.nombre).run();
 
@@ -26439,8 +33408,8 @@ async function handlePrimary(request, env, ctx) {
                estadio = excluded.estadio,
                fundacion = excluded.fundacion,
                ciudad = excluded.ciudad,
-               autor_id = excluded.autor_id,
-               autor_nombre = excluded.autor_nombre,
+               autor_id = COALESCE(club_info.autor_id, excluded.autor_id),
+               autor_nombre = CASE WHEN club_info.autor_id IS NULL THEN excluded.autor_nombre ELSE club_info.autor_nombre END,
                updated_at = datetime('now')`
           ).bind(solicitud.club, solicitud.entrenador, solicitud.estadio, solicitud.fundacion, solicitud.ciudad, solicitud.solicitante_id, solicitud.solicitante_nombre).run();
         }
@@ -26460,7 +33429,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/club-info" && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede borrar la ficha de un club" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede borrar la ficha de un club" }, 403);
         const club = url.searchParams.get("club");
         if (!club) return json({ error: "Falta el club" }, 400);
         await env.DB.prepare("DELETE FROM club_info WHERE club = ?").bind(club).run();
@@ -26635,7 +33604,9 @@ async function handlePrimary(request, env, ctx) {
         const competicion = url.searchParams.get("competicion");
         const grupo = url.searchParams.get("grupo");
         const desdeFecha = url.searchParams.get("desde_fecha");
-        const verNoCubiertos = esStaff || url.searchParams.get("con_no_cubiertos") === "1";
+        // Siempre se devuelven TODOS los resultados (también los finalizados sin cubrir):
+        // la web los muestra con su aviso en lugar de ocultarlos.
+        const verNoCubiertos = true;
         let donde = " WHERE 1=1";
         const binds = [];
         if (!verNoCubiertos) donde += " AND finalizado_no_cubierto = 0";
@@ -26740,7 +33711,9 @@ async function handlePrimary(request, env, ctx) {
         // equipo) lo pide para enseñar los partidos finalizados sin cubrir con un
         // aviso en vez de ocultarlos. Sin ese parámetro (clasificación, porras,
         // portada, estadísticas...) siguen excluidos, así no cuentan en nada.
-        const verNoCubiertos = esStaff || url.searchParams.get("con_no_cubiertos") === "1";
+        // Siempre se devuelven TODOS los resultados (también los finalizados sin cubrir):
+        // la web los muestra con su aviso en lugar de ocultarlos.
+        const verNoCubiertos = true;
         if (!verNoCubiertos) { query += " AND finalizado_no_cubierto = 0"; }
         if (competicion) { query += " AND competicion = ?"; binds.push(competicion); }
         if (desdeFecha) { query += " AND (fecha_partido >= ? OR fecha_partido IS NULL)"; binds.push(desdeFecha); }
@@ -27183,6 +34156,34 @@ async function handlePrimary(request, env, ctx) {
         return json({ ok: true, id: nuevoId });
       }
 
+      // PUT /api/results/:id/datos-partido -> datos del encuentro y estadísticas (Centro de partido).
+      // Ruta aparte del PUT general para no reescribir todo el partido (ni tocar su cronómetro) al editarlos.
+      const datosPartidoMatch = path.match(/^\/api\/results\/(\d+)\/datos-partido$/);
+      if (datosPartidoMatch && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (!puedeGestionarContenidoEditorial(payload)) {
+          return json({ error: "Un fotógrafo no puede editar resultados" }, 403);
+        }
+        const id = parseInt(datosPartidoMatch[1]);
+        const fila = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(id).first();
+        if (!fila) return json({ error: "Resultado no encontrado" }, 404);
+        if (!(await puedeEditar(env, payload, "resultado", id, fila.autor_id))) {
+          return json({ error: "No puedes editar este resultado porque no es tuyo. Solicita permiso al autor o a un Responsable." }, 403);
+        }
+        const body = await request.json().catch(() => ({}));
+        const datos = normalizarDatosPartido(body && body.datos_partido);
+        try {
+          await env.DB.prepare("UPDATE results SET datos_partido = ? WHERE id = ?").bind(datos ? JSON.stringify(datos) : null, id).run();
+        } catch (err) {
+          if (esErrorColumnaFaltante(err, "datos_partido")) {
+            return json({ error: "Falta aplicar la migración migracion_datos_partido.sql en la base de datos." }, 500);
+          }
+          throw err;
+        }
+        return json({ ok: true, datos_partido: datos });
+      }
+
       const resultMatch = path.match(/^\/api\/results\/(\d+)$/);
       // Un único resultado por id (sin autenticar, igual que la lista: se
       // usa en el detalle público y, sobre todo, para que el panel de
@@ -27209,7 +34210,7 @@ async function handlePrimary(request, env, ctx) {
         // finalizado sin cubrir. Ahora se devuelve normal, con
         // finalizado_no_cubierto = 1, para que el modal de detalle pueda
         // abrirse y avisar de que aún no se ha cubierto ni actualizado.)
-        if (ligero) return json({ resultado });
+        if (ligero) return json({ resultado: leerDatosPartido(resultado) });
         resultado.alineaciones = await obtenerAlineaciones(env, "result_id", id);
         // Si hay una (o varias) noticia ya publicada vinculada a este
         // partido (crónica, previa...), se adjunta aquí para poder
@@ -27236,7 +34237,7 @@ async function handlePrimary(request, env, ctx) {
         resultado.url_galeria = hayGaleria
           ? `${SITIO_URL}/galeria/${await slugPartidoUnico(env, resultado)}`
           : null;
-        return json({ resultado });
+        return json({ resultado: leerDatosPartido(resultado) });
       }
       if (resultMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
@@ -27248,7 +34249,7 @@ async function handlePrimary(request, env, ctx) {
         const resultadoParaPermiso = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(id).first();
         if (!resultadoParaPermiso) return json({ error: "Resultado no encontrado" }, 404);
         if (!(await puedeEditar(env, payload, "resultado", id, resultadoParaPermiso.autor_id))) {
-          return json({ error: "No puedes editar este resultado porque no es tuyo. Solicita permiso al autor o a un administrador." }, 403);
+          return json({ error: "No puedes editar este resultado porque no es tuyo. Solicita permiso al autor o a un Responsable." }, 403);
         }
         const body = await request.json();
         if (body.estado && !ESTADOS_RESULTADO_VALIDOS.includes(body.estado)) {
@@ -27376,7 +34377,7 @@ async function handlePrimary(request, env, ctx) {
         const resultadoBorrado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(id).first();
         if (!resultadoBorrado) return json({ error: "Resultado no encontrado" }, 404);
         if (!(await puedeBorrarResultado(env, payload, id, resultadoBorrado.autor_id))) {
-          return json({ error: "No puedes eliminar este resultado porque no es tuyo. Solicita permiso al autor o a un administrador." }, 403);
+          return json({ error: "No puedes eliminar este resultado porque no es tuyo. Solicita permiso al autor o a un Responsable." }, 403);
         }
         try {
           await env.DB.prepare("DELETE FROM results WHERE id = ?").bind(id).run();
@@ -27425,7 +34426,7 @@ async function handlePrimary(request, env, ctx) {
         const resultado = await env.DB.prepare("SELECT autor_id, equipo_local, equipo_visitante FROM results WHERE id = ?").bind(id).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
         if (!(await puedeEditar(env, payload, "resultado", id, resultado.autor_id))) {
-          return json({ error: "No puedes editar este resultado porque no es tuyo. Solicita permiso al autor o a un administrador." }, 403);
+          return json({ error: "No puedes editar este resultado porque no es tuyo. Solicita permiso al autor o a un Responsable." }, 403);
         }
         const body = await request.json();
         // Se admite mandar ambos a null/vacío para "quitar" el MVP ya
@@ -27594,7 +34595,7 @@ async function handlePrimary(request, env, ctx) {
         const resultado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(resultadoId).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
         if (!(await puedeEditar(env, payload, "resultado", resultadoId, resultado.autor_id))) {
-          return json({ error: "No puedes gestionar el minuto a minuto de este partido porque no es tuyo. Solicita permiso al autor o a un administrador." }, 403);
+          return json({ error: "No puedes gestionar el minuto a minuto de este partido porque no es tuyo. Solicita permiso al autor o a un Responsable." }, 403);
         }
         const cuerpoAvisos = await request.json().catch(() => ({}));
         const activos = cuerpoAvisos && cuerpoAvisos.activos === false ? 0 : 1;
@@ -27617,7 +34618,7 @@ async function handlePrimary(request, env, ctx) {
         const resultado = await env.DB.prepare("SELECT autor_id, fecha_partido FROM results WHERE id = ?").bind(resultadoId).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
         if (!(await puedeEditar(env, payload, "resultado", resultadoId, resultado.autor_id))) {
-          return json({ error: "No puedes gestionar el minuto a minuto de este partido porque no es tuyo. Solicita permiso al autor o a un administrador." }, 403);
+          return json({ error: "No puedes gestionar el minuto a minuto de este partido porque no es tuyo. Solicita permiso al autor o a un Responsable." }, 403);
         }
         if (!dentroDelDiaDelPartido(resultado.fecha_partido)) {
           return json({ error: "Solo se puede acceder al panel de Minuto a Minuto el día del partido." }, 403);
@@ -27969,20 +34970,18 @@ async function handlePrimary(request, env, ctx) {
         if (!payload) return json({ error: "Inicia sesión para guardar tu porra" }, 401);
         const body = await request.json();
         const resultadoId = parseInt(body.resultado_id, 10);
-        const golesLocal = parseInt(body.goles_local_predicho, 10);
-        const golesVisitante = parseInt(body.goles_visitante_predicho, 10);
+        let golesLocal = parseInt(body.goles_local_predicho, 10);
+        let golesVisitante = parseInt(body.goles_visitante_predicho, 10);
         if (!Number.isInteger(resultadoId)) {
           return json({ error: "Falta el partido" }, 400);
         }
-        if (!Number.isInteger(golesLocal) || !Number.isInteger(golesVisitante) || golesLocal < 0 || golesVisitante < 0) {
-          return json({ error: "El resultado predicho debe ser un marcador válido (0 o más goles por equipo)" }, 400);
+        if (!Number.isInteger(golesLocal) || !Number.isInteger(golesVisitante)) {
+          return json({ error: "Falta el marcador de la porra" }, 400);
         }
-        // Tope razonable: evita marcadores absurdos metidos a mano contra
-        // la API directamente (10 goles ya es un resultado extremo real
-        // en fútbol amateur; 999 no aporta nada y solo ensucia datos).
-        if (golesLocal > 20 || golesVisitante > 20) {
-          return json({ error: "El resultado predicho no es válido" }, 400);
-        }
+        // Se ajusta al rango 0-20 en vez de rechazar: evita marcadores absurdos
+        // metidos a mano contra la API sin devolverle un error al lector.
+        golesLocal = Math.min(20, Math.max(0, golesLocal));
+        golesVisitante = Math.min(20, Math.max(0, golesVisitante));
         const partido = await env.DB.prepare(
           "SELECT id, estado, fecha_partido FROM results WHERE id = ?"
         ).bind(resultadoId).first();
@@ -28011,6 +35010,40 @@ async function handlePrimary(request, env, ctx) {
            VALUES (?, ?, ?, ?)`
         ).bind(payload.rid, resultadoId, golesLocal, golesVisitante).run();
         return json({ ok: true, id: insertado.meta.last_row_id });
+      }
+
+      // GET /api/mapa-desplazamientos — equipo y estadios visitados del lector
+      // autenticado (mapa de desplazamientos, ver migracion_mapa_desplazamientos.sql).
+      if (path === "/api/mapa-desplazamientos" && method === "GET") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "Inicia sesión para ver tu mapa" }, 401);
+        const fila = await env.DB.prepare(
+          "SELECT equipo, estadios, updated_at FROM reader_mapa_desplazamientos WHERE reader_id = ?"
+        ).bind(payload.rid).first();
+        let estadios = [];
+        try { estadios = fila ? JSON.parse(fila.estadios) : []; } catch { estadios = []; }
+        return json({ equipo: fila ? fila.equipo : null, estadios, updated_at: fila ? fila.updated_at : null });
+      }
+
+      // PUT /api/mapa-desplazamientos — guarda (upsert) el equipo y los estadios
+      // visitados. Body: { equipo, estadios: [id, ...] }. Se valida el formato de
+      // los ids (slug) y se limitan tamaños; el catálogo vive en el frontend.
+      if (path === "/api/mapa-desplazamientos" && method === "PUT") {
+        const payload = await requireReaderAuth(request, env);
+        if (!payload) return json({ error: "Inicia sesión para guardar tu mapa" }, 401);
+        const body = await request.json().catch(() => ({}));
+        let equipo = typeof body.equipo === "string" ? body.equipo.trim().slice(0, 80) : null;
+        if (equipo === "") equipo = null;
+        const lista = Array.isArray(body.estadios) ? body.estadios : [];
+        if (lista.length > 400) return json({ error: "Demasiados estadios" }, 400);
+        const ids = [...new Set(lista.filter((x) => typeof x === "string" && /^[a-z0-9-]{1,80}$/.test(x)))];
+        await env.DB.prepare(
+          `INSERT INTO reader_mapa_desplazamientos (reader_id, equipo, estadios, updated_at)
+           VALUES (?, ?, ?, datetime('now'))
+           ON CONFLICT(reader_id) DO UPDATE SET equipo = excluded.equipo,
+             estadios = excluded.estadios, updated_at = datetime('now')`
+        ).bind(payload.rid, equipo, JSON.stringify(ids)).run();
+        return json({ ok: true, estadios: ids.length });
       }
 
       // GET /api/porras/resumen?competicion= — puntuación TOTAL del lector
@@ -28303,6 +35336,33 @@ async function handlePrimary(request, env, ctx) {
           .bind(contar("local"), contar("visitante"), resultadoId).run();
       }
 
+      // Estado en vivo de un partido en UNA sola petición: la fila del partido (igual que
+      // ?ligero=1) y sus eventos. Lo usa el minuto a minuto público en cada ciclo de
+      // refresco, que antes hacía dos peticiones (partido + eventos). Si el cliente manda
+      // ?firma=<la que recibió la vez anterior> y los eventos no han cambiado, la respuesta
+      // lleva "eventos: null" y no se reenvían. Partidos programados/anulados no tienen
+      // eventos públicos: se devuelve "eventos: null" y firma vacía.
+      const vivoMatch = path.match(/^\/api\/results\/(\d+)\/vivo$/);
+      if (vivoMatch && method === "GET") {
+        const id = parseInt(vivoMatch[1]);
+        const resultado = await memoCorta(`res:${id}`, 3000, () => env.DB.prepare("SELECT * FROM results WHERE id = ?").bind(id).first());
+        if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
+        if (resultado.estado === "programado" || resultado.estado === "anulado") {
+          return json({ resultado, eventos: null, firma: "" });
+        }
+        const eventosVivo = await memoCorta(`ev:${id}`, 3000, async () => {
+          const { results } = await env.DB.prepare(
+            `SELECT id, tipo, equipo, jugador, jugador_sale, jugador_asistencia, minuto, minuto_extra, orden, bajar_gol, var_motivo, var_decision, es_penalti, motivo_tarjeta
+             FROM match_events WHERE resultado_id = ?
+             ORDER BY minuto ASC, CASE WHEN tipo = 'fin_descanso' THEN 1 ELSE 0 END ASC, COALESCE(minuto_extra, 0) ASC, orden ASC, id ASC`
+          ).bind(id).all();
+          return results || [];
+        });
+        const firma = firmaListaEventos(eventosVivo);
+        const firmaCliente = url.searchParams.get("firma") || "";
+        return json({ resultado, eventos: firma === firmaCliente ? null : eventosVivo, firma });
+      }
+
       const eventosMatch = path.match(/^\/api\/results\/(\d+)\/eventos$/);
       if (eventosMatch && method === "GET") {
         const resultadoId = parseInt(eventosMatch[1]);
@@ -28327,7 +35387,7 @@ async function handlePrimary(request, env, ctx) {
         const resultado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(resultadoId).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
         if (!(await puedeEditar(env, payload, "resultado", resultadoId, resultado.autor_id))) {
-          return json({ error: "No puedes editar los eventos de este partido porque no es tuyo. Solicita permiso al autor o a un administrador." }, 403);
+          return json({ error: "No puedes editar los eventos de este partido porque no es tuyo. Solicita permiso al autor o a un Responsable." }, 403);
         }
         const body = await request.json();
         if (!TIPOS_EVENTO_VALIDOS.includes(body.tipo)) {
@@ -28448,7 +35508,7 @@ async function handlePrimary(request, env, ctx) {
         const resultado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(resultadoId).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
         if (!(await puedeEditar(env, payload, "resultado", resultadoId, resultado.autor_id))) {
-          return json({ error: "No puedes editar los eventos de este partido porque no es tuyo. Solicita permiso al autor o a un administrador." }, 403);
+          return json({ error: "No puedes editar los eventos de este partido porque no es tuyo. Solicita permiso al autor o a un Responsable." }, 403);
         }
         const body = await request.json();
         if (!TIPOS_EVENTO_VALIDOS.includes(body.tipo)) {
@@ -28502,7 +35562,7 @@ async function handlePrimary(request, env, ctx) {
         const resultado = await env.DB.prepare("SELECT autor_id FROM results WHERE id = ?").bind(resultadoId).first();
         if (!resultado) return json({ error: "Resultado no encontrado" }, 404);
         if (!(await puedeEditar(env, payload, "resultado", resultadoId, resultado.autor_id))) {
-          return json({ error: "No puedes editar los eventos de este partido porque no es tuyo. Solicita permiso al autor o a un administrador." }, 403);
+          return json({ error: "No puedes editar los eventos de este partido porque no es tuyo. Solicita permiso al autor o a un Responsable." }, 403);
         }
         const eventoABorrar = await env.DB.prepare("SELECT tipo, minuto FROM match_events WHERE id=? AND resultado_id=?").bind(eventoId, resultadoId).first();
         await env.DB.prepare("DELETE FROM match_events WHERE id=? AND resultado_id=?").bind(eventoId, resultadoId).run();
@@ -28532,7 +35592,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/jornadas-calendario" && method === "GET") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede ver el calendario de jornadas" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede ver el calendario de jornadas" }, 403);
         const { results } = await env.DB.prepare(
           "SELECT id, competicion, grupo, jornada, fecha_inicio, fecha_fin FROM jornadas_calendario ORDER BY competicion, grupo IS NOT NULL, grupo, fecha_inicio"
         ).all();
@@ -28542,7 +35602,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/jornadas-calendario" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede editar el calendario de jornadas" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede editar el calendario de jornadas" }, 403);
         const body = await request.json();
         const competicionesValidas = ["hypermotion", "primera_federacion", "segunda_federacion"];
         if (!competicionesValidas.includes(body.competicion)) return json({ error: "Competición no válida" }, 400);
@@ -28564,7 +35624,7 @@ async function handlePrimary(request, env, ctx) {
       if (jornadaCalendarioMatch && method === "PUT") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede editar el calendario de jornadas" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede editar el calendario de jornadas" }, 403);
         const id = parseInt(jornadaCalendarioMatch[1], 10);
         const body = await request.json();
         const competicionesValidas = ["hypermotion", "primera_federacion", "segunda_federacion"];
@@ -28585,7 +35645,7 @@ async function handlePrimary(request, env, ctx) {
       if (jornadaCalendarioMatch && method === "DELETE") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede editar el calendario de jornadas" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede editar el calendario de jornadas" }, 403);
         const id = parseInt(jornadaCalendarioMatch[1], 10);
         await env.DB.prepare("DELETE FROM jornadas_calendario WHERE id = ?").bind(id).run();
         return json({ ok: true });
@@ -28600,7 +35660,7 @@ async function handlePrimary(request, env, ctx) {
       if (path === "/api/jornadas-calendario/recalcular" && method === "POST") {
         const payload = await requireAuth(request, env);
         if (!payload) return json({ error: "No autorizado" }, 401);
-        if (payload.rol !== "admin") return json({ error: "Solo un administrador puede recalcular jornadas" }, 403);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede recalcular jornadas" }, 403);
 
         const { results: partidos } = await env.DB.prepare(
           `SELECT id, competicion, grupo, fecha_partido, jornada FROM results WHERE fuente LIKE 'auto%'`

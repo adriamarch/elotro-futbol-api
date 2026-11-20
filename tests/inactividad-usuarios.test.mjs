@@ -17,6 +17,8 @@ function entre(ini, fin) {
 
 const codigo = [
   entre("const INACTIVIDAD_DIAS_HASTA_PRIMER_AVISO", "function diaYHoraEnMadrid("),
+  entre("function diaYHoraEnMadrid(", "// Días naturales"),
+  entre("const EXCEPCION_DURACIONES_DIAS", "function construirEmailExcepcionActividad("), // excepcionalidades de actividad
   entre("// Historial de avisos de inactividad: una entrada", "\n\n/*\n * ====="),
   "this.cargar = cargarEstadoInactividadUsuarios; this.registrar = registrarHistorialAviso; this.parsear = parsearHistorialAvisos;",
 ].join("\n");
@@ -24,6 +26,11 @@ const codigo = [
 const db = new DatabaseSync(":memory:");
 db.exec(`
   CREATE TABLE articles (id INTEGER PRIMARY KEY, autor_id INTEGER, coautor_id INTEGER, fecha_publicacion TEXT);
+  CREATE TABLE users (id INTEGER PRIMARY KEY, nombre TEXT, email TEXT, created_at TEXT, rol TEXT, activo INTEGER);
+  CREATE TABLE media (id INTEGER PRIMARY KEY, autor_id INTEGER);
+  CREATE TABLE match_gallery (id INTEGER PRIMARY KEY AUTOINCREMENT, result_id INTEGER, media_id INTEGER, vinculado_por_id INTEGER, created_at TEXT);
+  CREATE TABLE excepciones_actividad (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, dias INTEGER NOT NULL,
+    desde TEXT NOT NULL, hasta TEXT NOT NULL, cancelada_at TEXT);
   CREATE TABLE recordatorios_inactividad (user_id INTEGER PRIMARY KEY, ref_actividad TEXT NOT NULL,
     avisos_enviados INTEGER NOT NULL DEFAULT 0, ultimo_aviso_at TEXT, admins_avisados_at TEXT, updated_at TEXT, historial_avisos TEXT);
 `);
@@ -46,7 +53,24 @@ const usuarios = [
   { id: 4, rol: "admin", created_at: hace(100) },     // no aplica
   { id: 5, rol: "redactor", created_at: hace(100) },  // 5 avisos + admins avisados
   { id: 6, rol: "redactor", created_at: hace(100) },  // 3 avisos, pero firma como segundo autor una noticia reciente -> reinicio
+  { id: 7, rol: "redactor", created_at: hace(100) },  // excepcionalidad EN VIGOR hoy
+  { id: 8, rol: "redactor", created_at: hace(100) },  // excepcionalidad de 7 días ya terminada -> esos días no cuentan
+  { id: 9, rol: "redactor", created_at: hace(100) },  // excepcionalidad CANCELADA -> como si no existiera
+  { id: 10, rol: "fotografo", created_at: hace(100) }, // fotógrafo: colgó una galería hace 3 días (foto suya)
+  { id: 11, rol: "fotografo", created_at: hace(100) }, // fotógrafo: nunca ha colgado una galería
+  { id: 12, rol: "fotografo", created_at: hace(100) }, // fotógrafo: vinculó hace 5 días una foto de otra persona a un partido
+  { id: 13, rol: "fotografo", created_at: hace(100) }, // fotógrafo con excepcionalidad en vigor
 ];
+db.prepare("INSERT INTO media VALUES (?,?)").run(1, 10);
+db.prepare("INSERT INTO media VALUES (?,?)").run(2, 99);
+db.prepare("INSERT INTO match_gallery (result_id, media_id, vinculado_por_id, created_at) VALUES (?,?,?,?)").run(1, 1, 10, hace(3).slice(0, 19).replace("T", " "));
+db.prepare("INSERT INTO match_gallery (result_id, media_id, vinculado_por_id, created_at) VALUES (?,?,?,?)").run(2, 2, 12, hace(5).slice(0, 19).replace("T", " "));
+const dia = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+const exc = db.prepare("INSERT INTO excepciones_actividad (user_id, dias, desde, hasta, cancelada_at) VALUES (?,?,?,?,?)");
+exc.run(7, 7, dia(-2), dia(4), null);
+exc.run(8, 7, dia(-17), dia(-11), null);
+exc.run(9, 7, dia(-2), dia(4), "2026-01-01 00:00:00");
+exc.run(13, 7, dia(-2), dia(4), null);
 db.prepare("INSERT INTO recordatorios_inactividad (user_id, ref_actividad, avisos_enviados, ultimo_aviso_at, admins_avisados_at, updated_at) VALUES (?,?,?,?,?,?)").run(1, hace(40), 3, hace(6), null, hace(6));
 db.prepare("INSERT INTO recordatorios_inactividad (user_id, ref_actividad, avisos_enviados, ultimo_aviso_at, admins_avisados_at, updated_at) VALUES (?,?,?,?,?,?)").run(2, hace(40), 3, hace(6), null, hace(6));
 db.prepare("INSERT INTO articles VALUES (?,?,?,?)").run(1, 2, null, hace(2)); // noticia posterior a la ref guardada
@@ -75,6 +99,34 @@ assert.equal(mapa.get(6).dias_sin_subir, 1);
 assert.equal(mapa.get(5).avisos_enviados, 5);
 assert.ok(mapa.get(5).admins_avisados_at);
 
+// ---- Excepcionalidades de actividad ----
+assert.equal(mapa.get(1).excepcion_en_vigor, false, "sin excepcionalidad: no está en vigor");
+assert.equal(mapa.get(7).excepcion_en_vigor, true, "en vigor: el panel no debe anunciar avisos");
+assert.equal(mapa.get(8).excepcion_en_vigor, false, "ya terminada: no está en vigor");
+assert.equal(mapa.get(8).dias_sin_subir, 93, "los 7 días de una excepcionalidad terminada no cuentan como inactividad");
+assert.equal(mapa.get(9).excepcion_en_vigor, false, "cancelada: no cuenta");
+assert.equal(mapa.get(9).dias_sin_subir, 100, "cancelada: los días cuentan con normalidad");
+
+// ---- Fotógrafos: la referencia es su última galería de partido ----
+assert.equal(mapa.get(10).dias_sin_subir, 3, "foto suya vinculada a un partido: cuenta como galería");
+assert.equal(mapa.get(10).referencia_tipo, "galeria");
+assert.equal(mapa.get(11).dias_sin_subir, 100, "sin ninguna galería: se cuenta desde el alta de la cuenta");
+assert.equal(mapa.get(12).dias_sin_subir, 5, "vincular fotos a un partido también cuenta");
+assert.equal(mapa.get(1).referencia_tipo, "noticia");
+assert.equal(mapa.get(13).excepcion_en_vigor, true, "los fotógrafos también pueden tener excepcionalidad");
+
+// La consulta de la pasada diaria es válida y elige la referencia según el rol
+{
+  const sqlPasada = entre("`SELECT u.id, u.nombre, u.email, u.created_at, u.rol,", "`\n    ).all()").slice(1);
+  for (const u of usuarios) db.prepare("INSERT INTO users VALUES (?,?,?,?,?,1)").run(u.id, "N" + u.id, `u${u.id}@x.es`, u.created_at, u.rol);
+  const filas = db.prepare(sqlPasada).all();
+  assert.ok(!filas.some((f) => f.rol === "admin"), "los admins no entran en la pasada");
+  const f10 = filas.find((f) => f.id === 10), f11 = filas.find((f) => f.id === 11), f1 = filas.find((f) => f.id === 1);
+  assert.ok(f10.ultima_galeria, "el fotógrafo con galería trae su fecha");
+  assert.equal(f11.ultima_galeria, null);
+  assert.equal(f1.ultima_galeria, null, "a los redactores no se les calcula galería");
+}
+
 // ---- Historial de cada aviso ----
 const hist1 = [{ numero: 1, enviado_at: hace(16), dias_sin_subir: 84 }, { numero: 2, enviado_at: hace(11), dias_sin_subir: 89 }];
 db.prepare("UPDATE recordatorios_inactividad SET historial_avisos = ? WHERE user_id = 1").run(JSON.stringify(hist1));
@@ -99,6 +151,18 @@ const sinCol = await ctx.cargar(env, usuarios);
 assert.equal(sinCol.get(1).avisos_enviados, 3, "el estado sigue saliendo");
 assert.equal(JSON.stringify(sinCol.get(1).avisos), "[]");
 await ctx.registrar(env, { userId: 1, cicloPrevio: true, numeroAviso: 4, enviadoAtIso: hace(0), diasSinSubir: 1 }); // no debe lanzar
+
+// Sin la tabla de excepcionalidades (migración sin aplicar) el listado sigue funcionando
+db.exec("DROP TABLE excepciones_actividad");
+const sinExc = await ctx.cargar(env, usuarios);
+assert.equal(sinExc.get(1).avisos_enviados, 3, "sin tabla de excepcionalidades el estado sigue saliendo");
+assert.equal(sinExc.get(7).excepcion_en_vigor, false);
+
+// Sin match_gallery el estado de redactores sigue funcionando y los fotógrafos se cuentan desde el alta
+db.exec("DROP TABLE match_gallery");
+const sinGal = await ctx.cargar(env, usuarios);
+assert.equal(sinGal.get(1).avisos_enviados, 3);
+assert.equal(sinGal.get(10).dias_sin_subir, 100);
 
 // Sin la tabla (migración sin aplicar) no debe romper el listado
 db.exec("DROP TABLE recordatorios_inactividad");

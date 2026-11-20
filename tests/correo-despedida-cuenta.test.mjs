@@ -114,3 +114,30 @@ test("a un fotógrafo le llega la despedida con texto de fotografía y legible e
   // El recuadro del mensaje debe llevar eof-texto: sin esa clase, en modo oscuro quedaba texto oscuro sobre fondo oscuro.
   assert.match(enviados[0].html, /class="eof-ficha eof-texto"/);
 });
+
+test("el correo de despedida incluye portada, carta, datos del paso por el medio y botones", async () => {
+  enviados = [];
+  const id = alta("zara", "Ana Zaragoza", "redactor", "ana@x.es");
+  sqlite.prepare("UPDATE users SET equipo = ? WHERE id = ?").run('["Real Zaragoza","SD Ponferradina"]', id);
+  assert.equal(await borrar(id), 200);
+  assert.equal(enviados.length, 1);
+  const { html, text } = enviados[0];
+  assert.match(html, /Hasta pronto/);
+  assert.match(html, /Las puertas siguen abiertas/);
+  assert.match(html, /Tu paso por el medio/);
+  assert.match(html, />Redacción</);
+  assert.match(html, /Real Zaragoza · SD Ponferradina/);
+  assert.match(html, /href="mailto:elotrofutbolmedio@gmail\.com\?subject=/);
+  // Modo oscuro: el botón secundario y la firma tienen regla propia (si no, rojo oscuro sobre fondo oscuro).
+  assert.match(html, /\.eof-boton-sec \{ color:#ff6b7d/);
+  assert.match(text, /^Gracias por todo, Ana/);
+});
+
+test("un equipo con JSON roto no impide enviar la despedida", async () => {
+  enviados = [];
+  const id = alta("roto", "Rosa Rota", "redactor", "rosa@x.es");
+  sqlite.prepare("UPDATE users SET equipo = ? WHERE id = ?").run("{no es json", id);
+  assert.equal(await borrar(id), 200);
+  assert.equal(enviados.length, 1);
+  assert.ok(!/Tu paso por el medio[\s\S]*\{no es json/.test(enviados[0].html));
+});

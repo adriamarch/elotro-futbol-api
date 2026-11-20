@@ -2,8 +2,8 @@
 // bloqueadas como las de Cloudflare Workers) y los entrega al Worker.
 // Variables: SYNC_API_URL (https://tu-dominio), SYNC_INGEST_TOKEN,
 //            THESPORTSDB_API_KEY (opcional; por defecto la gratuita "123").
-const BASE = (process.env.SYNC_API_URL || "").replace(/\/+$/, "");
-const TOKEN = process.env.SYNC_INGEST_TOKEN || "";
+const BASE = (process.env.SYNC_API_URL || "").trim().replace(/\/+$/, "");
+const TOKEN = (process.env.SYNC_INGEST_TOKEN || "").trim();
 const CLAVE = process.env.THESPORTSDB_API_KEY || "123";
 const premium = CLAVE !== "123" && CLAVE !== "3";
 if (!BASE || !TOKEN) { console.error("Faltan SYNC_API_URL o SYNC_INGEST_TOKEN"); process.exit(1); }
@@ -29,6 +29,8 @@ async function worker(metodo, ruta, cuerpo) {
     body: cuerpo ? JSON.stringify(cuerpo) : undefined,
   });
   const txt = await r.text();
+  if (r.status === 401) throw new Error(`Worker 401: el token no coincide. El secret SYNC_INGEST_TOKEN de GitHub debe ser IGUAL que el secret SYNC_INGEST_TOKEN del Worker (y SYNC_API_URL debe apuntar a ese mismo Worker). Respuesta: ${txt.slice(0, 200)}`);
+  if (r.status === 503) throw new Error(`Worker 503: ${txt.slice(0, 200)}`);
   if (!r.ok) throw new Error(`Worker ${r.status}: ${txt.slice(0, 200)}`);
   return JSON.parse(txt);
 }

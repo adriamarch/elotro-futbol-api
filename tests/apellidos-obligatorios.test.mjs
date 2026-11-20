@@ -7,6 +7,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
+import { cabeceraSesion } from "./ayuda-sesion-acreditacion.mjs";
 
 const entrada = process.env.WORKER_ENTRY
   ? new URL(process.env.WORKER_ENTRY, import.meta.url).href
@@ -24,9 +25,8 @@ CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, 
 CREATE TABLE sessions (id TEXT PRIMARY KEY, user_id INTEGER, user_agent TEXT, ip TEXT, created_at TEXT DEFAULT (datetime('now')), last_seen_at TEXT DEFAULT (datetime('now')), revoked_at TEXT);
 CREATE TABLE activity_log (id INTEGER PRIMARY KEY AUTOINCREMENT, usuario_id INTEGER, usuario_nombre TEXT, usuario_rol TEXT, accion TEXT, entidad TEXT, entidad_id TEXT, descripcion TEXT, detalle TEXT, ip TEXT, created_at TEXT DEFAULT (datetime('now')));
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
-CREATE TABLE acreditaciones (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT, email TEXT, dni TEXT, equipo TEXT, tipo_evento TEXT, tipo_acreditacion TEXT, funciones TEXT, jornada_partido TEXT, confirmado INTEGER DEFAULT 0, estado TEXT DEFAULT 'pendiente', created_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE acreditaciones (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT, email TEXT, dni TEXT, equipo TEXT, tipo_evento TEXT, tipo_acreditacion TEXT, funciones TEXT, jornada_partido TEXT, confirmado INTEGER DEFAULT 0, estado TEXT DEFAULT 'pendiente', nota_admin TEXT, created_at TEXT DEFAULT (datetime('now')));
 `);
-sqlite.prepare("INSERT INTO settings (key, value) VALUES ('acreditacion_acceso', 'solicitar')").run();
 
 const limpiar = (a) => a.map((v) => (v === undefined ? null : v));
 const DB = {
@@ -153,7 +153,7 @@ test("admin: al crear y editar usuarios el nombre se guarda con mayúscula inici
 async function postAcred(nombre) {
   const res = await worker.fetch(new Request("https://api.test/api/acreditaciones", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await cabeceraSesion(sqlite, JWT_SECRET)) },
     body: JSON.stringify({
       nombre, email: "solicitante@x.es", dni: "12345678Z", equipo: "CD Tudelano",
       tipo_evento: "Partido de fútbol", tipo_acreditacion: "Prensa / Pupitre",

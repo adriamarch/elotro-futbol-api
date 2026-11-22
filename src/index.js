@@ -9,6 +9,31 @@ import {
   agregarEtiquetas, clubesDeColumna, MIN_NOTICIAS_ETIQUETA_INDEXABLE,
 } from "./etiquetas.js";
 import { analizarComentario } from "./moderacion.js";
+import { calcularMapa } from "./mapa-estadios-catalogo.js";
+
+// Mapa de desplazamientos: el ranking necesita las columnas n_estadios y km (migracion_mapa_ranking.sql).
+// Si la migración no se ha aplicado en D1, se añaden aquí solas (una vez por instancia) en vez de
+// dejar el ranking y el guardado del mapa rotos con un error 500.
+let columnasRankingMapaListas = false;
+async function asegurarColumnasRankingMapa(env) {
+  if (columnasRankingMapaListas) return;
+  try {
+    await env.DB.prepare("SELECT n_estadios, km FROM reader_mapa_desplazamientos LIMIT 1").first();
+  } catch (e) {
+    const sentencias = [
+      "ALTER TABLE reader_mapa_desplazamientos ADD COLUMN n_estadios INTEGER",
+      "ALTER TABLE reader_mapa_desplazamientos ADD COLUMN km INTEGER",
+    ];
+    for (const q of sentencias) {
+      try { await env.DB.prepare(q).run(); } catch (err) { /* "duplicate column": ya existe */ }
+    }
+  }
+  try {
+    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_mapa_desp_n ON reader_mapa_desplazamientos(n_estadios)").run();
+    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_mapa_desp_km ON reader_mapa_desplazamientos(km)").run();
+  } catch (e) { /* los índices son opcionales */ }
+  columnasRankingMapaListas = true;
+}
 // Rutas: /api/login, /api/me, /api/me/sesiones, /api/articles, /api/results, /api/porras, /api/porras/resumen, /api/porras/ranking, /api/media, /api/custom-clubs, /api/articles/:id/comments, /api/comments/:id/vote, /api/comments/:id/report, /api/admin/comments, /api/admin/comments/reported, /api/club-info, /api/admin/club-info, /api/track/view, /api/track/reading, /api/track/result-view, /api/admin/analiticas/* (resumen, mensual, mas-leidas, fuentes, autores, tiempo-lectura, idiomas, partidos-seguidos, gsc), /sitemap-noticias.xml, /sitemap-news.xml, /rss.xml, /api/etiquetas, /sitemap-etiquetas.xml,
 // /rss/categoria|club|autor|etiqueta/{x}.xml
 
@@ -35037,13 +35062,75 @@ async function handlePrimary(request, env, ctx) {
         const lista = Array.isArray(body.estadios) ? body.estadios : [];
         if (lista.length > 400) return json({ error: "Demasiados estadios" }, 400);
         const ids = [...new Set(lista.filter((x) => typeof x === "string" && /^[a-z0-9-]{1,80}$/.test(x)))];
+        // Totales para los rankings: los calcula el servidor con su propio catálogo (nunca se
+        // fía de cifras enviadas por el navegador). Ver migracion_mapa_ranking.sql.
+        const totales = calcularMapa(equipo, ids);
+        await asegurarColumnasRankingMapa(env);
         await env.DB.prepare(
-          `INSERT INTO reader_mapa_desplazamientos (reader_id, equipo, estadios, updated_at)
-           VALUES (?, ?, ?, datetime('now'))
+          `INSERT INTO reader_mapa_desplazamientos (reader_id, equipo, estadios, n_estadios, km, updated_at)
+           VALUES (?, ?, ?, ?, ?, datetime('now'))
            ON CONFLICT(reader_id) DO UPDATE SET equipo = excluded.equipo,
-             estadios = excluded.estadios, updated_at = datetime('now')`
-        ).bind(payload.rid, equipo, JSON.stringify(ids)).run();
-        return json({ ok: true, estadios: ids.length });
+             estadios = excluded.estadios, n_estadios = excluded.n_estadios, km = excluded.km,
+             updated_at = datetime('now')`
+        ).bind(payload.rid, equipo, JSON.stringify(ids), totales.n, totales.km).run();
+        return json({ ok: true, estadios: ids.length, n: totales.n, km: totales.km });
+      }
+
+      // GET /api/mapa-desplazamientos/ranking — dos clasificaciones públicas: lectores con MÁS
+      // ESTADIOS visitados y lectores con MÁS KM acumulados (ida y vuelta, en línea recta).
+      // Público como el ranking de porras (solo se muestra el nombre que el lector eligió y su
+      // equipo). Con sesión, devuelve además la posición propia aunque no esté entre los primeros.
+      // Los empates en la cifra principal comparten puesto (1, 1, 3...).
+      if (path === "/api/mapa-desplazamientos/ranking" && method === "GET") {
+        await asegurarColumnasRankingMapa(env);
+        // Filas anteriores a la migración: se completan aquí la primera vez que alguien mira el ranking.
+        const { results: pendientes } = await env.DB.prepare(
+          "SELECT reader_id, equipo, estadios FROM reader_mapa_desplazamientos WHERE n_estadios IS NULL LIMIT 300"
+        ).all();
+        if (pendientes.length) {
+          await env.DB.batch(pendientes.map((f) => {
+            let lista = [];
+            try { lista = JSON.parse(f.estadios) || []; } catch { lista = []; }
+            const t = calcularMapa(f.equipo, lista);
+            return env.DB.prepare("UPDATE reader_mapa_desplazamientos SET n_estadios = ?, km = ? WHERE reader_id = ?").bind(t.n, t.km, f.reader_id);
+          }));
+        }
+        const TOP = 50;
+        const desde = `FROM reader_mapa_desplazamientos m JOIN readers rd ON rd.id = m.reader_id
+                       WHERE rd.activo = 1 AND m.n_estadios > 0`;
+        const columnas = "rd.id AS reader_id, rd.nombre, m.equipo, m.n_estadios AS n, m.km AS km";
+        const [porEstadios, porKm, total] = await Promise.all([
+          env.DB.prepare(`SELECT ${columnas} ${desde} ORDER BY m.n_estadios DESC, m.km DESC, rd.nombre ASC LIMIT ?`).bind(TOP).all(),
+          env.DB.prepare(`SELECT ${columnas} ${desde} ORDER BY m.km DESC, m.n_estadios DESC, rd.nombre ASC LIMIT ?`).bind(TOP).all(),
+          env.DB.prepare(`SELECT COUNT(*) AS total ${desde}`).first(),
+        ]);
+        const conPosicion = (filas, campo) => {
+          let pos = 0, anterior = null;
+          return filas.map((f, i) => {
+            if (f[campo] !== anterior) { pos = i + 1; anterior = f[campo]; }
+            return { ...f, posicion: pos };
+          });
+        };
+        let mi = null;
+        const payload = await requireReaderAuth(request, env);
+        if (payload) {
+          const mia = await env.DB.prepare(
+            "SELECT m.equipo, m.n_estadios AS n, m.km AS km FROM reader_mapa_desplazamientos m WHERE m.reader_id = ? AND m.n_estadios > 0"
+          ).bind(payload.rid).first();
+          if (mia) {
+            const [mejoresN, mejoresKm] = await Promise.all([
+              env.DB.prepare(`SELECT COUNT(*) AS c ${desde} AND m.n_estadios > ?`).bind(mia.n).first(),
+              env.DB.prepare(`SELECT COUNT(*) AS c ${desde} AND m.km > ?`).bind(mia.km).first(),
+            ]);
+            mi = { equipo: mia.equipo, n: mia.n, km: mia.km, posicion_estadios: mejoresN.c + 1, posicion_km: mejoresKm.c + 1 };
+          }
+        }
+        return json({
+          estadios: conPosicion(porEstadios.results, "n"),
+          km: conPosicion(porKm.results, "km"),
+          total: total ? total.total : 0,
+          mi_posicion: mi,
+        });
       }
 
       // GET /api/porras/resumen?competicion= — puntuación TOTAL del lector

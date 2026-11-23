@@ -3604,6 +3604,177 @@ async function asegurarTablaPodcast(env) {
   PODCAST_TABLA_LISTA = true;
 }
 
+// ============================================================
+// COMUNICADOS OFICIALES DEL MEDIO
+// Los escriben los Responsables (rol admin) desde el panel (pestaña "Comunicados oficiales") y los
+// leen los lectores en la web pública (/comunicados). Tabla creada en caliente con DDL
+// portable (id TEXT, sin AUTOINCREMENT) para que sea idéntica en D1 (SQLite) y en PostgreSQL.
+//   publicado 0 = borrador (solo lo ven los Responsables), 1 = visible para los lectores.
+//   fijado 1    = comunicado destacado; solo puede haber uno publicado y fijado a la vez.
+//   firma       = cargo con el que se firma (p. ej. "Responsable del Sitio Web"); vacío = "Responsable".
+// El texto se guarda como TEXTO PLANO (párrafos separados por línea en blanco): nunca HTML.
+// ============================================================
+const COMUNICADO_TIPOS = ["comunicado", "aviso", "rectificacion", "novedad"];
+const COMUNICADO_TITULO_MAX = 150;
+const COMUNICADO_RESUMEN_MAX = 280;
+const COMUNICADO_CONTENIDO_MIN = 20;
+const COMUNICADO_CONTENIDO_MAX = 8000;
+const COMUNICADO_FIRMA_MAX = 80;
+let COMUNICADOS_TABLA_LISTA = false;
+async function asegurarTablaComunicados(env) {
+  if (COMUNICADOS_TABLA_LISTA) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS comunicados (
+       id TEXT PRIMARY KEY, slug TEXT NOT NULL, tipo TEXT NOT NULL, titulo TEXT NOT NULL,
+       resumen TEXT, contenido TEXT NOT NULL, fecha TEXT NOT NULL,
+       fijado INTEGER NOT NULL DEFAULT 0, publicado INTEGER NOT NULL DEFAULT 0,
+       autor_id INTEGER, autor_nombre TEXT, firma TEXT,
+       created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`
+  ).run();
+  await env.DB.prepare(
+    "CREATE INDEX IF NOT EXISTS idx_comunicados_publicado_fecha ON comunicados (publicado, fecha)"
+  ).run();
+  COMUNICADOS_TABLA_LISTA = true;
+}
+
+function comunicadoFila(f) {
+  return {
+    id: f.id, slug: f.slug, tipo: f.tipo, titulo: f.titulo, resumen: f.resumen || "", contenido: f.contenido || "",
+    fecha: f.fecha || "", fijado: Number(f.fijado) === 1, publicado: Number(f.publicado) === 1,
+    autor_id: f.autor_id == null ? null : Number(f.autor_id), autor: f.autor_nombre || "", firma: f.firma || "",
+    created_at: f.created_at || "", updated_at: f.updated_at || "",
+    editado: !!f.updated_at && f.updated_at !== f.created_at,
+  };
+}
+
+// Devuelve { v } con los campos limpios o { error }. La firma vacía se resuelve fuera (depende de quién escribe).
+function comunicadoValidar(body) {
+  if (!body || typeof body !== "object") return { error: "Petición no válida" };
+  const linea = (t) => String(t == null ? "" : t).replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  const titulo = linea(body.titulo);
+  if (!titulo) return { error: "Falta el título" };
+  if (titulo.length > COMUNICADO_TITULO_MAX) return { error: `El título es demasiado largo (máximo ${COMUNICADO_TITULO_MAX} caracteres)` };
+  const resumen = linea(body.resumen);
+  if (resumen.length > COMUNICADO_RESUMEN_MAX) return { error: `El resumen es demasiado largo (máximo ${COMUNICADO_RESUMEN_MAX} caracteres)` };
+  const firma = linea(body.firma);
+  if (firma.length > COMUNICADO_FIRMA_MAX) return { error: `La firma es demasiado larga (máximo ${COMUNICADO_FIRMA_MAX} caracteres)` };
+  const contenido = String(body.contenido == null ? "" : body.contenido)
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]+/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (contenido.length < COMUNICADO_CONTENIDO_MIN) return { error: `El texto es demasiado corto (mínimo ${COMUNICADO_CONTENIDO_MIN} caracteres)` };
+  if (contenido.length > COMUNICADO_CONTENIDO_MAX) return { error: `El texto es demasiado largo (máximo ${COMUNICADO_CONTENIDO_MAX} caracteres)` };
+  const tipo = body.tipo == null || body.tipo === "" ? "comunicado" : String(body.tipo);
+  if (!COMUNICADO_TIPOS.includes(tipo)) return { error: "Tipo de comunicado no válido" };
+  const hoy = new Date().toISOString().slice(0, 10);
+  let fecha = hoy;
+  if (body.fecha != null && body.fecha !== "") {
+    const f = String(body.fecha);
+    const valida = /^\d{4}-\d{2}-\d{2}$/.test(f) && !Number.isNaN(Date.parse(f + "T00:00:00Z")) && new Date(f + "T00:00:00Z").toISOString().slice(0, 10) === f;
+    if (!valida) return { error: "La fecha no es válida (usa AAAA-MM-DD)" };
+    fecha = f;
+  }
+  return { v: { titulo, resumen, firma, contenido, tipo, fecha, fijado: body.fijado ? 1 : 0, publicado: body.publicado === true || body.publicado === 1 ? 1 : 0 } };
+}
+
+// Solo los Responsables (rol admin) escriben comunicados oficiales.
+async function requireComunicadosEditor(request, env) {
+  const payload = await requireAuth(request, env);
+  if (!payload) return { error: json({ error: "No autorizado" }, 401) };
+  if (!esAdmin(payload)) return { error: json({ error: "Solo los Responsables pueden gestionar los comunicados oficiales" }, 403) };
+  return { payload };
+}
+
+// Cargo con el que firma una persona: "Responsable" + sus funciones (si las tiene).
+async function comunicadoFirmaPorDefecto(env, payload) {
+  try {
+    const funciones = await leerFuncionesResponsables(env);
+    return tituloCargo("Responsable", funciones[String(payload.uid)] || []);
+  } catch { return "Responsable"; }
+}
+
+// ---- Fase 2: lectura pública y avisos al publicar --------------------------------------------------
+const COMUNICADO_TIPO_ETIQUETA = { comunicado: "Comunicado oficial", aviso: "Aviso", rectificacion: "Rectificación", novedad: "Novedad" };
+
+// Lo que ve cualquier lector. NUNCA se expone quién lo escribió (autor_id/autor_nombre): la firma es el cargo.
+function comunicadoPublico(f, conTexto = false) {
+  const c = {
+    slug: f.slug, tipo: f.tipo, titulo: f.titulo, resumen: f.resumen || "", fecha: f.fecha || "",
+    fijado: Number(f.fijado) === 1, firma: f.firma || "Responsable",
+    actualizado: !!f.updated_at && f.updated_at !== f.created_at ? f.updated_at : "",
+  };
+  if (conTexto) c.contenido = f.contenido || "";
+  return c;
+}
+
+function comunicadoUrl(slug) { return `${SITIO_URL}/comunicados/${encodeURIComponent(slug)}`; }
+
+// Los avisos masivos son siempre una decisión explícita al publicar (casillas del panel), nunca automáticos.
+function comunicadoAvisosPedidos(cuerpo) {
+  const push = !!cuerpo && cuerpo.avisar_push === true;
+  const correo = !!cuerpo && cuerpo.avisar_correo === true;
+  return push || correo ? { push, correo } : null;
+}
+
+function comunicadoCorreoCuerpoHtml(c) {
+  const parrafos = String(c.contenido || "").split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+  const html = parrafos.map((p) => `<p style="margin:0 0 14px;">${escapeHtmlEmail(p).replace(/\n/g, "<br>")}</p>`).join("");
+  return `${html}<p style="margin:18px 0 0;font-weight:700;">${escapeHtmlEmail(c.firma || "Responsable")}</p>`;
+}
+
+async function comunicadoEnviarCorreos(env, c) {
+  if (!cuentasResend(env).length) return { enviados: 0, desactivado: true };
+  const { results } = await env.DB.prepare("SELECT email, baja_token FROM newsletter_suscriptores WHERE activo = 1").all();
+  const destinatarios = results || [];
+  const etiqueta = COMUNICADO_TIPO_ETIQUETA[c.tipo] || "Comunicado oficial";
+  const url = comunicadoUrl(c.slug);
+  const TAMANO_LOTE = 45;
+  let enviados = 0, fallidos = 0;
+  for (let i = 0; i < destinatarios.length; i += TAMANO_LOTE) {
+    await Promise.all(destinatarios.slice(i, i + TAMANO_LOTE).map(async (s) => {
+      const bajaUrl = `${API_URL}/api/newsletter/baja?token=${encodeURIComponent(s.baja_token)}`;
+      try {
+        const resp = await enviarConResend(env, {
+          to: [s.email],
+          subject: `${etiqueta}: ${c.titulo}`,
+          html: plantillaEmail({
+            etiqueta, titulo: c.titulo, parrafo: c.resumen || undefined, bloqueHtml: comunicadoCorreoCuerpoHtml(c),
+            boton: { texto: "Leer en la web", url }, tono: c.tipo === "aviso" || c.tipo === "rectificacion" ? "aviso" : "marca",
+            preheader: c.resumen || c.titulo,
+            pieHtml: `Recibes este correo porque estás suscrito al boletín de ELOTROFÚTBOLTV. <a href="${bajaUrl}" style="color:#8a93a3;text-decoration:underline;">Darte de baja</a>`,
+          }),
+        });
+        if (resp && resp.ok) enviados++; else fallidos++;
+      } catch (err) { fallidos++; }
+    }));
+  }
+  return { enviados, fallidos };
+}
+
+// Avisa por push (a quien recibe las noticias) y/o por correo (boletín). Nunca lanza: publicar ya está hecho.
+async function avisarComunicado(env, c, { push = false, correo = false } = {}) {
+  const etiqueta = COMUNICADO_TIPO_ETIQUETA[c.tipo] || "Comunicado oficial";
+  const primerParrafo = String(c.contenido || "").split(/\n{2,}/)[0] || "";
+  const resultado = { push: null, correo: null };
+  if (push) {
+    try {
+      resultado.push = await pushEnviarATopico(env, "noticias", {
+        titulo: pushRecortar(`${etiqueta}: ${c.titulo}`, 100),
+        cuerpo: pushRecortar(c.resumen || primerParrafo || "Nuevo comunicado oficial de ElOtroFútbol", 160),
+        url: comunicadoUrl(c.slug),
+        tag: `comunicado-${c.id}`.slice(0, 120),
+      }, { ttl: 24 * 3600 });
+    } catch (err) { console.error("avisarComunicado (push):", err && err.message); }
+  }
+  if (correo) {
+    try { resultado.correo = await comunicadoEnviarCorreos(env, c); }
+    catch (err) { console.error("avisarComunicado (correo):", err && err.message); }
+  }
+  return resultado;
+}
+
 async function asegurarTablaDestinatariosAnuncio(env) {
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS anuncios_email_destinatarios (
@@ -9788,7 +9959,7 @@ async function registrarActividad(env, request, payload, { accion, entidad = nul
 // puntúa si cambia el rol o desactiva (marcas _rol_cambiado/_desactivado del detalle).
 const GUARDIAN_PESOS = {
   eliminar_articulo: 3, eliminar_media: 2, eliminar_resultado: 3, eliminar_usuario: 6, eliminar_lector: 3,
-  borrar_comentario: 1, borrar_encuesta: 2, borrar_podcast: 3, borrar_noticia_rapida: 2,
+  borrar_comentario: 1, borrar_encuesta: 2, borrar_podcast: 3, borrar_comunicado: 2, borrar_noticia_rapida: 2,
   borrar_producto_tienda: 3, borrar_pedido_tienda: 2, eliminar_carpeta_media: 3, borrar_votacion_interna: 2,
   formulario_eliminado: 5, vaciar_papelera: 6, restablecer_password: 5, crear_usuario: 3,
   editar_usuario: 6, editar_settings: 1,
@@ -9917,7 +10088,7 @@ async function guardianActuar(env, uid, cfg, puntos, resumen) {
 
   // Lo que NO se puede devolver solo (no pasa por la papelera): se dice claro en el aviso.
   const noRecuperable = ["eliminar_usuario", "eliminar_resultado", "eliminar_lector", "borrar_comentario", "borrar_encuesta",
-    "borrar_podcast", "borrar_noticia_rapida", "borrar_producto_tienda", "borrar_pedido_tienda", "formulario_eliminado",
+    "borrar_podcast", "borrar_comunicado", "borrar_noticia_rapida", "borrar_producto_tienda", "borrar_pedido_tienda", "formulario_eliminado",
     "vaciar_papelera", "eliminar_carpeta_media", "borrar_votacion_interna", "editar_settings", "restablecer_password"]
     .filter((a) => resumen[a]).map((a) => `${a} x${resumen[a]}`);
 
@@ -10899,7 +11070,8 @@ async function construirEstadisticasCuenta(env, usuario) {
   }, { acciones: 0, dias_activos: 0 });
   const pNiveles = seguro(() => todas(
     "SELECT nivel_anterior, nivel_nuevo, created_at FROM nivel_historial WHERE usuario_id = ?1 ORDER BY created_at", uid), []);
-  const pRacha = usuario.rol === "admin" ? Promise.resolve(null) : seguro(() => calcularRachaSemanal(env, usuario), null);
+  // La racha cuenta para TODOS los roles (redactor, fotógrafo y Responsable/admin): se deduce de lo que cada uno publica o sube.
+  const pRacha = seguro(() => calcularRachaSemanal(env, usuario), null);
   const pInsignias = usuario.rol === "admin" ? Promise.resolve({}) : seguro(() => leerInsigniasGuardadas(env, uid), {});
 
 
@@ -11978,7 +12150,7 @@ async function avisarNivelesListosSiToca(env, { forzar = false } = {}) {
 }
 
 // ---------- RACHAS SEMANALES ----------
-// "Semanas seguidas con actividad" de un colaborador (redactor o fotógrafo). Una semana (lunes a
+// "Semanas seguidas con actividad" de cualquier persona del equipo (redactor, fotógrafo o Responsable). Una semana (lunes a
 // domingo, hora de Madrid) cuenta como activa si la persona publicó al menos un artículo (como
 // autora o coautora) o vinculó al menos una foto a una galería de partido. No se guarda nada
 // aparte: se deduce de articles.fecha_publicacion y match_gallery.created_at, así que cuenta
@@ -19513,6 +19685,39 @@ async function syncCargarAlias(env, ctr, cache) {
   return mapa;
 }
 
+// ---- Salvaguardas del relleno (siempre activas, también en «Sincronizar todo») ----
+// 1) Solo se toca la temporada EN CURSO según el reloj (no la que diga la config ni la
+//    Action): un partido de marzo de 2025 ni se inserta ni se actualiza.
+// 2) Un partido solo se marca 'finalizado' si YA se ha jugado (su hora ya pasó) y su jornada
+//    ya ha empezado según «Calendario de jornadas». Con SYNC_FINALIZAR_SOLO_JORNADA_CERRADA = true
+//    además hay que esperar a que la jornada entera haya terminado.
+const SYNC_FINALIZAR_SOLO_JORNADA_CERRADA = false;
+
+function syncRangoTemporadaActual(instante = new Date()) {
+  const temporada = syncTemporada(instante);
+  const anio = parseInt(temporada.slice(0, 4), 10);
+  return { temporada, desde: `${anio}-07-01`, hasta: `${anio + 1}-06-30` };
+}
+
+function syncFechaEnTemporadaActual(fechaLocal, rango) {
+  const dia = String(fechaLocal || "").slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(dia) && dia >= rango.desde && dia <= rango.hasta;
+}
+
+function syncPuedeFinalizar(fechaLocal, jornada, calendario, ahora) {
+  if (!fechaLocal) return false;
+  // El propio partido ya tiene que haber terminado (hora pasada; si solo hay día, que el día haya pasado).
+  if (!syncPartidoPendienteDeResultado(fechaLocal, ahora)) return false;
+  const filas = (calendario || []).filter((r) => Number(r.jornada) === Number(jornada));
+  if (filas.length) {
+    const inicio = filas.map((r) => String(r.fecha_inicio || "").slice(0, 10)).filter(Boolean).sort()[0];
+    const fin = filas.map((r) => String(r.fecha_fin || "").slice(0, 10)).filter(Boolean).sort().pop();
+    if (inicio && inicio > ahora.fecha) return false; // la jornada aún no ha empezado
+    if (SYNC_FINALIZAR_SOLO_JORNADA_CERRADA && fin && fin >= ahora.fecha) return false; // aún no ha terminado
+  }
+  return true;
+}
+
 // Aplica los eventos de UNA liga: resuelve nombres, deduplica contra los
 // partidos existentes y escribe solo lo que cambia. Devuelve contadores.
 async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cache, opciones = {}) {
@@ -19526,7 +19731,10 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
 
   const alias = await syncCargarAlias(env, ctr, cache);
   const calendario = await syncCargarCalendario(env, liga, ctr);
-  const inicioTemporada = `${temporada.slice(0, 4)}-07-01`;
+  // Temporada REAL en curso (ver salvaguardas): ignora `temporada` si viene antigua de la config.
+  const rango = syncRangoTemporadaActual();
+  const ahora = syncPartesMadrid(new Date());
+  const inicioTemporada = rango.desde;
 
   // Partidos existentes de esta competicion/grupo (y los sin grupo, que
   // son los que un redactor dejo sin grupo) en la temporada actual.
@@ -19592,6 +19800,9 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
   const sinAlias = new Set();
   for (const ev of eventos) {
     if (!ev.idEvent || !ev.strHomeTeam || !ev.strAwayTeam) { resumen.omitidos++; continue; }
+    // Fuera de la temporada actual (p. ej. 31/03/2025): no se inserta ni se actualiza nada.
+    const fechaEv = syncFechaLocalEvento(ev).fechaLocal;
+    if (fechaEv && !syncFechaEnTemporadaActual(fechaEv, rango)) { resumen.fuera_temporada = (resumen.fuera_temporada || 0) + 1; resumen.omitidos++; continue; }
     const local = resolver(ev.strHomeTeam);
     const visitante = resolver(ev.strAwayTeam);
     if (!local.ok && conocidos.size) sinAlias.add(ev.strHomeTeam);
@@ -19602,9 +19813,14 @@ async function syncAplicarEventos(env, liga, eventos, ronda, temporada, ctr, cac
     if (fechaLocal && fechaLocal.length === 10) resumen.sin_hora_api++;
     const golesL = syncEnteroONull(ev.intHomeScore);
     const golesV = syncEnteroONull(ev.intAwayScore);
-    const estado = syncEstadoEvento(ev, golesL, golesV, instanteMs);
+    let estado = syncEstadoEvento(ev, golesL, golesV, instanteMs);
     const jornada = syncJornadaDeCalendario(calendario, fechaLocal)
       ?? syncEnteroONull(ev.intRound) ?? ronda ?? null;
+    // Nunca 'finalizado' si el partido/jornada aún no ha pasado: se queda 'programado' y sin marcador.
+    if (estado === "finalizado" && !syncPuedeFinalizar(fechaLocal, jornada, calendario, ahora)) {
+      estado = "programado";
+      resumen.finalizado_bloqueado = (resumen.finalizado_bloqueado || 0) + 1;
+    }
     const ubicacion = String(ev.strVenue || "").trim() || ubicacionPorLocal.get(local.nombre) || null;
 
     let fila = porExternalId.get(externalId);
@@ -21360,6 +21576,7 @@ const CACHE_PUBLICA_TTL_MS = {
   "/api/noticias-rapidas": 15000,
   "/api/polls/portada": 15000,
   "/api/settings": 60000,
+  "/api/luto": 15000,
   "/api/eliminatorias": 60000, // se calcula con la liga entera de results: TTL más largo
   "/api/club-info": 60000,
   "/api/media/publica": 30000,
@@ -23856,7 +24073,7 @@ async function handlePrimary(request, env, ctx) {
           ...NIVELES_INFO[n],
           requisitos: NIVELES_REQUISITOS[n] || null,
         }));
-        const racha = user.rol === "admin" ? null : await calcularRachaSemanal(env, user);
+        const racha = await calcularRachaSemanal(env, user); // todos los roles, también Responsables
         const insignias = await calcularInsignias(env, user, progreso.publicaciones);
         return json({ ...progreso, niveles, racha, insignias, pases: construirPasesNiveles() });
       }
@@ -24131,6 +24348,49 @@ async function handlePrimary(request, env, ctx) {
           descripcion: `Ha modificado las redes sociales del medio`,
         }));
         return json({ ok: true, redes: redesLimpias });
+      }
+
+      // ---------- LUTO DE LA WEB (lazo negro sobre el logo) ----------
+      // Un único ajuste en la tabla settings (clave "luto"). GET público (lo lee js/luto.js en todas las
+      // páginas); PUT solo para un Responsable, desde Funcionalidades > Luto web.
+      if (path === "/api/luto" && method === "GET") {
+        const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'luto'").first();
+        let l = {};
+        if (row) { try { l = JSON.parse(row.value) || {}; } catch { l = {}; } }
+        const hastaMs = l.hasta ? Date.parse(l.hasta) : NaN;
+        const caducado = Number.isFinite(hastaMs) && Date.now() > hastaMs;
+        return json({
+          activo: l.activo === true && !caducado,
+          mensaje: typeof l.mensaje === "string" ? l.mensaje : "",
+          detalle: typeof l.detalle === "string" ? l.detalle : "",
+          grises: l.grises !== false,
+          hasta: Number.isFinite(hastaMs) ? new Date(hastaMs).toISOString() : null,
+        });
+      }
+
+      if (path === "/api/luto" && method === "PUT") {
+        const payload = await requireAuth(request, env);
+        if (!payload) return json({ error: "No autorizado" }, 401);
+        if (payload.rol !== "admin") return json({ error: "Solo un Responsable puede activar o desactivar el luto de la web" }, 403);
+        const body = await request.json().catch(() => ({}));
+        const mensaje = typeof body.mensaje === "string" ? body.mensaje.replace(/\s+/g, " ").trim().slice(0, 160) : "";
+        const detalle = typeof body.detalle === "string" ? body.detalle.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim().slice(0, 500) : "";
+        let hasta = null;
+        if (body.hasta) {
+          const ms = Date.parse(body.hasta);
+          if (!Number.isFinite(ms)) return json({ error: "La fecha de fin no es válida" }, 400);
+          hasta = new Date(ms).toISOString();
+        }
+        const valor = { activo: body.activo === true, mensaje, detalle, grises: body.grises !== false, hasta };
+        await env.DB.prepare(
+          `INSERT INTO settings (key, value, updated_at) VALUES ('luto', ?, datetime('now'))
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+        ).bind(JSON.stringify(valor)).run();
+        ctx.waitUntil(registrarActividad(env, request, payload, {
+          accion: "editar_settings", entidad: "settings",
+          descripcion: valor.activo ? "Ha activado el luto en la web" : "Ha desactivado el luto en la web",
+        }));
+        return json({ ok: true, ...valor });
       }
 
       // ---------- ELIMINATORIAS Y PLAYOFFS (automáticos) ----------
@@ -30274,6 +30534,21 @@ async function handlePrimary(request, env, ctx) {
             body.publicado = false;
           }
         }
+        // Editar una noticia ya programada NUNCA la quita de programada, aunque
+        // quien la edita no tenga permiso para (re)programar (Nivel 1-2, o un
+        // permiso temporal de edición): el permiso de arriba solo limita CAMBIAR
+        // la fecha. Si sigue sin publicar y sin una fecha nueva válida, se
+        // conserva la que tenía (si ya pasó, el próximo minuto).
+        if (!programadoPara && body.publicado === false
+            && !articuloParaPermiso.publicado && articuloParaPermiso.programado_para) {
+          const progOriginal = articuloParaPermiso.programado_para;
+          const inicioMinutoConserva = Math.floor(Date.now() / 60000) * 60000;
+          let fechaConservada = progOriginal instanceof Date
+            ? progOriginal
+            : new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(String(progOriginal)) ? String(progOriginal) : String(progOriginal).replace(" ", "T") + "Z");
+          if (isNaN(fechaConservada.getTime()) || fechaConservada.getTime() < inicioMinutoConserva) fechaConservada = new Date(inicioMinutoConserva + 60000);
+          programadoPara = aSqliteDatetimeUTC(fechaConservada);
+        }
         // Una noticia programada no puede ser de "última hora": el banner dura 2 h
         // desde que se guarda y habría caducado mucho antes de publicarse. Se
         // fuerza a false (en la edicion, tambien apaga uno que ya tuviera).
@@ -31084,6 +31359,125 @@ async function handlePrimary(request, env, ctx) {
         return v.anonima === 1 ? "al_cerrar" : v.resultados_visibles;
       }
 
+      // ---------- COMUNICADOS OFICIALES: gestión desde el panel (solo Responsables) ----------
+      // GET /api/comunicados/admin (todos, también borradores), POST /api/comunicados,
+      // PUT|DELETE /api/comunicados/<id>. La lectura pública (GET) va más abajo.
+      if (path === "/api/comunicados/admin" && method === "GET") {
+        const auth = await requireComunicadosEditor(request, env);
+        if (auth.error) return auth.error;
+        await asegurarTablaComunicados(env);
+        const { results } = await env.DB.prepare("SELECT * FROM comunicados ORDER BY fecha DESC, created_at DESC").all();
+        return json({ items: (results || []).map(comunicadoFila) });
+      }
+
+      if (path === "/api/comunicados" && method === "POST") {
+        const auth = await requireComunicadosEditor(request, env);
+        if (auth.error) return auth.error;
+        const cuerpoCom = await request.json().catch(() => null);
+        const r = comunicadoValidar(cuerpoCom);
+        if (r.error) return json({ error: r.error }, 400);
+        await asegurarTablaComunicados(env);
+        const v = r.v;
+        const firma = v.firma || await comunicadoFirmaPorDefecto(env, auth.payload);
+        const id = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+        const slug = `${slugify(v.titulo) || "comunicado"}-${id.slice(0, 6)}`;
+        const ahora = new Date().toISOString();
+        if (v.fijado && v.publicado) await env.DB.prepare("UPDATE comunicados SET fijado = 0").run();
+        await env.DB.prepare(
+          `INSERT INTO comunicados (id, slug, tipo, titulo, resumen, contenido, fecha, fijado, publicado, autor_id, autor_nombre, firma, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(id, slug, v.tipo, v.titulo, v.resumen || null, v.contenido, v.fecha, v.fijado, v.publicado,
+          auth.payload.uid ?? null, auth.payload.nombre || null, firma, ahora, ahora).run();
+        ctx.waitUntil(registrarActividad(env, request, auth.payload, {
+          accion: "crear_comunicado", entidad: "comunicado", entidad_id: id,
+          descripcion: v.publicado
+            ? `${auth.payload.nombre} ha publicado el comunicado oficial "${v.titulo}"`
+            : `${auth.payload.nombre} ha guardado como borrador el comunicado oficial "${v.titulo}"`,
+        }));
+        // Aviso por push/correo: solo si nace ya publicado Y se marcó la casilla.
+        const avisos = v.publicado ? comunicadoAvisosPedidos(cuerpoCom) : null;
+        if (avisos) ctx.waitUntil(avisarComunicado(env, { id, slug, ...v, firma }, avisos));
+        return json({ ok: true, id, slug, firma, avisos });
+      }
+
+      {
+        const mCom = path.match(/^\/api\/comunicados\/([\w-]+)$/);
+        if (mCom && mCom[1] !== "admin" && (method === "PUT" || method === "DELETE")) {
+          const auth = await requireComunicadosEditor(request, env);
+          if (auth.error) return auth.error;
+          await asegurarTablaComunicados(env);
+          const id = mCom[1];
+          const actual = await env.DB.prepare("SELECT id, slug, titulo, firma, publicado FROM comunicados WHERE id = ?").bind(id).first();
+          if (!actual) return json({ error: "No existe ese comunicado" }, 404);
+          if (method === "DELETE") {
+            await env.DB.prepare("DELETE FROM comunicados WHERE id = ?").bind(id).run();
+            ctx.waitUntil(registrarActividad(env, request, auth.payload, {
+              accion: "borrar_comunicado", entidad: "comunicado", entidad_id: id,
+              descripcion: `${auth.payload.nombre} ha borrado el comunicado oficial "${actual.titulo}"`,
+            }));
+            return json({ ok: true });
+          }
+          const cuerpoCom = await request.json().catch(() => null);
+          const r = comunicadoValidar(cuerpoCom);
+          if (r.error) return json({ error: r.error }, 400);
+          const v = r.v;
+          // Firma vacía al editar = se conserva la que ya tenía (no pasa a ser la de quien edita).
+          const firma = v.firma || actual.firma || await comunicadoFirmaPorDefecto(env, auth.payload);
+          if (v.fijado && v.publicado) await env.DB.prepare("UPDATE comunicados SET fijado = 0 WHERE id <> ?").bind(id).run();
+          await env.DB.prepare(
+            `UPDATE comunicados SET tipo = ?, titulo = ?, resumen = ?, contenido = ?, fecha = ?, fijado = ?, publicado = ?, firma = ?, updated_at = ? WHERE id = ?`
+          ).bind(v.tipo, v.titulo, v.resumen || null, v.contenido, v.fecha, v.fijado, v.publicado, firma, new Date().toISOString(), id).run();
+          const antes = Number(actual.publicado) === 1;
+          const verbo = !antes && v.publicado ? "ha publicado" : (antes && !v.publicado ? "ha retirado (a borrador)" : "ha editado");
+          ctx.waitUntil(registrarActividad(env, request, auth.payload, {
+            accion: "editar_comunicado", entidad: "comunicado", entidad_id: id,
+            descripcion: `${auth.payload.nombre} ${verbo} el comunicado oficial "${v.titulo}"`,
+          }));
+          // Aviso por push/correo: solo en el paso de borrador a publicado (editar uno ya publicado no vuelve a avisar).
+          const avisos = !antes && v.publicado ? comunicadoAvisosPedidos(cuerpoCom) : null;
+          if (avisos) ctx.waitUntil(avisarComunicado(env, { id, slug: actual.slug, ...v, firma }, avisos));
+          return json({ ok: true, firma, avisos });
+        }
+      }
+
+      // ---------- COMUNICADOS OFICIALES: lectura pública (solo los publicados) ----------
+      // GET /api/comunicados          -> listado (sin el texto)
+      // GET /api/comunicados/fijado   -> el comunicado fijado y publicado (aviso de la portada), o null
+      // GET /api/comunicados/<slug>   -> detalle con el texto
+      // Nunca devuelven borradores ni quién lo escribió: solo la firma (el cargo).
+      if (method === "GET" && (path === "/api/comunicados" || path === "/api/comunicados/fijado")) {
+        try {
+          await asegurarTablaComunicados(env);
+          if (path === "/api/comunicados/fijado") {
+            const f = await env.DB.prepare(
+              "SELECT * FROM comunicados WHERE publicado = 1 AND fijado = 1 ORDER BY fecha DESC, created_at DESC LIMIT 1"
+            ).first();
+            return json({ item: f ? comunicadoPublico(f) : null });
+          }
+          const { results } = await env.DB.prepare(
+            "SELECT * FROM comunicados WHERE publicado = 1 ORDER BY fecha DESC, created_at DESC LIMIT 200"
+          ).all();
+          return json({ items: (results || []).map((f) => comunicadoPublico(f)) });
+        } catch (e) {
+          // Un fallo de base de datos no se disfraza de "no hay comunicados".
+          return json({ error: "No se pudieron cargar los comunicados" }, 503);
+        }
+      }
+
+      {
+        const mComPub = path.match(/^\/api\/comunicados\/([\w-]+)$/);
+        if (method === "GET" && mComPub && mComPub[1] !== "admin" && mComPub[1] !== "fijado") {
+          try {
+            await asegurarTablaComunicados(env);
+            const f = await env.DB.prepare("SELECT * FROM comunicados WHERE slug = ? AND publicado = 1").bind(mComPub[1]).first();
+            if (!f) return json({ error: "No existe ese comunicado" }, 404);
+            return json({ item: comunicadoPublico(f, true) });
+          } catch (e) {
+            return json({ error: "No se pudo cargar el comunicado" }, 503);
+          }
+        }
+      }
+
       // ---------- PODCAST: rutas públicas y de gestión (panel) ----------
       // Público: GET /api/podcast (solo publicados). Panel (admin/redactor):
       // GET /api/podcast/admin, POST /api/podcast, PUT|DELETE /api/podcast/<id>.
@@ -31519,6 +31913,31 @@ async function handlePrimary(request, env, ctx) {
         return !!(fila && fila.puede_gestionar_tienda === 1);
       }
 
+      // ---------- Descuento de tienda por nivel ----------
+      // Redactores de Nivel 3 o superior y fotógrafos de Nivel 2 (F2) tienen descuento en la tienda.
+      // Se calcula SIEMPRE en el servidor a partir del rol/nivel guardados en la base de datos (no del
+      // JWT), así un ascenso o descenso se nota al momento y el navegador no puede falsearlo.
+      // Para cambiar el porcentaje o los niveles mínimos basta con tocar estas tres constantes.
+      const TIENDA_DESCUENTO_PORCENTAJE = 10;
+      const TIENDA_DESCUENTO_NIVEL_REDACTOR = 3;
+      const TIENDA_DESCUENTO_NIVEL_FOTOGRAFO = 2;
+      async function descuentoTiendaDeUsuario(env, uid) {
+        const u = await env.DB.prepare("SELECT rol, nivel FROM users WHERE id = ?").bind(uid).first();
+        if (!u) return null;
+        const nivel = Number(u.nivel) || 1;
+        if (u.rol === "redactor" && nivel >= TIENDA_DESCUENTO_NIVEL_REDACTOR) {
+          return { porcentaje: TIENDA_DESCUENTO_PORCENTAJE, motivo: `Redactor de nivel ${nivel}` };
+        }
+        if (u.rol === "fotografo" && nivel >= TIENDA_DESCUENTO_NIVEL_FOTOGRAFO) {
+          return { porcentaje: TIENDA_DESCUENTO_PORCENTAJE, motivo: `Fotógrafo de nivel F${nivel}` };
+        }
+        return null;
+      }
+      function precioConDescuentoTienda(centimos, descuento) {
+        if (!descuento) return centimos;
+        return Math.round(centimos * (100 - descuento.porcentaje) / 100);
+      }
+
       // Datos de un producto tal como los consume el panel: variantes e
       // imágenes extra ya parseadas y las unidades que quedan. "stock" es
       // el total de unidades (NULL = sin límite) y "disponibles" = stock
@@ -31562,7 +31981,22 @@ async function handlePrimary(request, env, ctx) {
                   ${SQL_UNIDADES_PEDIDAS} AS pedidas
            FROM tienda_productos p WHERE p.activo = 1 ORDER BY p.orden ASC, p.id ASC`
         ).all();
-        return json({ productos: productos.map((p) => prepararProductoTienda(p)) });
+        // Quien tiene descuento recibe el catálogo con "precio_centimos" ya rebajado (así tarjetas,
+        // ficha y checkout del panel cuadran solos) y el precio normal en "precio_original_centimos".
+        // Las rutas de gestión (/productos/todos) NO se tocan: ahí siempre va el precio real.
+        const descuento = await descuentoTiendaDeUsuario(env, payload.uid);
+        return json({
+          productos: productos.map((p) => {
+            const salida = prepararProductoTienda(p);
+            if (descuento) {
+              salida.precio_original_centimos = salida.precio_centimos;
+              salida.precio_centimos = precioConDescuentoTienda(salida.precio_centimos, descuento);
+              salida.descuento_pct = descuento.porcentaje;
+            }
+            return salida;
+          }),
+          descuento: descuento ? { porcentaje: descuento.porcentaje, motivo: descuento.motivo } : null,
+        });
       }
 
       // ---------- Gestión del catálogo (crear/editar/activar productos) ----------
@@ -31829,6 +32263,11 @@ async function handlePrimary(request, env, ctx) {
           }
         }
 
+        // Precio por unidad: el del catálogo con el descuento que corresponda a su nivel (si lo tiene).
+        // Se guarda ya rebajado en cada fila del pedido, así totales y confirmación de pago coinciden.
+        const descuentoPedido = await descuentoTiendaDeUsuario(env, payload.uid);
+        const precioUnidad = precioConDescuentoTienda(producto.precio_centimos, descuentoPedido);
+
         const pedidosIds = [];
         for (let i = 0; i < cantidad; i++) {
           const { meta } = await env.DB.prepare(
@@ -31837,7 +32276,7 @@ async function handlePrimary(request, env, ctx) {
                 metodo_pago, entrega, direccion_envio)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(payload.uid, producto.id, producto.nombre, variantesDisponibles.length ? variante : null,
-                 producto.precio_centimos, referenciaPago, metodoPago, entrega, direccionEnvio).run();
+                 precioUnidad, referenciaPago, metodoPago, entrega, direccionEnvio).run();
           pedidosIds.push(meta.last_row_id);
         }
 
@@ -31851,7 +32290,7 @@ async function handlePrimary(request, env, ctx) {
 
         ctx.waitUntil(registrarActividad(env, request, payload, {
           accion: "crear_pedido_tienda", entidad: "pedido_tienda", entidad_id: pedidosIds[0],
-          descripcion: `${payload.nombre} ha pedido ${cantidad > 1 ? cantidad + " x " : ""}"${producto.nombre}"${variante ? " (" + variante + ")" : ""} en la tienda (${codigo}, ${metodoPago}, ${entrega === "envio" ? "envío" : "en mano"})`,
+          descripcion: `${payload.nombre} ha pedido ${cantidad > 1 ? cantidad + " x " : ""}"${producto.nombre}"${variante ? " (" + variante + ")" : ""} en la tienda (${codigo}, ${metodoPago}, ${entrega === "envio" ? "envío" : "en mano"}${descuentoPedido ? `, con ${descuentoPedido.porcentaje}% de descuento por ser ${descuentoPedido.motivo.toLowerCase()}` : ""})`,
         }));
 
         ctx.waitUntil(staffPushEnviar(env, "tienda", {
@@ -31863,7 +32302,8 @@ async function handlePrimary(request, env, ctx) {
         return json({
           ok: true, pedido_id: pedidosIds[0], pedidos_ids: pedidosIds, cantidad,
           codigo, metodo_pago: metodoPago, entrega,
-          total_centimos: producto.precio_centimos * cantidad,
+          total_centimos: precioUnidad * cantidad,
+          descuento_pct: descuentoPedido ? descuentoPedido.porcentaje : 0,
         });
       }
 

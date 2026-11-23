@@ -12,10 +12,19 @@ on:
   schedule:
     - cron: "30 5 * * *"
   workflow_dispatch:
+    inputs:
+      reemplazo_total:
+        description: "Sustitución total: los datos de TheSportsDB pisan TODOS los partidos (también los editados a mano)"
+        type: boolean
+        default: false
 
 concurrency:
   group: sync-partidos
   cancel-in-progress: false
+
+# Solo lectura: este workflow no escribe en el repositorio (mínimo privilegio).
+permissions:
+  contents: read
 
 jobs:
   sync:
@@ -32,3 +41,4 @@ jobs:
           SYNC_API_URL: ${{ secrets.SYNC_API_URL }}
           SYNC_INGEST_TOKEN: ${{ secrets.SYNC_INGEST_TOKEN }}
           THESPORTSDB_API_KEY: ${{ secrets.THESPORTSDB_API_KEY }}
+          REEMPLAZO_TOTAL: ${{ github.event.inputs.reemplazo_total }}

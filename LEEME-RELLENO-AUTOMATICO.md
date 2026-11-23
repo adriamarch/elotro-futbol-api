@@ -60,3 +60,13 @@ Ese botón lanza el workflow con `reemplazo_total=true`; el script lo envía com
   estado ni marcador), tampoco en «Sincronizar todo» (sustitución total). Se gestiona solo a mano.
 - Los ya reprogramados antes de la migración hay que marcarlos con el `UPDATE` comentado en el SQL.
 - Si la migración aún no está aplicada, todo funciona como antes (sin protección).
+
+## Salvaguardas de fecha (siempre activas, también en «Sincronizar todo»)
+- **Solo la temporada en curso**: la que marca el reloj (1 jul – 30 jun; ahora 2026-2027), no la
+  `temporada` de la config ni la de la Action. Un evento con fecha fuera de ese rango (p. ej. 31/03/2025)
+  no se inserta ni actualiza; se cuenta en `resumen.fuera_temporada`.
+- **Nunca `finalizado` antes de tiempo**: un partido solo se guarda como `finalizado` (con marcador) si su
+  hora ya ha pasado (+100 min; si solo hay día, que el día haya pasado) y su jornada ya ha empezado según
+  «Calendario de jornadas». Si no, queda `programado` y sin marcador (`resumen.finalizado_bloqueado`).
+  Para exigir además que la jornada entera haya terminado: `SYNC_FINALIZAR_SOLO_JORNADA_CERRADA = true`.
+- Test: `node worker/tests/relleno-salvaguardas.test.mjs [ruta del worker]`.
